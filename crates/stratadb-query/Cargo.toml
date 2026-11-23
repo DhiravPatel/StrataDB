@@ -1,0 +1,20 @@
+[package]
+name = "stratadb-query"
+description = "StrataDB query language: parser, planner with pruning, and budgeted executor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+stratadb-common.workspace = true
+stratadb-schema.workspace = true
+stratadb-segment.workspace = true
+stratadb-storage.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

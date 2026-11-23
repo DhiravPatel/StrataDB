@@ -1,0 +1,14 @@
+[package]
+name = "stratadb-testkit"
+description = "Deterministic synthetic log datasets for StrataDB tests and benchmarks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+stratadb-common.workspace = true
+stratadb-schema.workspace = true
+
+[lints]
+workspace = true

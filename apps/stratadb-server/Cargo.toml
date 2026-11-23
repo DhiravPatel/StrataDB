@@ -1,0 +1,39 @@
+[package]
+name = "stratadb-server"
+description = "StrataDB HTTP server: authenticated ingestion and query API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "strata-server"
+path = "src/main.rs"
+
+[dependencies]
+stratadb-common.workspace = true
+stratadb-schema.workspace = true
+stratadb-storage.workspace = true
+stratadb-query.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync", "macros", "time"] }
+sha2 = "0.10"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+subtle = "2.6"
+getrandom = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { version = "1", features = ["io-util"] }
+rcgen = "0.14"
+
+[lints]
+workspace = true

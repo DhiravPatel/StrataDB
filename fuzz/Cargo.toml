@@ -1,0 +1,73 @@
+# Coverage-guided fuzzing (libFuzzer). Not a workspace member: requires nightly.
+#   cargo +nightly fuzz run <target> -- -max_total_time=300 -rss_limit_mb=2048
+# Targets: wal_frames wal_recovery segment segment_internals manifest event_codec query json_event config security_files
+[package]
+name = "stratadb-fuzz-targets"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+stratadb-fuzz = { path = "../crates/stratadb-fuzz" }
+
+[workspace]
+
+[[bin]]
+name = "wal_frames"
+path = "fuzz_targets/wal_frames.rs"
+test = false
+doc = false
+[[bin]]
+name = "wal_recovery"
+path = "fuzz_targets/wal_recovery.rs"
+test = false
+doc = false
+[[bin]]
+name = "segment"
+path = "fuzz_targets/segment.rs"
+test = false
+doc = false
+[[bin]]
+name = "segment_internals"
+path = "fuzz_targets/segment_internals.rs"
+test = false
+doc = false
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+[[bin]]
+name = "event_codec"
+path = "fuzz_targets/event_codec.rs"
+test = false
+doc = false
+[[bin]]
+name = "query"
+path = "fuzz_targets/query.rs"
+test = false
+doc = false
+[[bin]]
+name = "json_event"
+path = "fuzz_targets/json_event.rs"
+test = false
+doc = false
+[[bin]]
+name = "otlp_proto"
+path = "fuzz_targets/otlp_proto.rs"
+test = false
+doc = false
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+[[bin]]
+name = "security_files"
+path = "fuzz_targets/security_files.rs"
+test = false
+doc = false

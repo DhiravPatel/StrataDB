@@ -1,0 +1,66 @@
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+      # SDK conformance tests drive these toolchains (they skip if absent).
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.22" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      # Modules for the official-OTel-exporter interop test (built offline in the test).
+      - run: cd tools/otlp-interop && go mod download
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # Includes crash matrix, power-loss model, restore drills, stable mutation fuzzing,
+      # and Rust/Python/Go SDK conformance against a real server.
+      - run: cargo test --workspace --locked
+      - run: cd sdk/go && gofmt -l . | (! grep .) && go vet ./...
+
+  audit-and-sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.95.0" }
+      - run: cargo install cargo-audit cargo-cyclonedx --locked
+      - run: cargo audit
+      - run: cargo cyclonedx --format json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: "**/*.cdx.json"
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - name: 30 s per target
+        run: |
+          cd fuzz
+          for t in wal_frames wal_recovery segment manifest event_codec query json_event config security_files; do
+            cargo fuzz run "$t" -- -max_total_time=30 -rss_limit_mb=2048
+          done
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f deployments/docker/Dockerfile -t stratadb:ci .
+      - name: image runs as non-root and the binary starts
+        run: |
+          test "$(docker run --rm --entrypoint id stratadb:ci -u)" = "10001"
+          docker run --rm --entrypoint strata-server stratadb:ci --version

@@ -1,0 +1,22 @@
+# Example production configuration (see docs/operations/configuration.md).
+config_version = 1
+data_dir = "/var/lib/stratadb"
+listen = "0.0.0.0:7070"
+durability = "group_commit"
+
+[tls]
+cert = "/etc/stratadb/tls/cert.pem"
+key = "/etc/stratadb/tls/key.pem"
+
+[limits]
+max_body_bytes = 8388608
+max_concurrent_ingest = 32
+max_concurrent_queries = 16
+max_query_timeout_ms = 60000
+
+[storage]
+disk_reserve_bytes = 1073741824
+default_retention_days = 30
+
+[backup]
+dir = "/var/backups/stratadb"

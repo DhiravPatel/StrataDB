@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/stratadb-common",
+    "crates/stratadb-schema",
+    "crates/stratadb-wal",
+    "crates/stratadb-segment",
+    "crates/stratadb-storage",
+    "crates/stratadb-query",
+    "crates/stratadb-testkit",
+    "crates/stratadb-fuzz",
+    "apps/stratadb-cli",
+    "apps/stratadb-bench",
+    "apps/stratadb-server",
+    "sdk/rust",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+# License intentionally not declared yet: see docs/adr/0016-license.md (pending owner sign-off).
+
+[workspace.dependencies]
+stratadb-common = { path = "crates/stratadb-common" }
+stratadb-schema = { path = "crates/stratadb-schema" }
+stratadb-wal = { path = "crates/stratadb-wal" }
+stratadb-segment = { path = "crates/stratadb-segment" }
+stratadb-storage = { path = "crates/stratadb-storage" }
+stratadb-query = { path = "crates/stratadb-query" }
+stratadb-testkit = { path = "crates/stratadb-testkit" }
+
+thiserror = "2"
+crc32c = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
+tempfile = "3"
+proptest = { version = "1", default-features = false, features = ["std"] }
+sha2 = "0.10"
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.dev]
+# Reduced debug info keeps target/ small on space-constrained dev machines.
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
+codegen-units = 1

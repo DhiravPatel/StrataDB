@@ -1,0 +1,35 @@
+resource_logs {
+  resource {
+    attributes { key: "service.name" value { string_value: "checkout" } }
+    attributes { key: "host.cpu" value { int_value: 8 } }
+  }
+  scope_logs {
+    scope {
+      name: "my.library"
+      version: "1.0.0"
+      attributes { key: "my.scope.attribute" value { string_value: "x" } }
+    }
+    log_records {
+      time_unix_nano: 1795170600000000000
+      observed_time_unix_nano: 1795170600100000000
+      severity_number: 17
+      severity_text: "ERROR"
+      body { string_value: "card declined" }
+      attributes { key: "http.status_code" value { int_value: 402 } }
+      attributes { key: "ratio" value { double_value: 0.25 } }
+      attributes { key: "ok" value { bool_value: false } }
+      attributes { key: "raw" value { bytes_value: "hello" } }
+      attributes { key: "list" value { array_value { values { string_value: "a" } values { int_value: -3 } } } }
+      attributes { key: "map" value { kvlist_value { values { key: "k" value { string_value: "v" } } } } }
+      flags: 1
+      trace_id: "\x5b\x8e\xff\xf7\x98\x03\x81\x03\xd2\x69\xb6\x33\x81\x3f\xc6\x0c"
+      span_id: "\xee\xe1\x9b\x7e\xc3\xc1\xb1\x74"
+      event_name: "payment.failed"
+    }
+    log_records {
+      observed_time_unix_nano: 1795170601000000000
+      severity_text: "WARN"
+      body { kvlist_value { values { key: "nested" value { array_value { } } } } }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "stratadb-schema"
+description = "Canonical event model, typed values, validation and versioned event codec for StrataDB"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+stratadb-common.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

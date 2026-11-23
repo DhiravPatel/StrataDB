@@ -1,0 +1,282 @@
+{
+  "build": "release",
+  "config": {
+    "batch_size": 1000,
+    "bloom": false,
+    "cache_state": "warm (same process, OS page cache not dropped)",
+    "durability": "group_commit",
+    "events": 200000,
+    "profile": "app-logs",
+    "reps": 5,
+    "seed": 1,
+    "tenants": 4
+  },
+  "environment": {
+    "arch": "aarch64",
+    "cpus": 10,
+    "os": "macos"
+  },
+  "flush": {
+    "final_flush_ms": 237.982042,
+    "rows": 50500
+  },
+  "ingest": {
+    "ack_latency": {
+      "max_ms": 17.701833999999998,
+      "mean_ms": 6.228833706250003,
+      "min_ms": 4.441459,
+      "n": 800,
+      "p50_ms": 5.999833000000001,
+      "p95_ms": 7.463875,
+      "p99_ms": 9.854125
+    },
+    "encoded_bytes": 46409813,
+    "encoded_bytes_per_s_wall": 8648753.818990646,
+    "events_per_s_wall": 37271.22890579476,
+    "wall_s": 5.366069375,
+    "write_batch_time_s": 4.983066965
+  },
+  "label": "developer-hardware measurement; not a production capacity claim",
+  "queries": [
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 13.123792,
+        "mean_ms": 11.7854,
+        "min_ms": 10.796375000000001,
+        "n": 5,
+        "p50_ms": 11.937916,
+        "p95_ms": 13.123792,
+        "p99_ms": 13.123792
+      },
+      "name": "01_trace_id_lookup",
+      "result_rows": 1,
+      "rows_matched": 1,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 2724440,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT event_time, body FROM logs WHERE trace_id = '8d9b9a5f3627f6e55ff25f124592b313'"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 58.694792,
+        "mean_ms": 56.2748668,
+        "min_ms": 53.486167,
+        "n": 5,
+        "p50_ms": 55.952584,
+        "p95_ms": 58.694792,
+        "p99_ms": 58.694792
+      },
+      "name": "02_request_id_lookup",
+      "result_rows": 1,
+      "rows_matched": 1,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 7156298,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT event_time, body FROM logs WHERE attributes['request_id'] = 'req_df7728bfa81e'"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 2.831209,
+        "mean_ms": 2.7507334000000006,
+        "min_ms": 2.664834,
+        "n": 5,
+        "p50_ms": 2.7689160000000004,
+        "p95_ms": 2.831209,
+        "p99_ms": 2.831209
+      },
+      "name": "03_recent_errors",
+      "result_rows": 100,
+      "rows_matched": 133,
+      "rows_scanned": 12500,
+      "segment_bytes_read": 571961,
+      "segments_pruned": 2,
+      "segments_scanned": 1,
+      "segments_total": 3,
+      "sql": "SELECT event_time, service, body FROM logs WHERE event_time >= TIMESTAMP '2026-11-20T00:03:10.000000000Z' AND severity = 'ERROR' ORDER BY event_time DESC LIMIT 100"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 11.403666999999999,
+        "mean_ms": 10.1531086,
+        "min_ms": 8.930625,
+        "n": 5,
+        "p50_ms": 9.918792,
+        "p95_ms": 11.403666999999999,
+        "p99_ms": 11.403666999999999
+      },
+      "name": "04_service_severity",
+      "result_rows": 1,
+      "rows_matched": 761,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 100327,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT count(*) FROM logs WHERE service = 'auth' AND severity = 'WARN'"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 2.7656669999999997,
+        "mean_ms": 2.5721415999999997,
+        "min_ms": 2.458375,
+        "n": 5,
+        "p50_ms": 2.489333,
+        "p95_ms": 2.7656669999999997,
+        "p99_ms": 2.7656669999999997
+      },
+      "name": "05_time_range_scan",
+      "result_rows": 1,
+      "rows_matched": 5000,
+      "rows_scanned": 18750,
+      "segment_bytes_read": 75005,
+      "segments_pruned": 2,
+      "segments_scanned": 1,
+      "segments_total": 3,
+      "sql": "SELECT count(*) FROM logs WHERE event_time >= TIMESTAMP '2026-11-20T00:01:30.000000000Z' AND event_time < TIMESTAMP '2026-11-20T00:01:50.000000000Z'"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 40.290042,
+        "mean_ms": 37.7763668,
+        "min_ms": 35.556709,
+        "n": 5,
+        "p50_ms": 36.760708,
+        "p95_ms": 40.290042,
+        "p99_ms": 40.290042
+      },
+      "name": "06_message_token_search",
+      "result_rows": 1,
+      "rows_matched": 595,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 1991289,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT count(*) FROM logs WHERE body LIKE '%TIMEOUT%'"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 65.44575,
+        "mean_ms": 57.8507252,
+        "min_ms": 52.670625,
+        "n": 5,
+        "p50_ms": 56.732459,
+        "p95_ms": 65.44575,
+        "p99_ms": 65.44575
+      },
+      "name": "07_attribute_equality",
+      "result_rows": 1,
+      "rows_matched": 8423,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 4964994,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT count(*) FROM logs WHERE attributes['region'] = 'eu-west-1'"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 68.737625,
+        "mean_ms": 65.36206659999999,
+        "min_ms": 62.278375,
+        "n": 5,
+        "p50_ms": 64.716167,
+        "p95_ms": 68.737625,
+        "p99_ms": 68.737625
+      },
+      "name": "08_high_cardinality_agg",
+      "result_rows": 10,
+      "rows_matched": 50000,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 4964994,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT attributes['user_id'] AS u, count(*) AS n FROM logs GROUP BY attributes['user_id'] ORDER BY n DESC LIMIT 10"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 30.098291999999997,
+        "mean_ms": 29.514658399999995,
+        "min_ms": 28.958875,
+        "n": 5,
+        "p50_ms": 29.552416,
+        "p95_ms": 30.098291999999997,
+        "p99_ms": 30.098291999999997
+      },
+      "name": "09_service_time_bucket",
+      "result_rows": 48,
+      "rows_matched": 50000,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 250342,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT service, time_bucket(INTERVAL '1 minute', event_time) AS b, count(*) FROM logs GROUP BY service, time_bucket(INTERVAL '1 minute', event_time)"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 60.111167,
+        "mean_ms": 54.05585,
+        "min_ms": 49.752083,
+        "n": 5,
+        "p50_ms": 50.368583,
+        "p95_ms": 60.111167,
+        "p99_ms": 60.111167
+      },
+      "name": "10_top_error_codes",
+      "result_rows": 6,
+      "rows_matched": 3432,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 5014994,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT attributes['error.code'] AS code, count(*) AS n FROM logs WHERE severity IN ('ERROR', 'FATAL') GROUP BY attributes['error.code'] ORDER BY n DESC LIMIT 10"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 15.426917,
+        "mean_ms": 14.452124999999999,
+        "min_ms": 13.404124999999999,
+        "n": 5,
+        "p50_ms": 14.356957999999999,
+        "p95_ms": 15.426917,
+        "p99_ms": 15.426917
+      },
+      "name": "12_historical_wide_range",
+      "result_rows": 5,
+      "rows_matched": 50000,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 50000,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT severity, count(*) FROM logs GROUP BY severity"
+    }
+  ],
+  "reopen_ms": 24.605999999999998,
+  "storage": {
+    "encoded_to_segment_ratio": 1.14085386114462,
+    "flushes": 3,
+    "segment_bytes": 40679893,
+    "segments": 12,
+    "write_stalls": 0
+  },
+  "stratadb_version": "0.0.1"
+}

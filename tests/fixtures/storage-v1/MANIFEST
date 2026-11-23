@@ -1,0 +1,43 @@
+STRATADB-MANIFEST v1 crc32c=ba6facee len=995
+{
+  "format_version": 1,
+  "version": 2,
+  "next_segment_id": 3,
+  "flushed_through_seq": 2,
+  "segments": [
+    {
+      "id": 1,
+      "tenant": "alpha",
+      "segment_format_version": 1,
+      "min_schema_version": 1,
+      "max_schema_version": 1,
+      "min_event_time": 1700000000000000000,
+      "max_event_time": 1700000000000000007,
+      "min_seq": 1,
+      "max_seq": 1,
+      "row_count": 8,
+      "file_bytes": 1416,
+      "footer_crc": 397604351,
+      "created_ms": 1795181384388,
+      "state": "committed",
+      "lineage": []
+    },
+    {
+      "id": 2,
+      "tenant": "beta",
+      "segment_format_version": 1,
+      "min_schema_version": 1,
+      "max_schema_version": 1,
+      "min_event_time": 1700000000000000000,
+      "max_event_time": 1700000000000000002,
+      "min_seq": 2,
+      "max_seq": 2,
+      "row_count": 3,
+      "file_bytes": 738,
+      "footer_crc": 298649786,
+      "created_ms": 1795181384388,
+      "state": "committed",
+      "lineage": []
+    }
+  ]
+}

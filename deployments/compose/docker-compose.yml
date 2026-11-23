@@ -1,0 +1,30 @@
+# Local single-node StrataDB with TLS. Not a high-availability topology:
+# one container on one host has no host-level redundancy (spec §29.3).
+#
+# 1. Put cert.pem and key.pem in ./tls (e.g. from your CA, or mkcert for local dev).
+# 2. docker compose -f deployments/compose/docker-compose.yml up -d
+# 3. docker compose exec stratadb strata-server token create --data-dir /data --tenant acme --permissions ingest,query
+services:
+  stratadb:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    image: stratadb:dev
+    ports:
+      - "7070:7070"
+    volumes:
+      - stratadb-data:/data
+      - ./tls:/etc/stratadb/tls:ro
+    read_only: true            # only /data is writable
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    stop_grace_period: 60s     # allow flush on SIGTERM
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+volumes:
+  stratadb-data:

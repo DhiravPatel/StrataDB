@@ -1,0 +1,30 @@
+[package]
+name = "stratadb-storage"
+description = "Single-node storage engine: WAL + memtable + flush + segments + manifest + recovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+failpoints = ["stratadb-common/failpoints", "stratadb-wal/failpoints", "stratadb-segment/failpoints"]
+
+[dependencies]
+stratadb-common.workspace = true
+stratadb-schema.workspace = true
+stratadb-wal.workspace = true
+stratadb-segment.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+fs4.workspace = true
+
+[dev-dependencies]
+stratadb-common = { workspace = true, features = ["failpoints"] }
+tempfile.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

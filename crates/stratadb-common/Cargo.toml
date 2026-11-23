@@ -1,0 +1,23 @@
+[package]
+name = "stratadb-common"
+description = "Shared error model, checksums, binary codec, durable filesystem helpers and identifiers for StrataDB"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Enables named crash/error injection points. Never enable in release builds.
+failpoints = []
+
+[dependencies]
+thiserror.workspace = true
+crc32c.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

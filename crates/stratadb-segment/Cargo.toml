@@ -1,0 +1,22 @@
+[package]
+name = "stratadb-segment"
+description = "Immutable columnar segment format (v1): writer, reader, checksums and statistics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+failpoints = ["stratadb-common/failpoints"]
+
+[dependencies]
+stratadb-common.workspace = true
+stratadb-schema.workspace = true
+lz4_flex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

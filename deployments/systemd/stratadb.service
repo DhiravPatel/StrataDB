@@ -1,0 +1,34 @@
+# /etc/systemd/system/stratadb.service — see docs/operations/deployment.md
+[Unit]
+Description=StrataDB log database
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stratadb
+Group=stratadb
+ExecStart=/usr/local/bin/strata-server serve --config /etc/stratadb/strata.toml
+# SIGTERM triggers graceful shutdown (drain, flush, WAL sync).
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/stratadb /var/backups/stratadb
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
