@@ -46,7 +46,7 @@ before being referenced. Checks per mode:
 | `async` | flushed / synced batches survive; WAL may end below the manifest boundary and recovery must not reuse sequence numbers | ✅ tested (asserts the WAL-behind-manifest path is exercised) |
 
 Not modelled: intra-file write reordering, lost un-fsynced renames/dir
-entries, lying hardware → requires a fault-injecting filesystem (TASKS.md T-P1-PL).
+entries, lying hardware → requires a fault-injecting filesystem (docs/project/TASKS.md T-P1-PL).
 
 ## Format compatibility — `crates/stratadb-storage/tests/compat.rs`
 Golden v1 data directory in `tests/fixtures/storage-v1/` (2 tenants, 2 segments,

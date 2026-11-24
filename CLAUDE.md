@@ -1,8 +1,8 @@
 # CLAUDE.md — persistent instructions for coding agents
 
-Read before every session: this file, `NEXT_SESSION.md`, `IMPLEMENTATION_STATUS.md`,
-`TASKS.md`, and the relevant ADRs in `docs/adr/`. The master contract is
-`StrataDB_Master_Engineering_Specification.md` (the "spec").
+Read before every session: this file, `docs/project/NEXT_SESSION.md`, `docs/project/IMPLEMENTATION_STATUS.md`,
+`docs/project/TASKS.md`, and the relevant ADRs in `docs/adr/`. The master contract is
+`docs/spec/StrataDB_Master_Engineering_Specification.md` (the "spec").
 
 ## Non-negotiables (spec Appendix E, §36.3)
 - Never acknowledge a write before the configured durability boundary.
@@ -18,11 +18,11 @@ Read before every session: this file, `NEXT_SESSION.md`, `IMPLEMENTATION_STATUS.
 - Do not mark anything VERIFIED/production-ready without tests that prove it.
 
 ## Workflow
-1. Pick the next dependency-ready task from `TASKS.md`.
+1. Pick the next dependency-ready task from `docs/project/TASKS.md`.
 2. State invariants; implement the smallest complete unit with tests.
 3. Run `scripts/check.sh` (fmt, clippy -D warnings, tests). All must pass.
-4. Update `IMPLEMENTATION_STATUS.md`, `TASKS.md`, `KNOWN_LIMITATIONS.md`,
-   relevant docs/ADRs, and `NEXT_SESSION.md`.
+4. Update `docs/project/IMPLEMENTATION_STATUS.md`, `docs/project/TASKS.md`, `docs/project/KNOWN_LIMITATIONS.md`,
+   relevant docs/ADRs, and `docs/project/NEXT_SESSION.md`.
 
 ## Layout
 - `crates/stratadb-common` errors, CRC-32C, bounded codec, durable fs ops, failpoints, time

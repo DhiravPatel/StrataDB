@@ -8,8 +8,8 @@ A self-hostable, log-native analytical database for structured logs, written in 
 > compaction, retention, and verified backup/restore are implemented and tested.
 > It has **not** had an external security review, fuzzing, or production load
 > testing. Do not use for production data yet. See
-> [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) and
-> [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
+> [docs/project/IMPLEMENTATION_STATUS.md](docs/project/IMPLEMENTATION_STATUS.md) and
+> [docs/project/KNOWN_LIMITATIONS.md](docs/project/KNOWN_LIMITATIONS.md).
 
 ## What works today
 - **Durable ingestion** through a checksummed WAL (`async` / `sync` / `group_commit`)
@@ -55,11 +55,13 @@ configuration: [docs/operations/configuration.md](docs/operations/configuration.
 deployment: [docs/operations/deployment.md](docs/operations/deployment.md) · Rust SDK: `sdk/rust`.
 
 ## Documentation
-- Architecture: [ARCHITECTURE.md](ARCHITECTURE.md) · decisions: [docs/adr/](docs/adr/)
-- Formats & durability: [docs/storage-format/](docs/storage-format/)
-- Query language: [docs/query-language/](docs/query-language/)
-- Development: [DEVELOPMENT.md](DEVELOPMENT.md) · roadmap: [ROADMAP.md](ROADMAP.md)
-- Security: [SECURITY.md](SECURITY.md), [THREAT_MODEL.md](THREAT_MODEL.md)
+Full index: [docs/README.md](docs/README.md).
+
+- Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · decisions: [docs/adr/](docs/adr)
+- Formats & durability: [docs/storage-format/](docs/storage-format)
+- Query language: [docs/query-language/](docs/query-language)
+- Development: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) · roadmap: [docs/project/ROADMAP.md](docs/project/ROADMAP.md)
+- Security: [docs/SECURITY.md](docs/SECURITY.md), [docs/security/THREAT_MODEL.md](docs/security/THREAT_MODEL.md)
 
 ## License
 Not yet selected — see [docs/adr/0016-license.md](docs/adr/0016-license.md).

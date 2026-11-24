@@ -8,7 +8,7 @@
 //!
 //! Not modelled: reordering of unsynced writes inside a file, lost directory
 //! entries for un-fsynced renames, or lying hardware. A fault-injecting
-//! filesystem layer is needed for those (TASKS.md T-P1-PL).
+//! filesystem layer is needed for those (docs/project/TASKS.md T-P1-PL).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code: panics are failures
 

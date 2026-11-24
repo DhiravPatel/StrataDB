@@ -2,7 +2,7 @@
 
 StrataDB is pre-alpha and has **no network listener, authentication, or TLS
 yet**; it must not be exposed to untrusted users. Security is release-blocking
-(spec §18); see [THREAT_MODEL.md](THREAT_MODEL.md).
+(spec §18); see [docs/security/THREAT_MODEL.md](security/THREAT_MODEL.md).
 
 ## Reporting a vulnerability
 A private reporting channel has **not been configured yet** (maintainer

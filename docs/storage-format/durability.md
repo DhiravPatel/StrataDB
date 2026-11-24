@@ -19,4 +19,4 @@ See ADR-0009 for the mode table. Additional facts operators must know:
   no row missing or duplicated across a concurrent flush.
 - **Disk full:** surfaces as `resource_exhausted` (retryable) on the write
   that hit it, and poisons the WAL (restart required). Disk high-watermark
-  admission control is not implemented yet (KNOWN_LIMITATIONS.md).
+  admission control is not implemented yet (docs/project/KNOWN_LIMITATIONS.md).

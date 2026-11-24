@@ -553,10 +553,10 @@ stratadb/
 ├── README.md
 ├── LICENSE
 ├── NOTICE
-├── CONTRIBUTING.md
-├── CODE_OF_CONDUCT.md
-├── SECURITY.md
-├── GOVERNANCE.md
+├── docs/CONTRIBUTING.md
+├── docs/CODE_OF_CONDUCT.md
+├── docs/SECURITY.md
+├── docs/project/GOVERNANCE.md
 ├── CHANGELOG.md
 ├── .github/
 │   ├── workflows/

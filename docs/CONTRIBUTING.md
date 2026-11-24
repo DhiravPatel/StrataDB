@@ -5,7 +5,7 @@
 - Run `scripts/check.sh` before sending a change; CI runs the same commands.
 - Persistent-format or durability-protocol changes require an RFC
   (`docs/rfcs/`) and an ADR update, version bump, and compatibility fixtures.
-- New dependencies require an entry in `DEPENDENCY_REVIEW.md` (license,
+- New dependencies require an entry in `docs/project/DEPENDENCY_REVIEW.md` (license,
   maintenance, security history, why it is needed). Prefer none.
 - `unsafe` is forbidden workspace-wide; lifting that requires an ADR with
   measured justification and documented invariants.

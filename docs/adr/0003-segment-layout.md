@@ -22,7 +22,7 @@
   optional → ignore). Trailer carries footer length + CRC + magic.
 - Single row group per segment in v1 (segments are bounded by memtable size).
 
-## Consequences / known gaps (tracked in KNOWN_LIMITATIONS.md)
+## Consequences / known gaps (tracked in docs/project/KNOWN_LIMITATIONS.md)
 - Attributes are stored per-row as typed maps, not shredded into columns:
   attribute predicates must decode the whole attributes chunk.
 - No general-purpose compression (zstd/lz4) yet; only lightweight encodings.

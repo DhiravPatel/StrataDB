@@ -1,4 +1,4 @@
-# NEXT_SESSION.md
+# docs/project/NEXT_SESSION.md
 
 ## Current phase
 Single-node product (Phases 1–5) is implemented and tested end to end:
@@ -19,7 +19,7 @@ SDKs, `strata doctor` are done this session. Distributed mode (Phases 7–8) has
 
 ## Last validation (2026-11-21)
 `scripts/check.sh` → fmt ✅ clippy `-D warnings` ✅ tests ✅ (see
-IMPLEMENTATION_STATUS.md for the count). Stable mutation fuzzing runs in the
+docs/project/IMPLEMENTATION_STATUS.md for the count). Stable mutation fuzzing runs in the
 default suite.
 
 ## Known failures
@@ -50,6 +50,6 @@ per-tenant rate/storage quotas, JSON structured logs with request ids,
 
 ## Owner actions required
 1. Confirm license (ADR-0016) and add LICENSE.
-2. Security reporting channel + CoC contact (SECURITY.md, CODE_OF_CONDUCT.md).
+2. Security reporting channel + CoC contact (docs/SECURITY.md, docs/CODE_OF_CONDUCT.md).
 3. Start Docker if you want the image build / Collector interop verified.
 4. Disk: ~16 GB free; `cargo clean` frees ~6 GB of build artifacts when needed.

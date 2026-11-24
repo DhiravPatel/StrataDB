@@ -14,7 +14,7 @@
 //!
 //! Scope: these simulate **process crashes** — data handed to the kernel
 //! survives. Power-loss simulation (dropping unsynced page-cache data) needs a
-//! fault-injecting filesystem layer and is tracked in KNOWN_LIMITATIONS.md.
+//! fault-injecting filesystem layer and is tracked in docs/project/KNOWN_LIMITATIONS.md.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code: panics are failures
 

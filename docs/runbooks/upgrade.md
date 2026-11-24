@@ -1,6 +1,6 @@
 # Runbook: upgrading StrataDB
 
-1. Read the release notes and COMPATIBILITY.md for format changes.
+1. Read the release notes and docs/project/COMPATIBILITY.md for format changes.
 2. Stop the server (the CLI needs the data-directory lock).
 3. Install the new binaries next to the old ones (keep the old ones for rollback).
 4. `strata doctor --data-dir D` — must not report `fail`.

@@ -25,4 +25,4 @@ F + H + benchmarks ──► Phase 6 hardening ──► I (distributed, Phases 
 6. Distributed work only after the single-node release gates pass.
 
 ## Acceptance criteria per phase
-See `docs/requirements-traceability.md` (requirement → task → test).
+See `docs/project/requirements-traceability.md` (requirement → task → test).

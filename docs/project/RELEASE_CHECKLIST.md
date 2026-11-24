@@ -25,4 +25,4 @@ report, or document). Status for the current tree:
 
 ## Security / Operations / Performance / Release
 - [ ] all items — server, auth, TLS, metrics, backup, Docker, benchmarks,
-      license, SBOM not done. See KNOWN_LIMITATIONS.md.
+      license, SBOM not done. See docs/project/KNOWN_LIMITATIONS.md.

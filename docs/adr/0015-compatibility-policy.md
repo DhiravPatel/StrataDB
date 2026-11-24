@@ -1,7 +1,7 @@
 # ADR-0015: Compatibility and upgrade policy
 
 - **Status:** Accepted
-- **Spec references:** §30, COMPATIBILITY.md
+- **Spec references:** §30, docs/project/COMPATIBILITY.md
 
 ## Decision
 - Independently versioned formats: WAL v1, segment v1, event encoding v1,
