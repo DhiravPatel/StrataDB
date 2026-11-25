@@ -47,6 +47,13 @@ a sequential scan in the last bits (addition order), deterministically.
 Evidence: `benchmarks/reports/2026-11-25-parallel-ab.md` (2.2–2.6× with 3
 segments). `parallelism = 1` disables it.
 
+### Update 2026-11-25: attribute key projection
+Queries that reference specific attribute keys read only those keys per
+segment (shredded chunks, or a projection of the residual map chunk that skips
+other values without allocating). Query 10 of the suite: 22× faster, 26× fewer
+segment bytes (`benchmarks/reports/2026-11-25-map-projection-ab.md`).
+`QueryOptions::enable_map_projection` disables it.
+
 ## Revisit conditions
 If the supported SQL surface grows to joins/window functions, or benchmarks
 show vectorized Arrow execution is materially faster on Class B/C workloads.

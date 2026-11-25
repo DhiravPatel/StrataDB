@@ -55,8 +55,11 @@ leaves no partial file (rerun it). Re-importing an export reproduces the
 events exactly (same lossy cases as NDJSON). Importing other Parquet files:
 columns map by name like JSON keys (`event_time`/`timestamp` as a timestamp
 of any unit, integer nanoseconds or RFC 3339 string; `message` = body; `level`
-= severity; every other column becomes an attribute). Independent-reader check:
-`scripts/parquet_interop_check.py` (needs pyarrow; not yet run in CI).
+= severity; every other column becomes an attribute; nested struct/list/map
+columns become JSON objects/arrays; binary becomes hex). Readable codecs:
+uncompressed, snappy (pyarrow/DuckDB/Spark default), gzip, lz4 — zstd and
+brotli files are refused with a clear error (rewrite them with snappy).
+Interop is verified against pyarrow and DuckDB (`scripts/parquet_interop.sh`).
 
 ### CSV
 RFC 4180: comma separator, CRLF line ends, fields with `,` `"` CR or LF are

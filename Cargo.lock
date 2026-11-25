@@ -725,6 +725,15 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "lz4_flex"
+version = "0.11.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13591d77a9b6d941f7e6fcade7f9dfd9e801308752bde50c0a9bb5852778c22c"
+dependencies = [
+ "twox-hash 2.1.5",
+]
+
+[[package]]
+name = "lz4_flex"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f56455fff36934a9500d69062aec1c77037179b6f0669e4d5d6b72b84722d6a3"
@@ -926,14 +935,17 @@ dependencies = [
  "ahash",
  "bytes",
  "chrono",
+ "flate2",
  "half",
  "hashbrown 0.15.5",
+ "lz4_flex 0.11.7",
  "num",
  "num-bigint",
  "paste",
  "seq-macro",
+ "snap",
  "thrift",
- "twox-hash",
+ "twox-hash 1.6.3",
 ]
 
 [[package]]
@@ -1303,6 +1315,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"
 
 [[package]]
+name = "snap"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
+
+[[package]]
 name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1435,7 +1453,7 @@ dependencies = [
 name = "stratadb-segment"
 version = "0.0.1"
 dependencies = [
- "lz4_flex",
+ "lz4_flex 0.14.2",
  "proptest",
  "stratadb-common",
  "stratadb-crypto",
@@ -1818,6 +1836,12 @@ dependencies = [
  "cfg-if",
  "static_assertions",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typenum"

@@ -28,6 +28,18 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cd sdk/go && gofmt -l . | (! grep .) && go vet ./...
 
+  parquet-interop:
+    # Parquet export read back by independent implementations (ADR-0025).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.95.0" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pyarrow duckdb
+      - run: scripts/parquet_interop.sh
+
   audit-and-sbom:
     runs-on: ubuntu-latest
     steps:
@@ -51,7 +63,7 @@ jobs:
       - name: 30 s per target
         run: |
           cd fuzz
-          for t in wal_frames wal_recovery segment manifest event_codec query json_event config security_files; do
+          for t in wal_frames wal_recovery segment segment_internals manifest event_codec query json_event otlp_proto config security_files cursor sealed map_projection; do
             cargo fuzz run "$t" -- -max_total_time=30 -rss_limit_mb=2048
           done
 

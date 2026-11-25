@@ -36,6 +36,10 @@ pub struct QueryOptions {
     /// Vectorized filter evaluation (typed kernels, selection vectors).
     /// Disabling it must never change results.
     pub enable_vectorized: bool,
+    /// Read only the referenced attribute keys (shredded chunks or a
+    /// projection of the residual map chunk) instead of whole maps when a
+    /// query names specific keys. Disabling it must never change results.
+    pub enable_map_projection: bool,
     pub parse_limits: crate::parser::ParseLimits,
     /// Worker threads for scanning segments (sorted and aggregate queries;
     /// spec §13.5). 1 = sequential. Results are merged in segment order, so
@@ -54,6 +58,7 @@ impl Default for QueryOptions {
             cancel: None,
             enable_pruning: true,
             enable_vectorized: true,
+            enable_map_projection: true,
             parse_limits: Default::default(),
             parallelism: std::thread::available_parallelism()
                 .map_or(1, |n| n.get())
@@ -1137,20 +1142,26 @@ fn load_batch<'t>(
     needed: &[ColumnId],
     tenant: &'t TenantId,
     stats: &mut QueryStats,
+    projection: bool,
 ) -> Result<Batch<'t>> {
     let mut cols = HashMap::new();
     let mut shredded = HashMap::new();
     let footer = seg.reader.footer();
-    // Use shredded columns when every referenced key of a scope is shredded
-    // in this segment and the whole map is not needed; else read full maps.
-    let use_shredded = |scope: Scope, keys: &std::collections::BTreeSet<String>, whole: bool| {
-        !whole && !keys.is_empty() && keys.iter().all(|k| footer.shredded(scope, k).is_some())
+    // When a scope is referenced only through specific keys, read just those
+    // keys (shredded chunks, or a projection of the residual map chunk that
+    // skips every other value) instead of materializing whole maps.
+    // With projection disabled, only scopes whose referenced keys are all
+    // shredded in this segment are read per key (the pre-projection rule).
+    let project = |scope: Scope, keys: &std::collections::BTreeSet<String>, whole: bool| {
+        !whole
+            && !keys.is_empty()
+            && (projection || keys.iter().all(|k| footer.shredded(scope, k).is_some()))
     };
-    let shred_attr = use_shredded(Scope::Attributes, &plan.attr_keys, plan.whole_attributes);
-    let shred_res = use_shredded(Scope::Resource, &plan.resource_keys, plan.whole_resource);
+    let proj_attr = project(Scope::Attributes, &plan.attr_keys, plan.whole_attributes);
+    let proj_res = project(Scope::Resource, &plan.resource_keys, plan.whole_resource);
     for id in needed {
-        let skip = (*id == ColumnId::Attributes && shred_attr)
-            || (*id == ColumnId::ResourceAttributes && shred_res);
+        let skip = (*id == ColumnId::Attributes && proj_attr)
+            || (*id == ColumnId::ResourceAttributes && proj_res);
         if skip {
             continue;
         }
@@ -1172,19 +1183,21 @@ fn load_batch<'t>(
         }
     }
     for (scope, keys, on) in [
-        (Scope::Attributes, &plan.attr_keys, shred_attr),
-        (Scope::Resource, &plan.resource_keys, shred_res),
+        (Scope::Attributes, &plan.attr_keys, proj_attr),
+        (Scope::Resource, &plan.resource_keys, proj_res),
     ] {
         if !on {
             continue;
         }
-        for k in keys {
-            if let Some(vals) = seg.reader.read_shredded(scope, k)? {
-                stats.bytes_read += footer.shredded(scope, k).map_or(0, |c| c.len);
-                shredded.insert((scope, k.clone()), vals);
-            }
+        let keys: Vec<String> = keys.iter().cloned().collect();
+        if keys.iter().all(|k| footer.shredded(scope, k).is_some()) {
+            stats.shredded_reads += 1;
         }
-        stats.shredded_reads += 1;
+        let (vals, bytes) = seg.reader.read_map_keys(scope, &keys)?;
+        stats.bytes_read += bytes;
+        for (k, col) in keys.into_iter().zip(vals) {
+            shredded.insert((scope, k), col);
+        }
     }
     Ok(Batch {
         len: footer.row_count as usize,
@@ -1230,7 +1243,14 @@ fn scan_parallel(
                 let r = (|| -> Result<Partial> {
                     p.check_budget()?;
                     p.stats.segments_scanned += 1;
-                    let batch = load_batch(segs[i], template.plan, needed, tenant, &mut p.stats)?;
+                    let batch = load_batch(
+                        segs[i],
+                        template.plan,
+                        needed,
+                        tenant,
+                        &mut p.stats,
+                        template.opts.enable_map_projection,
+                    )?;
                     p.process(&batch)?;
                     p.check_budget()?;
                     let mut groups: Vec<(Vec<u8>, usize)> = p.groups.drain().collect();
@@ -1417,7 +1437,14 @@ fn run(
             }
             ctx.check_budget()?;
             ctx.stats.segments_scanned += 1;
-            let batch = load_batch(seg, plan, &needed, tenant, &mut ctx.stats)?;
+            let batch = load_batch(
+                seg,
+                plan,
+                &needed,
+                tenant,
+                &mut ctx.stats,
+                opts.enable_map_projection,
+            )?;
             ctx.process(&batch)?;
         }
     }

@@ -2,6 +2,21 @@
 
 ## Unreleased (0.0.1)
 ### Added
+- Fuzz targets `cursor`, `sealed` (encryption formats, encrypted WAL recovery)
+  and `map_projection`; 10-minute libFuzzer campaigns found no crashes
+  (≈ 8.2 M runs); CI fuzz smoke covers all 14 targets.
+- Attribute key projection: queries naming specific attribute keys no longer
+  decode whole maps (`QueryOptions::enable_map_projection`,
+  `strata-bench --no-map-projection`); query 10 of the suite 22× faster.
+### Fixed
+- Parquet import of a file using a codec this build lacks looped forever
+  (every row returned the same read error); read errors now abort the import
+  with a clear `unsupported` error. Nested Parquet columns are imported as
+  JSON structure instead of debug strings.
+### Added
+- Parquet import of snappy/gzip/lz4 files (pure-Rust codecs) and independent
+  interop verification against pyarrow and DuckDB (`scripts/parquet_interop.sh`,
+  CI job `parquet-interop`, fixtures `tests/fixtures/parquet-interop`).
 - Parquet export/import in `strata` (ADR-0025): `export --format parquet`
   (events, row group per page, atomic rename), `ingest` of `*.parquet` (exact
   timestamp conversion, aliases, extra columns → attributes); optional

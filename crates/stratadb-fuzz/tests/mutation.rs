@@ -162,6 +162,72 @@ fn seeds() -> Vec<(&'static str, Vec<Vec<u8>>)> {
                "body": {"kvlistValue": {"values": [{"key": "a", "value": {"arrayValue": {"values": [{"intValue": "1"}, {"bytesValue": "AAE="}]}}}]}},
                "traceId": "5B8EFFF798038103D269B633813FC60C", "attributes": [{"key": "d", "value": {"doubleValue": 1.5}}]}]}]}]}).to_string().into_bytes(),
     ];
+    // Real cursors of the `cursor` target's queries (selector byte + rest).
+    let mut cursors: Vec<Vec<u8>> = Vec::new();
+    for (sel, sql) in [
+        (1u8, "SELECT body FROM logs ORDER BY event_time DESC"),
+        (0, "SELECT body FROM logs"),
+    ] {
+        let p = stratadb_query::execute_page(
+            &e.snapshot(&t),
+            sql,
+            &stratadb_query::QueryOptions::default(),
+            &stratadb_query::PageRequest {
+                page_size: 2,
+                cursor: None,
+            },
+        )
+        .unwrap();
+        let text = p.next_cursor.unwrap();
+        let mut seed = vec![sel];
+        seed.extend(stratadb_query::page::fuzz_hooks::cursor_rest(&text).unwrap());
+        cursors.push(seed);
+        let mut raw = vec![sel];
+        raw.extend_from_slice(text.as_bytes());
+        cursors.push(raw);
+    }
+    // Sealed files, KEYRING and an encrypted WAL from the golden fixture.
+    let fx =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/encrypted-v1");
+    let sealed: Vec<Vec<u8>> = [
+        "MANIFEST",
+        "KEYRING",
+        "segments/enc/seg-00000000000000000001.sseg",
+        "wal/wal-00000000000000000001.log",
+    ]
+    .iter()
+    .map(|f| std::fs::read(fx.join(f)).unwrap())
+    .collect();
+    // Map chunks: selector byte (key mask, rows) + encoded maps.
+    let maps = {
+        use stratadb_common::codec::Encoder;
+        let mut out = Vec::new();
+        for sel in [0b1_1111u8, 0b0_0110 | (2 << 5)] {
+            let mut enc = Encoder::new();
+            for i in 0..3i64 {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("a".to_owned(), Value::Int(i));
+                m.insert(
+                    "hot".to_owned(),
+                    Value::List(vec![Value::from("x"), Value::Null]),
+                );
+                if i == 1 {
+                    m.insert(
+                        "nested".to_owned(),
+                        Value::Map(std::collections::BTreeMap::from([(
+                            "k".to_owned(),
+                            Value::Float(1.5),
+                        )])),
+                    );
+                }
+                stratadb_schema::codec::encode_map(&mut enc, &m);
+            }
+            let mut seed = vec![sel];
+            seed.extend(enc.into_inner());
+            out.push(seed);
+        }
+        out
+    };
     let config = b"config_version = 1\ndata_dir = \"/d\"\nlisten = \"127.0.0.1:1\"\n[limits]\nmax_query_rows = 5\n[storage]\nbloom_attribute_keys = [\"a\"]\ndisk_reserve_ratio = 0.1\n[tls]\ncert = \"/c\"\nkey = \"/k\"\n".to_vec();
     drop(e);
     vec![
@@ -183,6 +249,9 @@ fn seeds() -> Vec<(&'static str, Vec<Vec<u8>>)> {
         ),
         ("config", vec![config]),
         ("security_files", vec![tokens, audit]),
+        ("cursor", cursors),
+        ("sealed", sealed),
+        ("map_projection", maps),
     ]
 }
 
@@ -234,7 +303,10 @@ fn no_decoder_panics_on_mutated_inputs() {
             }
         }
         let mut r = Rng(0x5eed ^ name.len() as u64);
-        let n = if *name == "wal_recovery" || *name == "segment" || *name == "security_files" {
+        let n = if matches!(
+            *name,
+            "wal_recovery" | "segment" | "security_files" | "sealed" | "cursor"
+        ) {
             iters / 3
         } else {
             iters

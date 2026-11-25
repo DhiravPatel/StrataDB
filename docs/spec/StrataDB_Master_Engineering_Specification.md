@@ -3,7 +3,7 @@
 ## A production-oriented, open-source database purpose-built for structured logs
 
 **Document type:** Master product, architecture, implementation,
-security, operations, and release specification\
+security, operations, Studio GUI, and release specification\
 **Status:** Proposed engineering baseline --- decisions must be
 validated by RFCs and benchmarks\
 **Version:** 0.1\
@@ -16,7 +16,7 @@ and patent review\
 **Primary workload:** High-volume structured application and
 infrastructure logs
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 0. Executive direction
 
@@ -80,6 +80,7 @@ publish reproducible results.
     the system without vendor assistance.
 14. A failed optimization must be safely disableable.
 15. Compatibility and migration are product features.
+16. StrataDB Studio is an official, optional, self-hosted administration UI; core server and CLI operation must not depend on it.
 
 ## 0.4 Non-goals for the initial release
 
@@ -102,9 +103,9 @@ The first release is not intended to be:
 
 ## 0.5 Release strategy
 
-  -----------------------------------------------------------------------------------------------------------------------------------------------
+  -----------------------------------------------------------------------
   Release                 Scope                   Exit condition
-  -----------------------------------------------------------------------------------------------------------------------------------------------
+  ----------------------- ----------------------- -----------------------
   Research prototypes     WAL, segment, index,    Measured and reviewed
                           query experiments       design decisions
 
@@ -126,11 +127,11 @@ The first release is not intended to be:
 
   1.0                     Stable self-hosted      All release gates in
                           release                 this document pass
-  -----------------------------------------------------------------------------------------------------------------------------------------------
+  -----------------------------------------------------------------------
 
 Do not skip release gates to reach a marketing date.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 1. Users, use cases, and workload contract
 
@@ -233,7 +234,7 @@ A benchmark result without this workload description is incomplete.
 -   Desired behavior: ingestion backpressure, bounded memory, fair
     resource scheduling, no starvation.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 2. Functional requirements
 
@@ -353,7 +354,7 @@ Provide:
 -   Build information and format versions.
 -   Diagnostic bundle generation with secrets redacted.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 3. Non-functional requirements and service objectives
 
@@ -423,7 +424,7 @@ that node. Backups to a separate failure domain are required.
 -   Ingestion queue bound.
 -   Disk high-watermark behavior.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 4. System architecture
 
@@ -537,7 +538,7 @@ Required ADRs:
 14. Object storage interface.
 15. Compatibility and upgrade policy.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 5. Rust workspace and repository architecture
 
@@ -553,10 +554,10 @@ stratadb/
 ├── README.md
 ├── LICENSE
 ├── NOTICE
-├── docs/CONTRIBUTING.md
-├── docs/CODE_OF_CONDUCT.md
-├── docs/SECURITY.md
-├── docs/project/GOVERNANCE.md
+├── CONTRIBUTING.md
+├── CODE_OF_CONDUCT.md
+├── SECURITY.md
+├── GOVERNANCE.md
 ├── CHANGELOG.md
 ├── .github/
 │   ├── workflows/
@@ -596,8 +597,15 @@ stratadb/
 │   ├── stratadb-server/
 │   ├── stratadb-cli/
 │   ├── stratadb-bench/
-│   ├── stratadb-doctor/
-│   └── stratadb-console/
+│   └── stratadb-doctor/
+├── studio/
+│   ├── package.json
+│   ├── pnpm-lock.yaml
+│   ├── vite.config.ts
+│   ├── src/
+│   ├── public/
+│   ├── e2e/
+│   └── README.md
 ├── sdk/
 │   ├── rust/
 │   ├── go/
@@ -676,7 +684,7 @@ the final tree.
 -   Define error categories and retryability.
 -   Keep dependency features minimal.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 6. Data model and schema system
 
@@ -770,7 +778,7 @@ Validate:
 Reject or quarantine invalid records according to batch error semantics.
 Never silently drop malformed records.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 7. Ingestion architecture
 
@@ -870,7 +878,7 @@ Implement OTLP logs with documented mapping:
 Preserve fields that cannot be mapped losslessly. Provide protocol
 conformance tests and interoperability fixtures.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 8. WAL and durability engine
 
@@ -983,7 +991,7 @@ Use atomic metadata transitions and filesystem-specific durability
 practices. Document assumptions about rename and directory fsync on
 supported platforms.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 9. Memtable and flush pipeline
 
@@ -1034,7 +1042,7 @@ A query must see a consistent combination of:
 The flush protocol must prevent both missing records and double-counted
 records.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 10. Segment and storage format
 
@@ -1149,7 +1157,7 @@ written manifest must never cause silent data loss.
 -   Never silently return incomplete results without an explicit
     partial-result marker.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 11. Compression and encoding
 
@@ -1208,7 +1216,7 @@ Measure:
 
 Report per-field-type results, not only aggregate ratios.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 12. Index architecture
 
@@ -1319,7 +1327,7 @@ trustworthy.
 
 Index publication must be atomic with manifest visibility rules.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 13. Query language and execution engine
 
@@ -1435,7 +1443,7 @@ Show:
 -   Operator tree.
 -   Cache hits and misses.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 14. Full-text and message search
 
@@ -1476,7 +1484,7 @@ Define:
 -   Require time-range narrowing for expensive operations.
 -   Expose scanned bytes and cancellation.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 15. Catalog and metadata
 
@@ -1512,7 +1520,7 @@ product.
 -   Locking model.
 -   Atomic manifest publication.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 16. Compaction and retention
 
@@ -1581,7 +1589,7 @@ Define how deletes interact with:
 -   Late-arriving records.
 -   Concurrent queries.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 17. Caching
 
@@ -1609,7 +1617,7 @@ Define how deletes interact with:
 Measure warm and cold behavior separately. Do not compare one database
 with a warm cache to another with a cold cache.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 18. Security architecture
 
@@ -1764,7 +1772,7 @@ include secrets or sensitive payloads by default.
 -   Safe file creation flags.
 -   Dependency scanning.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 19. Backup, restore, and disaster recovery
 
@@ -1819,7 +1827,7 @@ Restore workflow:
 
 A backup feature is not complete until restore drills pass.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 20. Distributed architecture
 
@@ -1930,7 +1938,7 @@ while hardware, disks, bandwidth, and hosted storage incur costs.
 Define consistency, multipart upload, retry, checksum, object
 versioning, and deletion semantics for every backend.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 21. API design
 
@@ -2009,7 +2017,7 @@ Include:
 -   Never silently change field meanings.
 -   Keep SDKs generated or tested against the canonical schema.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 22. CLI and developer experience
 
@@ -2071,7 +2079,7 @@ Support:
 
 It must not print secret values.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 23. SDKs and integrations
 
@@ -2126,41 +2134,479 @@ Provide a data source or documented integration only when the query API
 is stable. Do not claim full Grafana compatibility based on a simple
 HTTP endpoint.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
-# 24. Management console
+# 24. StrataDB Studio — full database administration application
 
-The web console is useful but must not delay the database engine.
+StrataDB Studio is the official graphical administration environment for
+StrataDB. Its breadth of database-management workflows should be
+comparable to the experience users expect from mature tools such as
+pgAdmin and phpMyAdmin. It must be purpose-built for StrataDB's event and
+log database model rather than copying relational-database concepts that
+StrataDB does not implement.
 
-Initial screens:
+The goal is comparable administrative completeness, not pixel-for-pixel
+imitation, use of another product's branding, or implementation of
+unsupported PostgreSQL/MySQL features. Studio must never imply support
+for foreign keys, relational joins, stored procedures, extensions, or
+other capabilities unless the StrataDB engine actually implements them.
 
--   Cluster overview.
--   Ingestion throughput.
--   Storage usage.
--   Query explorer.
--   Query history.
--   Schema browser.
--   Segment explorer.
--   Index status.
--   Retention policies.
--   Active queries.
--   Tenant and user administration.
--   Backup and restore status.
--   Node health.
--   Audit log.
+Studio is an optional, self-hosted management application. The database
+server and CLI must remain fully usable without Studio. Studio must not
+require a StrataDB cloud account, external telemetry service, paid API,
+or vendor-hosted control plane.
 
-Security:
+## 24.1 Product goals and parity definition
 
--   No secrets in browser storage unless justified.
--   CSRF protection where cookie authentication is used.
--   Secure session cookies.
--   Strict CORS policy.
--   Content Security Policy.
--   Output escaping.
--   Server-side authorization on every operation.
--   No direct filesystem access from browser.
+Studio must let an authorized operator perform the normal lifecycle of a
+StrataDB instance without needing to edit database files manually:
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+- Connect to one or many local or remote StrataDB instances.
+- Inspect instance, database, namespace, table/stream, schema, segment,
+  index, tenant, user, role, query, job, and backup metadata.
+- Create and manage supported database objects.
+- Write, run, explain, save, and inspect StrataQL queries.
+- Browse and filter actual stored events.
+- Observe ingestion, storage, query, compaction, and health activity.
+- Administer authentication, authorization, quotas, and retention.
+- Start and monitor supported maintenance tasks.
+- Create, verify, list, and restore backups with safe confirmation.
+- Inspect server configuration and diagnostics without exposing secrets.
+- Export query results and operational reports.
+
+Parity means a coherent, mature administration workflow: connection
+management, object browser, query tool, data browser, properties,
+monitoring, maintenance, security, backup/restore, and preferences. It
+does not mean implementing every feature of pgAdmin or phpMyAdmin.
+
+## 24.2 Application architecture and repository layout
+
+Studio is a separately buildable frontend application. The initial
+recommended stack is:
+
+- React and TypeScript.
+- Vite.
+- Tailwind CSS.
+- Accessible component primitives, for example shadcn/ui.
+- Monaco Editor for StrataQL editing.
+- Apache ECharts or another reviewed open-source chart library.
+- A typed API client generated from or checked against the canonical
+  OpenAPI schema.
+- Playwright for end-to-end tests.
+- Vitest and Testing Library for component and unit tests.
+
+The Rust server exposes versioned, authenticated management APIs and a
+WebSocket or server-sent-event interface for live updates. Studio must
+not directly read, write, rename, or delete database files. All actions
+must pass through server-side service interfaces that enforce the same
+catalog, storage, authorization, audit, and durability invariants as the
+CLI and other clients.
+
+Suggested layout:
+
+```text
+studio/
+  package.json
+  pnpm-lock.yaml
+  tsconfig.json
+  vite.config.ts
+  src/
+    app/                 # routing, shell, providers, feature flags
+    components/          # shared accessible UI components
+    features/
+      connections/       # saved connection profiles
+      overview/          # instance and database dashboards
+      object-explorer/   # tree, object details, context actions
+      query-tool/        # editor, tabs, results, explain, history
+      data-browser/      # event search and record inspection
+      schemas/           # schema and field browser
+      storage/           # WAL, segments, indexes, compaction
+      monitoring/        # metrics, active queries, health
+      security/          # users, roles, tokens, tenants, audit
+      retention/         # policies and deletion previews
+      backups/           # backup, verification, restore
+      jobs/              # background task monitoring
+      settings/          # preferences and instance configuration
+      diagnostics/       # doctor results and diagnostic bundles
+    lib/                 # typed API client, auth, formatting
+    routes/
+    styles/
+    test/
+  e2e/
+  public/
+  README.md
+```
+
+Do not create every screen as an empty placeholder. Build feature areas
+incrementally against working API contracts.
+
+## 24.3 Global application shell and interaction model
+
+The desktop-first layout should provide:
+
+- A top application bar with StrataDB identity, active connection,
+  connection status, server version, theme, help, and account/session
+  controls.
+- A left object explorer with expandable instance/database/object
+  hierarchy, search, refresh, and context menus.
+- A central workspace with closable tabs for query tools, object
+  properties, data browser, and monitoring views.
+- A contextual properties/details panel where it improves workflows.
+- A bottom or dockable messages/task panel for query messages,
+  background jobs, notices, and errors.
+- Breadcrumbs and clear indication of the active instance, database,
+  and tenant scope.
+- Keyboard navigation, accessible labels, focus management, and
+  keyboard shortcuts.
+- Dark and light themes, responsive behavior, and persisted user
+  preferences.
+
+The interface must handle loading, empty, stale, offline, permission
+ denied, partial failure, and server-upgrade states explicitly. Avoid
+showing fake values or pretending an unavailable server is healthy.
+
+Connection profiles must support local and remote endpoints, TLS
+settings, authentication method, connection test, server identity
+verification, and safe secret handling. Persisted credentials must use
+an appropriate OS credential store when available or a documented
+secure alternative. Do not store plaintext secrets in localStorage,
+URLs, browser logs, analytics, or exported diagnostic bundles.
+
+## 24.4 Object explorer and object properties
+
+The tree must reflect actual StrataDB catalog objects. Its exact nodes
+must follow implemented engine concepts, but should support the
+following hierarchy when those objects exist:
+
+```text
+Connections
+  Local StrataDB
+    Instance
+      Overview
+      Databases
+        observability
+          Tables / Streams
+            logs
+              Columns / Fields
+              Schema versions
+              Partitions / Time ranges
+              Segments
+              Indexes
+          Views (only if implemented)
+      Tenants
+      Users and Roles
+      Active Queries
+      Background Jobs
+      Backups
+      Server Configuration
+      Diagnostics
+```
+
+Required interactions:
+
+- Expand/collapse, refresh, filter, and search objects.
+- Object-specific context menus with only supported operations.
+- Open object properties and metadata.
+- Display object identifiers, creation/version metadata, schema,
+  ownership/permissions, and storage statistics where available.
+- Show clear disabled states and explanations for unsupported operations.
+- Confirm destructive operations and display their scope and impact.
+- Never allow the frontend tree to be treated as an authorization
+  boundary; every API request must be authorized by the server.
+
+Do not present a relational schema diagram or foreign-key browser unless
+StrataDB adds those semantics in a future, separately specified feature.
+
+## 24.5 Query Tool — first-class SQL workbench
+
+The Query Tool is a core Studio feature and must include:
+
+- Monaco-based StrataQL editor with syntax highlighting.
+- Context-aware autocomplete for databases, tables/streams, fields,
+  functions, keywords, and supported types.
+- Syntax validation and useful line/column diagnostics.
+- Multiple query tabs and unsaved-change warnings.
+- Run, cancel, explain, and explain-analyze actions.
+- Configurable query timeout, row limit, and safe resource options.
+- Query parameter support only if the engine API defines safe binding
+  semantics; never interpolate untrusted values into query strings.
+- Results grid with sorting and pagination only where server semantics
+  guarantee correctness.
+- Raw JSON/event view and schema display.
+- Query messages, warnings, execution duration, bytes scanned, segments
+  scanned/pruned, indexes used, and resource usage when available.
+- Query history with search, status, timestamp, duration, and the ability
+  to rerun a query subject to current permissions.
+- Save and organize query snippets locally or in server-side saved
+  queries only after a secure ownership/permission model exists.
+- Export results to CSV and JSON with row/byte limits and clear partial
+  result handling.
+- Copy query and copy result actions.
+- Explain-plan visualization based on the real plan response.
+
+A query cancellation action must reach the server and cancel execution;
+hiding a spinner is not cancellation. Large results must be streamed or
+paged with bounded memory. Never load an unbounded result set into the
+browser.
+
+## 24.6 Log and event data browser
+
+Provide an event-centric data browser tailored to StrataDB:
+
+- Time-range selector with explicit timezone display.
+- Search by service, severity, trace ID, span ID, request ID, and
+  arbitrary supported attributes.
+- Structured filter builder that generates valid StrataQL using safe
+  parameterization where supported.
+- Live tail with pause/resume, bounded buffering, and visible dropped or
+  delayed update indicators.
+- Table/grid view and raw JSON view.
+- Expandable event detail with typed attributes and resource attributes.
+- Highlight matching fields without changing the underlying data.
+- Stable pagination/cursor semantics and explicit result limits.
+- Export only the records actually returned, with clear truncation
+  notices.
+- Display event time and ingest time separately.
+- Explain missing versus null values consistently with query semantics.
+
+Live tail must use bounded client and server buffers, support reconnect
+and resume semantics where available, and never silently imply that all
+historical events were received during a disconnect.
+
+## 24.7 Instance and database overview
+
+The overview must display real server-provided information:
+
+- Instance identity, version, uptime, build, storage format versions.
+- Readiness and health state.
+- Ingestion events/s and bytes/s over selectable windows.
+- Write acknowledgement latency percentiles where measured.
+- Query throughput and latency percentiles.
+- Active/running/queued queries.
+- WAL size, active memtable usage, segment count and disk usage.
+- Index storage and compression ratio.
+- Compaction and retention activity.
+- Available disk space and configured high-watermarks.
+- Tenant/resource quota utilization where authorized.
+- Replication and cluster state only in distributed mode.
+
+Every metric must identify its unit, time window, and whether it is a
+rate, gauge, or cumulative counter. Missing metrics must be shown as
+unavailable, not as zero. Avoid misleading charts and unsupported
+aggregated health scores.
+
+## 24.8 Storage and maintenance administration
+
+Provide read-only inspection first, then guarded actions as the engine
+supports them:
+
+- WAL segment listing, sequence ranges, size, sync/health status, and
+  recovery diagnostics. Do not expose arbitrary WAL mutation.
+- Segment list with ID, time range, record count, size, checksum status,
+  schema version, and lifecycle state.
+- Segment detail including column statistics and index references.
+- Index list, type, fields, size, build state, and verification status.
+- Index build/rebuild/drop only through supported catalog operations.
+- Compaction queue, running tasks, progress, inputs, outputs, resource
+  usage, and failure reasons.
+- Trigger compaction only when supported, permissioned, and safe.
+- Retention policy editor with preview of affected time ranges and
+  estimated data volume before applying deletion.
+- Integrity verification and scrub jobs with progress and reports.
+- Disk usage breakdown and low-disk warnings.
+
+The UI must never directly delete segment or WAL files. Destructive
+storage operations must be implemented by the database service with
+transactional metadata handling, audit records, and recovery-safe
+semantics.
+
+## 24.9 Security and tenant administration
+
+When the relevant server features are implemented, Studio must support:
+
+- Users and service identities.
+- Roles and permission grants.
+- API token creation, listing metadata, rotation, and revocation.
+- Tenant listing and configuration.
+- Per-tenant ingestion/storage/query quotas.
+- Authentication configuration inspection.
+- TLS certificate/connection status without exposing private keys.
+- Audit event search and export.
+- Session management and explicit logout.
+
+Token secrets must be displayed only at creation/rotation time when the
+server contract permits it. Store only server-side token hashes where
+appropriate. Enforce least privilege. Administrative actions must be
+server-authorized and audited. Never rely on hiding a button to enforce
+security.
+
+## 24.10 Backup, restore, and disaster recovery UI
+
+Provide workflows for:
+
+- Create backup with destination, scope, consistency mode, encryption
+  option, and retention metadata.
+- Show backup job progress and final manifest/checksum status.
+- List backups and inspect their compatibility metadata.
+- Verify backup integrity.
+- Preview restore target, data scope, format compatibility, and
+  overwrite/conflict behavior.
+- Require explicit confirmation and a typed confirmation phrase for
+  destructive in-place restore.
+- Restore to a new data directory or isolated instance where supported.
+- Display restore progress and post-restore verification.
+
+Do not claim a backup is valid merely because an archive exists. The
+server must verify checksums and the project must run automated restore
+drills. Studio must never upload backup contents to a vendor service.
+
+## 24.11 Background jobs, monitoring, and diagnostics
+
+Provide a task center for compaction, index builds, retention, backup,
+restore, scrubbing, and future cluster maintenance. Show queued/running/
+succeeded/failed/cancelled state, start time, duration, progress when
+reliably measurable, and structured failure details.
+
+Provide active query monitoring with query ID, user/tenant scope subject
+to permissions, start time, runtime, resource consumption, and a
+permissioned cancel action. Do not expose query text or sensitive event
+values to users who lack permission.
+
+Diagnostics should surface `strata doctor`-equivalent checks through a
+safe API and allow downloading a redacted diagnostic bundle. Redaction
+must happen server-side as well as client-side.
+
+## 24.12 API contracts required by Studio
+
+Define and version a management API contract before implementing each
+screen. The following are capability groups, not permission to invent
+unimplemented endpoints:
+
+- Instance: identity, version, health, readiness, capabilities.
+- Catalog: list/get databases, tables/streams, schemas, fields, segments,
+  indexes, and supported object properties.
+- Query: submit, poll, cancel, explain, analyze, history where retained.
+- Data: bounded search, cursor pagination, event detail, live tail.
+- Metrics: time-series metrics and current gauges with explicit units.
+- Jobs: list, inspect, start, cancel where cancellation is safe.
+- Storage: inspect WAL/segments/indexes and request supported
+  maintenance operations.
+- Security: users, roles, grants, tokens, tenants, audit events.
+- Retention: inspect, preview, create/update policy, execute only through
+  safe engine-controlled operations.
+- Backup: create, list, verify, inspect, restore.
+- Configuration: redacted effective config and validated updates for
+  explicitly reloadable fields only.
+- Diagnostics: run checks and download redacted reports.
+
+For every endpoint specify request/response schemas, pagination,
+filtering, authentication, authorization, rate limits, error semantics,
+versioning, cancellation, and audit requirements. Maintain OpenAPI as
+the canonical API description and generate or contract-test the
+TypeScript client against it.
+
+## 24.13 Security requirements
+
+- All management endpoints require authentication except explicitly
+  documented minimal health endpoints.
+- Enforce authorization in Rust service boundaries, not just routes or
+  frontend components.
+- Apply tenant scope to every catalog, query, metrics, event, cache, and
+  job lookup.
+- Use secure session cookies when cookie authentication is selected;
+  implement CSRF protections for state-changing requests.
+- Use strict CORS allowlists and a restrictive Content Security Policy.
+- Prevent XSS through output encoding and safe rendering of event bodies.
+- Do not render event content as trusted HTML.
+- Protect WebSocket/SSE connections with equivalent authentication,
+  authorization, origin validation, and resource limits.
+- Apply rate limits and request-size limits to management APIs.
+- Redact tokens, passwords, private keys, and sensitive query parameters
+  from logs and diagnostics.
+- Require confirmation for destructive operations and enforce the same
+  protection on the server for high-risk operations.
+- Audit security-sensitive changes and administrative actions.
+- Never ship default admin credentials. Provide a secure first-run
+  bootstrap flow.
+
+## 24.14 Deployment and offline operation
+
+Support three self-hosted modes:
+
+1. Bundled: StrataDB server serves a built Studio asset bundle from a
+   configurable listener, disabled or loopback-only by default for
+   initial development unless explicitly enabled.
+2. Standalone: Studio runs as a separate static web application or
+   self-hosted container and connects to a remote StrataDB API.
+3. Development: Vite development server proxies API requests to a local
+   StrataDB instance.
+
+The exact ports must be configurable and documented. Do not assume that
+PostgreSQL's default port is appropriate for StrataDB; select and reserve
+StrataDB ports through an ADR and check conflicts. Do not expose the
+administrative UI publicly by default. Recommend loopback binding for
+local use and TLS/VPN/private networking for remote administration.
+
+Studio must load and operate without external fonts, analytics, CDN
+scripts, remote icon services, or third-party runtime dependencies. Pin
+and bundle required assets. Core database and Studio operation must not
+require internet access after installation and dependency download.
+
+## 24.15 Testing and quality gates
+
+Required Studio testing:
+
+- Unit tests for formatting, state, permissions, and API client logic.
+- Component tests for every critical workflow.
+- Contract tests against OpenAPI schemas.
+- End-to-end tests against a real local StrataDB instance.
+- Authentication and session expiry tests.
+- Role and tenant isolation tests, including direct API invocation.
+- Query submit/cancel/timeout and large-result tests.
+- WebSocket/SSE reconnect and bounded-buffer tests.
+- Destructive action confirmation tests.
+- Backup/restore workflow tests.
+- XSS/CSRF/CORS/security regression tests.
+- Keyboard accessibility and automated accessibility checks.
+- Browser compatibility for supported browsers.
+- Build reproducibility and dependency/license checks.
+
+A screen is not complete when it only renders. Its full workflow must
+work against a real server, enforce authorization, handle failures, and
+have tests.
+
+## 24.16 Studio milestones and release gates
+
+Studio work proceeds alongside the database roadmap but must not delay
+WAL durability, recovery, or core storage correctness.
+
+- Studio S0 — UX and API architecture: information architecture,
+  component system, API capability matrix, authentication model, and
+  clickable design prototype. Exit: approved API contracts and threat
+  model.
+- Studio S1 — Application foundation: app shell, connection manager,
+  server identity, health, theme, typed API client. Exit: connect to a
+  real local instance with secure session handling.
+- Studio S2 — Query workbench: editor, autocomplete, submit/cancel,
+  results, explain, history. Exit: real queries and bounded results.
+- Studio S3 — Object explorer and event browser: catalog tree, object
+  properties, structured search, event details, live tail. Exit: actual
+  catalog and event data with permission tests.
+- Studio S4 — Operations: overview, metrics, active queries, jobs,
+  WAL/segment/index inspection, compaction and retention workflows.
+  Exit: real operational APIs and audit behavior.
+- Studio S5 — Administration: users, roles, tokens, tenants, backup,
+  restore, diagnostics, settings. Exit: security and restore drills pass.
+- Studio S6 — Production release: accessibility, browser testing,
+  packaging, offline behavior, CSP, security review, documentation,
+  upgrade compatibility, and release automation.
+
+Studio production readiness requires all supported workflows to pass
+end-to-end tests against the release candidate server. Unsupported
+features must be clearly identified, not represented by nonfunctional
+controls.
+
+------------------------------------------------------------------------
 
 # 25. Observability of StrataDB itself
 
@@ -2242,7 +2688,7 @@ payloads by default.
 Do not make liveness fail merely because an optional dependency is
 unavailable; otherwise orchestrators may create restart loops.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 26. Testing strategy
 
@@ -2351,7 +2797,7 @@ For distributed mode:
 
 Use deterministic seeds and preserve failure traces.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 27. Benchmark laboratory
 
@@ -2449,7 +2895,7 @@ No public claim such as "X times faster" without:
 -   Raw results.
 -   Clear version identifiers.
 
-------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------
 
 # 28. Capacity planning
 
@@ -2923,6 +3369,37 @@ Exit gate:
 
 ------------------------------------------------------------------------
 
+## Studio implementation workstream (parallel, dependency-aware)
+
+Studio is a first-class product deliverable. It may be developed in
+parallel with core database work only when the required API contracts
+are stable. The database remains the priority whenever work competes
+with durability, recovery, or tenant isolation.
+
+-   ST-001 Approve Studio information architecture and UX conventions.
+-   ST-002 Create the standalone React/TypeScript application and build.
+-   ST-003 Define OpenAPI management contracts and typed client.
+-   ST-004 Implement secure connection manager and instance identity.
+-   ST-005 Implement application shell, navigation, tabs, and themes.
+-   ST-006 Implement overview and health screens from real metrics.
+-   ST-007 Implement StrataQL query editor and result grid.
+-   ST-008 Implement query explain, cancellation, and history.
+-   ST-009 Implement catalog/object explorer and properties.
+-   ST-010 Implement event browser and live tail.
+-   ST-011 Implement segment, WAL, and index inspection.
+-   ST-012 Implement jobs, compaction, and retention administration.
+-   ST-013 Implement users, roles, tokens, tenants, and audit screens.
+-   ST-014 Implement backup, verification, and restore workflows.
+-   ST-015 Implement diagnostics, preferences, and documentation links.
+-   ST-016 Add end-to-end, accessibility, and security test suites.
+-   ST-017 Package bundled and standalone self-hosted deployment modes.
+-   ST-018 Complete Studio release security and compatibility review.
+
+Each ticket must identify its server API dependency and must not mock a
+missing production endpoint as if it were implemented.
+
+------------------------------------------------------------------------
+
 # 34. Production acceptance checklist
 
 A release cannot be called production-ready merely because the happy
@@ -2988,7 +3465,31 @@ path works.
 -   [ ] Competitor comparison is fair and reproducible.
 -   [ ] Regressions have thresholds and review process.
 
-## 34.6 Release
+## 34.6 Studio administration interface
+
+-   [ ] Studio connects to a real local StrataDB instance.
+-   [ ] Studio can securely connect to a remote instance.
+-   [ ] Connection identity and server version are verified and visible.
+-   [ ] Object explorer reflects actual catalog metadata.
+-   [ ] Query Tool executes, cancels, explains, and displays real queries.
+-   [ ] Large results are paginated/streamed with bounded browser memory.
+-   [ ] Event browser supports bounded time-range search and event detail.
+-   [ ] Live tail reconnect behavior and dropped-update semantics are
+        explicit.
+-   [ ] Overview and monitoring use real server metrics.
+-   [ ] WAL, segments, indexes, and jobs are safely inspectable.
+-   [ ] Maintenance actions are server-controlled and audited.
+-   [ ] User, role, token, and tenant workflows enforce least privilege.
+-   [ ] Backup verification and restore workflows pass automated drills.
+-   [ ] Destructive actions have server-side safeguards and confirmations.
+-   [ ] No secret is exposed in browser storage, URLs, logs, or bundles.
+-   [ ] Studio works without external runtime services or CDNs.
+-   [ ] Accessibility, browser, API contract, and E2E tests pass.
+-   [ ] Bundled and standalone deployment modes are documented and tested.
+-   [ ] Unsupported database features are not shown as implemented.
+
+## 34.7 Release
+
 
 -   [ ] License review complete.
 -   [ ] SBOM generated.

@@ -222,6 +222,119 @@ pub fn fuzz_security_files(data: &[u8]) {
 pub type Target = fn(&[u8]);
 
 /// All targets with a name, for the mutation runner.
+/// Queries whose cursors the `cursor` target exercises (byte 0 selects one).
+const CURSOR_QUERIES: [&str; 4] = [
+    "SELECT body FROM logs",
+    "SELECT body FROM logs ORDER BY event_time DESC",
+    "SELECT service, attributes['n'] FROM logs ORDER BY service, attributes['f'] DESC LIMIT 7",
+    "SELECT body FROM logs WHERE attributes['nested'] IS NOT MISSING ORDER BY attributes['nested'], body",
+];
+
+/// Pagination cursors (client-supplied tokens): raw text, raw bodies, and
+/// bodies wrapped with a valid version/fingerprint/CRC so fuzzed key values
+/// reach the executor's cursor comparisons.
+pub fn fuzz_cursor(data: &[u8]) {
+    let Some((&sel, rest)) = data.split_first() else {
+        return;
+    };
+    let _ = stratadb_query::page::fuzz_hooks::decode_body(rest);
+    let (_, e) = query_engine();
+    let t = tenant();
+    let sql = CURSOR_QUERIES[usize::from(sel) % CURSOR_QUERIES.len()];
+    let opts = stratadb_query::QueryOptions {
+        max_rows_scanned: 10_000,
+        max_result_rows: 100,
+        timeout: std::time::Duration::from_secs(2),
+        parallelism: 1,
+        ..Default::default()
+    };
+    let snap = e.snapshot(&t);
+    let page = |cursor: String| {
+        let _ = stratadb_query::execute_page(
+            &snap,
+            sql,
+            &opts,
+            &stratadb_query::PageRequest {
+                page_size: 1 + usize::from(sel >> 4),
+                cursor: Some(cursor),
+            },
+        );
+    };
+    page(String::from_utf8_lossy(rest).into_owned());
+    page(stratadb_query::page::fuzz_hooks::cursor_text(&t, sql, rest));
+}
+
+/// Key of the golden encrypted fixture (`tests/fixtures/encrypted-v1`).
+const FIXTURE_KEY: [u8; 32] = [0x5a; 32];
+
+fn fixture_keyring() -> &'static std::sync::Arc<stratadb_crypto::Keyring> {
+    static K: OnceLock<std::sync::Arc<stratadb_crypto::Keyring>> = OnceLock::new();
+    K.get_or_init(|| {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/encrypted-v1");
+        let p =
+            stratadb_crypto::StaticKeyProvider(stratadb_crypto::SecretKey::from_bytes(FIXTURE_KEY));
+        std::sync::Arc::new(stratadb_crypto::Keyring::load(&dir, &p).unwrap().unwrap())
+    })
+}
+
+/// Encryption-at-rest decoders: sealed container (header, length checks,
+/// block authentication, random-access reads), KEYRING framing, and recovery
+/// of an encrypted WAL segment — all with the fixture's real keys.
+pub fn fuzz_sealed(data: &[u8]) {
+    use stratadb_crypto::container;
+    let keys = fixture_keyring();
+    let _ = container::Header::decode(data, "fuzz");
+    let _ = container::open_bytes(keys, data, "fuzz");
+    let _ = stratadb_crypto::Keyring::check_format(data);
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("f");
+    std::fs::write(&p, data).unwrap();
+    if let Ok(f) = std::fs::File::open(&p) {
+        if let Ok(s) = container::SealedFile::open(f, keys, &p) {
+            let len = s.len();
+            for (off, n) in [(0, 16), (len / 2, 100), (len.saturating_sub(16), 16)] {
+                let mut buf = vec![0u8; n.min(4096)];
+                let _ = s.read_exact_at(&mut buf, off);
+            }
+        }
+    }
+    // The same bytes as an encrypted WAL segment.
+    let wal = tempfile::tempdir().unwrap();
+    std::fs::write(
+        wal.path().join(stratadb_wal::format::segment_file_name(1)),
+        data,
+    )
+    .unwrap();
+    let o = stratadb_wal::WalOptions {
+        keys: Some(std::sync::Arc::clone(keys)),
+        ..Default::default()
+    };
+    let _ = stratadb_wal::Wal::open(wal.path(), o, 0, |_, _, p| {
+        let _ = stratadb_schema::codec::decode_batch(p, &DecodeLimits::default());
+        Ok(())
+    });
+}
+
+/// Attribute key projection over a map chunk and value skipping.
+pub fn fuzz_map_projection(data: &[u8]) {
+    let Some((&sel, rest)) = data.split_first() else {
+        return;
+    };
+    const KEYS: [&str; 5] = ["", "a", "hot", "n", "zz"];
+    let keys: Vec<String> = KEYS
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| sel & (1 << i) != 0)
+        .map(|(_, k)| (*k).to_owned())
+        .collect();
+    let rows = 1 + usize::from(sel >> 5);
+    let _ = stratadb_segment::fuzz_hooks::project_map_keys(rest, rows, &keys);
+    let lim = DecodeLimits::default();
+    let mut d = Decoder::new(rest, "fuzz");
+    let _ = stratadb_schema::codec::skip_value(&mut d, &lim);
+}
+
 pub const TARGETS: &[(&str, Target)] = &[
     ("wal_frames", fuzz_wal_frames),
     ("wal_recovery", fuzz_wal_recovery),
@@ -234,4 +347,7 @@ pub const TARGETS: &[(&str, Target)] = &[
     ("otlp_proto", fuzz_otlp_proto),
     ("config", fuzz_config),
     ("security_files", fuzz_security_files),
+    ("cursor", fuzz_cursor),
+    ("sealed", fuzz_sealed),
+    ("map_projection", fuzz_map_projection),
 ];

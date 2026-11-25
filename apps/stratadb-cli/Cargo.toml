@@ -26,7 +26,7 @@ clap = { version = "4", default-features = false, features = ["std", "derive", "
 
 # Parquet import/export (ADR-0025). No Arrow, no compression codecs:
 # ~36 crates, all permissive licenses; CLI only.
-parquet = { version = "54", default-features = false, optional = true }
+parquet = { version = "54", default-features = false, features = ["snap", "flate2", "lz4"], optional = true }
 
 [features]
 default = ["parquet"]

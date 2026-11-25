@@ -97,41 +97,7 @@ impl Cursor {
         if crc32c(body) != stored {
             return Err(bad("checksum mismatch (corrupted or edited)"));
         }
-        let lim = DecodeLimits {
-            max_depth: 16,
-            max_string_bytes: MAX_CURSOR_CHARS,
-            max_items: 4096,
-        };
-        let parse = || -> Result<Cursor> {
-            let mut d = Decoder::new(body, "cursor");
-            let version = d.get_u8()?;
-            if version != CURSOR_VERSION {
-                return Err(bad(&format!("unsupported version {version}")));
-            }
-            let fingerprint = d.get_u32()?;
-            let as_of_seq = d.get_uvarint()?;
-            let returned = d.get_uvarint()?;
-            let n = d.get_len(MAX_KEYS, 1)?;
-            let mut keys = Vec::with_capacity(n);
-            for _ in 0..n {
-                keys.push(match d.get_u8()? {
-                    0 => None,
-                    1 => Some(decode_value(&mut d, &lim)?),
-                    t => return Err(bad(&format!("bad key tag {t}"))),
-                });
-            }
-            let seq = d.get_uvarint()?;
-            let idx = d.get_u32()?;
-            d.expect_end()?;
-            Ok(Cursor {
-                fingerprint,
-                as_of_seq,
-                returned,
-                keys,
-                seq,
-                idx,
-            })
-        };
+        let parse = || decode_body(body);
         // Decoder errors are "corruption" for storage; for a client-supplied
         // token they are invalid input.
         parse().map_err(|e| {
@@ -141,6 +107,73 @@ impl Cursor {
                 bad(&e.to_string())
             }
         })
+    }
+}
+
+/// Decode a cursor body (after base64 and CRC checks).
+fn decode_body(body: &[u8]) -> Result<Cursor> {
+    let lim = DecodeLimits {
+        max_depth: 16,
+        max_string_bytes: MAX_CURSOR_CHARS,
+        max_items: 4096,
+    };
+    let mut d = Decoder::new(body, "cursor");
+    let version = d.get_u8()?;
+    if version != CURSOR_VERSION {
+        return Err(bad(&format!("unsupported version {version}")));
+    }
+    let fingerprint = d.get_u32()?;
+    let as_of_seq = d.get_uvarint()?;
+    let returned = d.get_uvarint()?;
+    let n = d.get_len(MAX_KEYS, 1)?;
+    let mut keys = Vec::with_capacity(n);
+    for _ in 0..n {
+        keys.push(match d.get_u8()? {
+            0 => None,
+            1 => Some(decode_value(&mut d, &lim)?),
+            t => return Err(bad(&format!("bad key tag {t}"))),
+        });
+    }
+    let seq = d.get_uvarint()?;
+    let idx = d.get_u32()?;
+    d.expect_end()?;
+    Ok(Cursor {
+        fingerprint,
+        as_of_seq,
+        returned,
+        keys,
+        seq,
+        idx,
+    })
+}
+
+/// Fuzzing hooks (not a stable API).
+#[doc(hidden)]
+pub mod fuzz_hooks {
+    use super::*;
+
+    /// Decode a cursor body directly (no base64, no CRC check).
+    pub fn decode_body(body: &[u8]) -> bool {
+        super::decode_body(body).is_ok()
+    }
+
+    /// The part of a real cursor that [`cursor_text`] takes as `rest`
+    /// (corpus seeds): base64-decoded, without version, fingerprint and CRC.
+    pub fn cursor_rest(text: &str) -> Option<Vec<u8>> {
+        let b = base64url_decode(text)?;
+        (b.len() >= 9).then(|| b[5..b.len() - 4].to_vec())
+    }
+
+    /// A cursor text for `(tenant, sql)` whose body is version ‖ correct
+    /// fingerprint ‖ `rest`, with a valid CRC — so fuzzed key values reach
+    /// the executor's cursor comparisons instead of failing a check.
+    pub fn cursor_text(tenant: &TenantId, sql: &str, rest: &[u8]) -> String {
+        let mut b = vec![CURSOR_VERSION];
+        b.extend_from_slice(&fingerprint(tenant, sql).to_le_bytes());
+        b.extend_from_slice(rest);
+        let crc = crc32c(&b);
+        b.extend_from_slice(&crc.to_le_bytes());
+        base64url_encode(&b)
     }
 }
 

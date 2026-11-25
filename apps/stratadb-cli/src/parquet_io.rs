@@ -238,6 +238,29 @@ fn field_json(f: &Field) -> J {
         Field::TimestampMicros(v) => J::String(stratadb_common::time::format_rfc3339(
             v.saturating_mul(1_000),
         )),
+        // Nested columns keep their structure (struct → object, list → array,
+        // map → object with string keys).
+        Field::Group(row) => J::Object(
+            row.get_column_iter()
+                .map(|(k, v)| (k.clone(), field_json(v)))
+                .collect(),
+        ),
+        Field::ListInternal(list) => J::Array(list.elements().iter().map(field_json).collect()),
+        Field::MapInternal(map) => J::Object(
+            map.entries()
+                .iter()
+                .map(|(k, v)| {
+                    let key = match k {
+                        Field::Str(s) => s.clone(),
+                        other => field_json(other).to_string(),
+                    };
+                    (key, field_json(v))
+                })
+                .collect(),
+        ),
+        // Binary as lowercase hex (as StrataDB renders bytes elsewhere).
+        Field::Bytes(b) => J::String(b.data().iter().map(|x| format!("{x:02x}")).collect()),
+        // Dates, times, decimals, float16: their textual form.
         other => J::String(other.to_string()),
     }
 }
@@ -302,16 +325,37 @@ fn row_to_input(row: &parquet::record::Row) -> Result<J> {
 }
 
 /// Read a Parquet file as ingest JSON objects (row by row, via `f`).
+///
+/// A row that cannot be *mapped* (bad JSON column, invalid event) is passed
+/// to `f` as an error and the import continues. A failure to *read* the file
+/// (unsupported codec, corrupt page) aborts the import: the reader cannot
+/// make progress past it, so continuing would repeat the error forever.
 pub fn read_rows(path: &Path, mut f: impl FnMut(usize, Result<J>) -> Result<()>) -> Result<usize> {
-    let file = File::open(path).map_err(|e| Error::io(format!("opening {}", path.display()), e))?;
-    let reader = SerializedFileReader::new(file).map_err(pq)?;
+    let loc = path.display().to_string();
+    let file = File::open(path).map_err(|e| Error::io(format!("opening {loc}"), e))?;
+    let reader = SerializedFileReader::new(file).map_err(|e| read_error(&loc, e))?;
     let mut n = 0;
-    for (i, row) in reader.get_row_iter(None).map_err(pq)?.enumerate() {
+    for (i, row) in reader
+        .get_row_iter(None)
+        .map_err(|e| read_error(&loc, e))?
+        .enumerate()
+    {
+        let r = row.map_err(|e| read_error(&loc, e))?;
         n += 1;
-        match row {
-            Ok(r) => f(i, row_to_input(&r))?,
-            Err(e) => f(i, Err(pq(e)))?,
-        }
+        f(i, row_to_input(&r))?;
     }
     Ok(n)
+}
+
+/// A file-level read failure, with a hint for codecs this build lacks.
+fn read_error(loc: &str, e: parquet::errors::ParquetError) -> Error {
+    let msg = e.to_string();
+    if msg.contains("Disabled feature at compile time") {
+        Error::unsupported(format!(
+            "{loc}: {msg}. Supported Parquet codecs: uncompressed, snappy, gzip, lz4; \
+             rewrite the file with one of them (e.g. pyarrow `compression=\"snappy\"`)"
+        ))
+    } else {
+        Error::corruption(loc, format!("cannot read Parquet file: {msg}"))
+    }
 }

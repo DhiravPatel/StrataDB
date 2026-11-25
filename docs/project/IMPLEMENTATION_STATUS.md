@@ -6,7 +6,7 @@ reserved for features that additionally passed an independent review / release
 gate; **nothing is VERIFIED yet.**
 
 Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
-`-D warnings` ✅, `cargo test --workspace` ✅ (270 tests, 0 failures).
+`-D warnings` ✅, `cargo test --workspace` ✅ (273 tests, 0 failures).
 
 | ID | Feature | State | Evidence | Known limitations |
 |----|---------|-------|----------|-------------------|
@@ -32,6 +32,7 @@ Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
 | E-012 | Vectorized filter evaluation (typed kernels, selection vectors, compiled `LIKE`; `enable_vectorized` switch) | TESTED | `vector::tests::vectorized_equals_scalar` (2 000 random expr × batch cases, mutation-checked with 7 injected bugs), `like_fast_path_equals_general`, engine equivalence proptest with the switch off; A/B report `benchmarks/reports/2026-11-25-vectorized-ab.md` | projection/grouping still per row; single-threaded |
 | E-013 | Allocation-free grouping (borrowed group-key encoding, slice lookup) | TESTED | `group_key_into_equals_group_key_bytes` proptest (1 000 cases; injected tag bug caught), all query equivalence tests; report `2026-11-25-grouping.md` (1.3–3.0× on group-by queries) | map decoding dominates non-shredded keys |
 | E-014 | Parallel segment scans with partial aggregation (ordered merge, query-wide budgets) | TESTED | `query/tests/parallel.rs` (2), `row_budget_stops_parallel_workers_early`, full query suite under parallelism; 4 injected bugs caught; report `2026-11-25-parallel-ab.md` (2.2–2.6×) | memtable + merge sequential; float sums not bit-identical to sequential |
+| E-015 | Attribute key projection (no whole-map decode for key references) | TESTED | `read_map_keys_equals_full_maps`, `skip_value_validates_like_decode`, engine equivalence proptest with the switch off; report `2026-11-25-map-projection-ab.md` (22× on query 10) | whole-map references still decode every row |
 | E-011 | Stable keyset pagination (row queries; HTTP `page_size`/`cursor`; Rust/Python/Go SDK helpers) | TESTED | `query/tests/pagination.rs` (9 tests incl. proptest; mutation-checked: removing the tie-break, the `as_of` bound, the strict cursor comparison or loosening either pruning rule each fails tests), `query_pagination_over_http`, SDK conformance (ADR-0023) | aggregates/EXPLAIN not paginated; deep pages of non-time orders rescan |
 | F-001 | Segment statistics | TESTED | footer stats + `verify` | — |
 | F-002 | Timestamp pruning | TESTED | pruning tests + equivalence proptest | segments not time-partitioned |
@@ -54,14 +55,14 @@ Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
 | H-004 | Audit log (hash-chained) | TESTED | `audit.rs` unit test, `security_events_are_audited_without_secrets` (ADR-0022) | no rotation; tamper-evident only |
 | — | Disk reserve admission control | TESTED | `disk_reserve_pauses_writes_but_not_reads_or_flushes` | reserve measured every 200 ms |
 | — | Export (NDJSON/CSV, checkpoint/resume), idempotent import with report, `strata shell` | TESTED | `apps/stratadb-cli/tests/export_import.rs` (lossless re-import round trip, torn-page resume == one-shot, snapshot excludes later writes, no overwrite, CSV quoting, duplicate import, changed-file conflict, shell script; 2 injected bugs caught), `event_json_round_trips` proptest | CLI needs exclusive data-dir access; no HTTP export endpoint |
-| — | Parquet export/import (CLI, ADR-0025) | TESTED | `parquet_round_trip_is_lossless`, `imports_generic_parquet` (found an inexact timestamp conversion) | events only, uncompressed, no resume; pyarrow/DuckDB interop unverified (script provided) |
+| — | Parquet export/import (CLI, ADR-0025) | TESTED | `parquet_round_trip_is_lossless`, `imports_generic_parquet`, `imports_third_party_parquet_files` (pyarrow/DuckDB fixtures), `scripts/parquet_interop.sh` (pyarrow 26 + DuckDB 2 read the export exactly) | events only, uncompressed export, no resume; no zstd/brotli import |
 | — | Encryption at rest (KEK provider, wrapped DEKs, sealed segments/manifest, encrypted WAL, rotation, encrypted backups) | TESTED | `stratadb-crypto` (8), WAL encryption tests (2), `storage/tests/encryption.rs` (6 + golden fixture), encrypted power-loss simulation (1 320 states), CLI workflow, server config test (ADR-0024) | file KEK provider only; offline rotation |
 | H-005 | Retention (per tenant, legal hold) | TESTED | `tests/maintenance.rs`, CLI + HTTP endpoints (ADR-0020) | periodic, not instantaneous |
 | H-006, H-007 | Backup, verify, restore + drills | TESTED | `tests/backup.rs`, CLI drill, HTTP backup (ADR-0010) | full backups only; no encryption |
 | H-008 | Metrics | IMPLEMENTED | `/api/v1/metrics` (Prometheus text, cluster.read) | no latency histograms; no query metrics |
 | H-009 | CLI incl. `doctor` (read-only diagnostics) | TESTED | `apps/stratadb-cli/tests/cli.rs`, `tests/doctor.rs` (detects corruption, provably read-only) | local admin only |
 | H-010 | Docker/compose/systemd + healthcheck | IMPLEMENTED | `deployments/`, `strata-server healthcheck` smoke | **image build not verified** (no Docker daemon) |
-| H-011 | Fuzzing (9 targets) | TESTED | stable mutation test in default suite; 30k-iteration campaign; cargo-fuzz targets in `fuzz/` (docs/testing/fuzzing.md) | |
+| H-011 | Fuzzing (14 targets) | TESTED | stable mutation test in default suite; 30k-iteration campaign; cargo-fuzz targets in `fuzz/` (docs/testing/fuzzing.md) | |
 | — | Query status/cancel endpoints | TESTED | `running_queries_can_be_inspected_and_cancelled_by_their_tenant_only` | cancellation checked at batch boundaries |
 | — | OpenAPI document | TESTED | `openapi_document_matches_router` | schemas are coarse |
 | H-012 | External security review | NOT_STARTED | — | requires independent reviewer |

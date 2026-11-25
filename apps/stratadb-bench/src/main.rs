@@ -60,6 +60,9 @@ struct Args {
     /// Scan segments sequentially (A/B comparisons).
     #[arg(long)]
     no_parallel: bool,
+    /// Decode whole attribute maps instead of projecting referenced keys (A/B).
+    #[arg(long)]
+    no_map_projection: bool,
 }
 
 fn pct(sorted: &[f64], p: f64) -> f64 {
@@ -173,6 +176,7 @@ fn run(a: Args) -> Result<J> {
     let qopts = QueryOptions {
         max_result_rows: 1_000_000,
         enable_vectorized: !a.no_vectorize,
+        enable_map_projection: !a.no_map_projection,
         parallelism: if a.no_parallel {
             1
         } else {
@@ -220,7 +224,7 @@ fn run(a: Args) -> Result<J> {
                         "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)},
         "config": {"profile": profile.name(), "events": a.events, "batch_size": a.batch_size,
                    "tenants": a.tenants, "seed": a.seed, "durability": a.durability, "reps": a.reps,
-                   "bloom": !a.no_bloom, "compression": !a.no_compression, "shredding": !a.no_shredding, "vectorized": !a.no_vectorize, "ngram": !a.no_ngram, "parallel": !a.no_parallel,
+                   "bloom": !a.no_bloom, "compression": !a.no_compression, "shredding": !a.no_shredding, "vectorized": !a.no_vectorize, "ngram": !a.no_ngram, "parallel": !a.no_parallel, "map_projection": !a.no_map_projection,
                    "cache_state": "warm (same process, OS page cache not dropped)"},
         "ingest": {
             "wall_s": ingest_wall.as_secs_f64(),

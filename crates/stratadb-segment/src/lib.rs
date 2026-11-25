@@ -476,6 +476,15 @@ pub mod fuzz_hooks {
         columns::decode_column(id, enc, bytes, rows)
     }
 
+    /// Project a `Map`-encoded chunk onto `keys` (no CRC check).
+    pub fn project_map_keys(
+        bytes: &[u8],
+        rows: usize,
+        keys: &[String],
+    ) -> Result<Vec<Vec<Option<stratadb_schema::Value>>>> {
+        columns::project_map_keys(bytes, rows, keys)
+    }
+
     /// LZ4 block decompression with the reader's bound (no CRC check).
     pub fn decompress(bytes: &[u8], raw_len: usize) -> Result<Vec<u8>> {
         if raw_len as u64 > MAX_CHUNK_RAW_BYTES {
@@ -956,6 +965,70 @@ impl SegmentReader {
         .and_then(ColumnData::into_values)
         .map(Some)
         .map_err(|e| Error::corruption(self.path.display().to_string(), format!("{what}: {e}")))
+    }
+
+    /// Values of `keys` (sorted, deduplicated) of one attribute scope, one
+    /// column per key — the projection `read_column(map)[row].get(key)` without
+    /// building the maps: shredded keys come from their own chunks, the others
+    /// from the residual map chunk, whose other values are skipped. Returns the
+    /// columns and the stored bytes read.
+    pub fn read_map_keys(
+        &self,
+        scope: Scope,
+        keys: &[String],
+    ) -> Result<(Vec<Vec<Option<stratadb_schema::Value>>>, u64)> {
+        let loc = self.path.display().to_string();
+        let rows = self.footer.row_count as usize;
+        let mut out: Vec<Option<Vec<Option<stratadb_schema::Value>>>> = vec![None; keys.len()];
+        let mut bytes = 0u64;
+        let mut residual: Vec<String> = Vec::new();
+        for (i, k) in keys.iter().enumerate() {
+            match self.read_shredded(scope, k)? {
+                Some(col) => {
+                    bytes += self.footer.shredded(scope, k).map_or(0, |c| c.len);
+                    out[i] = Some(col);
+                }
+                None => residual.push(k.clone()),
+            }
+        }
+        if !residual.is_empty() {
+            let id = match scope {
+                Scope::Attributes => ColumnId::Attributes,
+                Scope::Resource => ColumnId::ResourceAttributes,
+            };
+            let meta = self
+                .footer
+                .column(id)
+                .ok_or_else(|| Error::corruption(&loc, format!("missing column {id:?}")))?;
+            if meta.encoding != Encoding::Map {
+                return Err(Error::corruption(
+                    &loc,
+                    format!("column {id:?} is not a map column"),
+                ));
+            }
+            let what = format!("column {id:?}");
+            let buf = self.read_chunk(
+                &what,
+                meta.offset,
+                meta.len,
+                meta.crc,
+                meta.compression,
+                meta.raw_len,
+            )?;
+            bytes += meta.len;
+            let cols = columns::project_map_keys(&buf, rows, &residual)
+                .map_err(|e| Error::corruption(&loc, format!("{what}: {e}")))?;
+            let mut it = cols.into_iter();
+            for (i, k) in keys.iter().enumerate() {
+                if out[i].is_none() && residual.binary_search(k).is_ok() {
+                    out[i] = it.next();
+                }
+            }
+        }
+        Ok((
+            out.into_iter().map(Option::unwrap_or_default).collect(),
+            bytes,
+        ))
     }
 
     /// Read, checksum, and decode one column chunk. Attribute map columns are

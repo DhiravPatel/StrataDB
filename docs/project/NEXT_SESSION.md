@@ -32,14 +32,11 @@ hash-chained audit log (admin actions fail closed); Bloom filters ext tag 2
 (string values only) with A/B evidence; TOML config with flag > env > file precedence.
 
 ## Exact next tasks (priority order)
-1. Verify Parquet exports with an independent reader (`pip install pyarrow`, then
-   `scripts/parquet_interop_check.py`); add it to CI.
-2. Query execution follow-ups: late materialization so non-shredded
-   attribute maps are decoded only for rows that pass the filter; parallel
-   group merge (query 08 is merge-bound); intra-segment parallelism.
-3. Run the Docker image build + an OpenTelemetry Collector binary (needs Docker).
-4. Longer seeded libFuzzer campaigns (≥ 30 min/target); add a `cursor` fuzz
-   target (decoder is proptested but not yet in `stratadb-fuzz::TARGETS`).
+1. Query execution follow-ups: parallel group merge (query 08 is now
+   merge-bound); intra-segment parallelism; row-selective decoding of whole
+   maps (`SELECT *` with selective filters).
+2. Run the Docker image build + an OpenTelemetry Collector binary (needs Docker).
+3. Longer seeded libFuzzer campaigns (≥ 30 min/target) for all 14 targets.
 
 Done since the last handoff: segment v3 attribute shredding (2.6–4.5× on attribute
 queries), OTLP/HTTP protobuf + official OTel Go exporter interop, token hot reload,

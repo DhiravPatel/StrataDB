@@ -1,0 +1,315 @@
+{
+  "build": "release",
+  "config": {
+    "batch_size": 1000,
+    "bloom": true,
+    "cache_state": "warm (same process, OS page cache not dropped)",
+    "compression": true,
+    "durability": "group_commit",
+    "events": 200000,
+    "map_projection": true,
+    "ngram": true,
+    "parallel": true,
+    "profile": "app-logs",
+    "reps": 15,
+    "seed": 1,
+    "shredding": true,
+    "tenants": 4,
+    "vectorized": true
+  },
+  "environment": {
+    "arch": "aarch64",
+    "cpus": 10,
+    "os": "macos"
+  },
+  "flush": {
+    "final_flush_ms": 329.881375,
+    "rows": 50500
+  },
+  "ingest": {
+    "ack_latency": {
+      "max_ms": 12.435,
+      "mean_ms": 5.947442756250002,
+      "min_ms": 3.5869999999999997,
+      "n": 800,
+      "p50_ms": 5.917999999999999,
+      "p95_ms": 7.009917,
+      "p99_ms": 9.998833000000001
+    },
+    "encoded_bytes": 46409813,
+    "encoded_bytes_per_s_wall": 9372026.52656637,
+    "events_per_s_wall": 40388.12449671525,
+    "wall_s": 4.951950666,
+    "write_batch_time_s": 4.757954205
+  },
+  "label": "developer-hardware measurement; not a production capacity claim",
+  "queries": [
+    {
+      "indexes_used": [
+        "bloom(trace_id)"
+      ],
+      "latency": {
+        "max_ms": 1.974208,
+        "mean_ms": 1.7283469999999999,
+        "min_ms": 1.640125,
+        "n": 15,
+        "p50_ms": 1.7132910000000001,
+        "p95_ms": 1.879208,
+        "p99_ms": 1.974208
+      },
+      "name": "01_trace_id_lookup",
+      "result_rows": 1,
+      "rows_matched": 1,
+      "rows_scanned": 18750,
+      "segment_bytes_read": 347769,
+      "segments_pruned": 2,
+      "segments_scanned": 1,
+      "segments_total": 3,
+      "sql": "SELECT event_time, body FROM logs WHERE trace_id = '8d9b9a5f3627f6e55ff25f124592b313'"
+    },
+    {
+      "indexes_used": [
+        "bloom(attributes['request_id'])"
+      ],
+      "latency": {
+        "max_ms": 1.90475,
+        "mean_ms": 1.8274890000000001,
+        "min_ms": 1.7966250000000001,
+        "n": 15,
+        "p50_ms": 1.818292,
+        "p95_ms": 1.854416,
+        "p99_ms": 1.90475
+      },
+      "name": "02_request_id_lookup",
+      "result_rows": 1,
+      "rows_matched": 1,
+      "rows_scanned": 18750,
+      "segment_bytes_read": 231083,
+      "segments_pruned": 2,
+      "segments_scanned": 1,
+      "segments_total": 3,
+      "sql": "SELECT event_time, body FROM logs WHERE attributes['request_id'] = 'req_df7728bfa81e'"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 1.458334,
+        "mean_ms": 1.3457528000000003,
+        "min_ms": 1.323084,
+        "n": 15,
+        "p50_ms": 1.3360830000000001,
+        "p95_ms": 1.3632920000000002,
+        "p99_ms": 1.458334
+      },
+      "name": "03_recent_errors",
+      "result_rows": 100,
+      "rows_matched": 133,
+      "rows_scanned": 12500,
+      "segment_bytes_read": 117333,
+      "segments_pruned": 2,
+      "segments_scanned": 1,
+      "segments_total": 3,
+      "sql": "SELECT event_time, service, body FROM logs WHERE event_time >= TIMESTAMP '2026-11-20T00:03:10.000000000Z' AND severity = 'ERROR' ORDER BY event_time DESC LIMIT 100"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 1.639583,
+        "mean_ms": 0.8483946000000001,
+        "min_ms": 0.737666,
+        "n": 15,
+        "p50_ms": 0.778417,
+        "p95_ms": 0.9454170000000001,
+        "p99_ms": 1.639583
+      },
+      "name": "04_service_severity",
+      "result_rows": 1,
+      "rows_matched": 761,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 69669,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT count(*) FROM logs WHERE service = 'auth' AND severity = 'WARN'"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 0.593541,
+        "mean_ms": 0.5844915333333334,
+        "min_ms": 0.579625,
+        "n": 15,
+        "p50_ms": 0.582333,
+        "p95_ms": 0.5926250000000001,
+        "p99_ms": 0.593541
+      },
+      "name": "05_time_range_scan",
+      "result_rows": 1,
+      "rows_matched": 5000,
+      "rows_scanned": 18750,
+      "segment_bytes_read": 317,
+      "segments_pruned": 2,
+      "segments_scanned": 1,
+      "segments_total": 3,
+      "sql": "SELECT count(*) FROM logs WHERE event_time >= TIMESTAMP '2026-11-20T00:01:30.000000000Z' AND event_time < TIMESTAMP '2026-11-20T00:01:50.000000000Z'"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 1.779084,
+        "mean_ms": 1.6933556666666665,
+        "min_ms": 1.652583,
+        "n": 15,
+        "p50_ms": 1.683667,
+        "p95_ms": 1.7385,
+        "p99_ms": 1.779084
+      },
+      "name": "06_message_token_search",
+      "result_rows": 1,
+      "rows_matched": 595,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 397978,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT count(*) FROM logs WHERE body LIKE '%TIMEOUT%'"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 1.296416,
+        "mean_ms": 1.2052054666666667,
+        "min_ms": 1.145917,
+        "n": 15,
+        "p50_ms": 1.19575,
+        "p95_ms": 1.255208,
+        "p99_ms": 1.296416
+      },
+      "name": "07_attribute_equality",
+      "result_rows": 1,
+      "rows_matched": 8423,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 132435,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT count(*) FROM logs WHERE attributes['region'] = 'eu-west-1'"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 11.671625,
+        "mean_ms": 11.101863666666668,
+        "min_ms": 10.404958,
+        "n": 15,
+        "p50_ms": 11.377375,
+        "p95_ms": 11.630833,
+        "p99_ms": 11.671625
+      },
+      "name": "08_high_cardinality_agg",
+      "result_rows": 10,
+      "rows_matched": 50000,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 255528,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT attributes['user_id'] AS u, count(*) AS n FROM logs GROUP BY attributes['user_id'] ORDER BY n DESC LIMIT 10"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 2.788084,
+        "mean_ms": 2.7100999999999993,
+        "min_ms": 2.48825,
+        "n": 15,
+        "p50_ms": 2.715042,
+        "p95_ms": 2.782708,
+        "p99_ms": 2.788084
+      },
+      "name": "09_service_time_bucket",
+      "result_rows": 48,
+      "rows_matched": 50000,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 42395,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT service, time_bucket(INTERVAL '1 minute', event_time) AS b, count(*) FROM logs GROUP BY service, time_bucket(INTERVAL '1 minute', event_time)"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 0.715542,
+        "mean_ms": 0.688611,
+        "min_ms": 0.6665,
+        "n": 15,
+        "p50_ms": 0.689625,
+        "p95_ms": 0.704625,
+        "p99_ms": 0.715542
+      },
+      "name": "10_top_error_codes",
+      "result_rows": 6,
+      "rows_matched": 3432,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 53214,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT attributes['error.code'] AS code, count(*) AS n FROM logs WHERE severity IN ('ERROR', 'FATAL') GROUP BY attributes['error.code'] ORDER BY n DESC LIMIT 10"
+    },
+    {
+      "indexes_used": [],
+      "latency": {
+        "max_ms": 1.329333,
+        "mean_ms": 1.290325,
+        "min_ms": 1.273459,
+        "n": 15,
+        "p50_ms": 1.288417,
+        "p95_ms": 1.3063339999999999,
+        "p99_ms": 1.329333
+      },
+      "name": "12_historical_wide_range",
+      "result_rows": 5,
+      "rows_matched": 50000,
+      "rows_scanned": 50000,
+      "segment_bytes_read": 28127,
+      "segments_pruned": 0,
+      "segments_scanned": 3,
+      "segments_total": 3,
+      "sql": "SELECT severity, count(*) FROM logs GROUP BY severity"
+    },
+    {
+      "indexes_used": [
+        "ngram(body)"
+      ],
+      "latency": {
+        "max_ms": 0.012666,
+        "mean_ms": 0.004705533333333333,
+        "min_ms": 0.003417,
+        "n": 15,
+        "p50_ms": 0.003584,
+        "p95_ms": 0.009625,
+        "p99_ms": 0.012666
+      },
+      "name": "13_absent_substring_search",
+      "result_rows": 1,
+      "rows_matched": 0,
+      "rows_scanned": 0,
+      "segment_bytes_read": 0,
+      "segments_pruned": 3,
+      "segments_scanned": 0,
+      "segments_total": 3,
+      "sql": "SELECT count(*) FROM logs WHERE body LIKE '%deadlock detected%'"
+    }
+  ],
+  "reopen_ms": 20.303791,
+  "storage": {
+    "encoded_to_segment_ratio": 3.750978402327313,
+    "flushes": 3,
+    "segment_bytes": 12372722,
+    "segments": 12,
+    "write_stalls": 0
+  },
+  "stratadb_version": "0.0.1"
+}

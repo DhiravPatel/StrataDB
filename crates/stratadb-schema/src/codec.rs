@@ -145,6 +145,69 @@ fn decode_value_depth(d: &mut Decoder<'_>, lim: &DecodeLimits, depth: usize) -> 
     })
 }
 
+/// Advance past one encoded value without allocating it. Validates exactly
+/// what [`decode_value`] validates (tags, lengths, UTF-8, nesting depth,
+/// strictly increasing map keys), so a chunk is rejected the same way whether
+/// its values are decoded or skipped.
+pub fn skip_value(d: &mut Decoder<'_>, lim: &DecodeLimits) -> Result<()> {
+    skip_value_depth(d, lim, 0)
+}
+
+fn skip_value_depth(d: &mut Decoder<'_>, lim: &DecodeLimits, depth: usize) -> Result<()> {
+    if depth > lim.max_depth {
+        return Err(Error::corruption(
+            "value",
+            format!("nesting deeper than {}", lim.max_depth),
+        ));
+    }
+    match d.get_u8()? {
+        tag::NULL | tag::FALSE | tag::TRUE => {}
+        tag::INT | tag::TIMESTAMP => {
+            d.get_ivarint()?;
+        }
+        tag::UINT => {
+            d.get_uvarint()?;
+        }
+        tag::FLOAT => {
+            d.get_f64()?;
+        }
+        tag::STRING => {
+            d.get_str(lim.max_string_bytes)?;
+        }
+        tag::BYTES => {
+            d.get_bytes(lim.max_string_bytes)?;
+        }
+        tag::LIST => {
+            let n = d.get_len(lim.max_items, 1)?;
+            for _ in 0..n {
+                skip_value_depth(d, lim, depth + 1)?;
+            }
+        }
+        tag::MAP => {
+            let n = d.get_len(lim.max_items, 2)?;
+            let mut prev: Option<&str> = None;
+            for _ in 0..n {
+                let k = d.get_str(lim.max_string_bytes)?;
+                if prev.is_some_and(|p| k <= p) {
+                    return Err(Error::corruption(
+                        "map",
+                        "keys not strictly increasing (duplicate or unsorted key)",
+                    ));
+                }
+                prev = Some(k);
+                skip_value_depth(d, lim, depth + 1)?;
+            }
+        }
+        other => {
+            return Err(Error::corruption(
+                "value",
+                format!("unknown value tag {other}"),
+            ))
+        }
+    }
+    Ok(())
+}
+
 pub fn decode_map(d: &mut Decoder<'_>, lim: &DecodeLimits) -> Result<BTreeMap<String, Value>> {
     decode_map_depth(d, lim, 0)
 }

@@ -656,3 +656,113 @@ mod parquet_tests {
         );
     }
 }
+
+/// Import of Parquet files written by pyarrow and DuckDB
+/// (`tests/fixtures/parquet-interop`, see its README).
+#[cfg(feature = "parquet")]
+#[test]
+fn imports_third_party_parquet_files() {
+    let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/parquet-interop");
+    let dir = tempfile::tempdir().unwrap();
+    let query = |d: &str, sql: &str| -> Vec<serde_json::Value> {
+        let o = strata(&["query", "--data-dir", d, "--tenant", "t", sql]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    };
+    for codec in ["snappy", "gzip", "lz4"] {
+        let d = dir.path().join(codec).to_str().unwrap().to_owned();
+        let f = fx.join(format!("pyarrow_{codec}.parquet"));
+        assert!(strata(&["init", "--data-dir", &d]).status.success());
+        let o = strata(&[
+            "ingest",
+            "--data-dir",
+            &d,
+            "--tenant",
+            "t",
+            "--file",
+            f.to_str().unwrap(),
+        ]);
+        assert!(
+            o.status.success(),
+            "{codec}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert_eq!(json_out(&o)["accepted"], 3, "{codec}");
+        let rows = query(&d, "SELECT event_time, body, severity, severity_text, attributes FROM logs ORDER BY event_time");
+        assert_eq!(
+            rows[0]["event_time"], "2026-11-20T10:30:00.123456789Z",
+            "{codec}: ns exact"
+        );
+        assert_eq!(rows[0]["body"], "from pyarrow");
+        assert_eq!(
+            (
+                rows[0]["severity"].as_str(),
+                rows[0]["severity_text"].as_str()
+            ),
+            (Some("WARN"), Some("warning"))
+        );
+        assert_eq!(
+            rows[0]["attributes"],
+            serde_json::json!({"ctx": {"tries": 1, "user": "u1"}, "labels": {"k": "v"}, "ok": true,
+                               "ratio": 0.5, "status": 200, "tags": ["a", "b"]}),
+            "{codec}: nested columns keep their structure"
+        );
+        assert_eq!(
+            rows[1]["attributes"],
+            serde_json::json!({"ok": false, "status": 504, "tags": []})
+        );
+        assert_eq!(rows[2]["severity"], "ERROR");
+    }
+    // DuckDB (µs TIMESTAMPTZ, BIGINT).
+    let d = dir.path().join("duck").to_str().unwrap().to_owned();
+    assert!(strata(&["init", "--data-dir", &d]).status.success());
+    let f = fx.join("duckdb_snappy.parquet");
+    let o = strata(&[
+        "ingest",
+        "--data-dir",
+        &d,
+        "--tenant",
+        "t",
+        "--file",
+        f.to_str().unwrap(),
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let rows = query(
+        &d,
+        "SELECT event_time, body, severity, attributes['n'] AS n FROM logs ORDER BY event_time",
+    );
+    assert_eq!(rows[0]["event_time"], "2026-11-25T10:00:00.123456000Z");
+    assert_eq!(
+        (
+            rows[0]["body"].as_str(),
+            rows[0]["severity"].as_str(),
+            rows[0]["n"].as_i64()
+        ),
+        (Some("from duckdb"), Some("ERROR"), Some(42))
+    );
+    assert_eq!(rows[1]["severity"], "INFO");
+    // An unsupported codec fails fast with a clear error (it used to loop forever).
+    let d = dir.path().join("zstd").to_str().unwrap().to_owned();
+    assert!(strata(&["init", "--data-dir", &d]).status.success());
+    let started = std::time::Instant::now();
+    let f = fx.join("pyarrow_zstd.parquet");
+    let o = strata(&[
+        "ingest",
+        "--data-dir",
+        &d,
+        "--tenant",
+        "t",
+        "--file",
+        f.to_str().unwrap(),
+    ]);
+    assert!(!o.status.success());
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("unsupported") && err.contains("snappy"),
+        "{err}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+}

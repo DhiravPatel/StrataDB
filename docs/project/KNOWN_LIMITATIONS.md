@@ -47,8 +47,8 @@
   rows) are shredded into columns (v3); rarer keys stay in per-row maps.
 - `WHERE` filters are vectorized and group keys are encoded without copies
   (ADR-0006 updates); projection and sort keys are still materialized per
-  matched row, attribute maps of non-shredded keys are decoded for every row of
-  a scanned segment (no late materialization). Segment scans of sorted and
+  matched row. Queries naming specific attribute keys decode only those keys;
+  queries using whole maps (`attributes`, `SELECT *`) decode every row's map. Segment scans of sorted and
   aggregate queries are parallel (ADR-0006); unsorted `LIMIT` scans, the
   memtable and the final merge are sequential; float `sum`/`avg` may differ in
   the last bits from a sequential scan. Whole-map predicates (`attributes = …`) use the scalar path. Memtable
@@ -68,7 +68,7 @@
   must be running) and trusts the operator-supplied `--tenant`; this includes
   `export`, `ingest` and `shell`. There is no HTTP export endpoint yet.
 - Export formats are NDJSON, CSV and Parquet (ADR-0025: CLI only, events only,
-  uncompressed, no resume; independent-reader interop not yet verified —
-  pyarrow/DuckDB not installed on the dev machine). CSV cannot distinguish
+  uncompressed, no resume). Parquet import reads uncompressed/snappy/gzip/lz4,
+  not zstd or brotli. CSV cannot distinguish
   missing from null and is not formula-escaped.
 - Resumable imports rely on the idempotency window (24 h / 100 000 keys).

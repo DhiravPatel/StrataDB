@@ -359,6 +359,44 @@ pub(crate) fn encode_shredded(rows: &[RowRef<'_>], resource: bool, key: &str) ->
     (e.into_inner(), missing)
 }
 
+/// Project a `Map`-encoded chunk onto `keys` (sorted, deduplicated): one
+/// column per key, `None` where the row's map lacks it. Values of other keys
+/// are skipped without allocation (validated like a full decode).
+// `out` is indexed [key][row]; `row` selects within the matched key's column.
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn project_map_keys(
+    bytes: &[u8],
+    rows: usize,
+    keys: &[String],
+) -> Result<Vec<Vec<Option<Value>>>> {
+    let lim = DecodeLimits::default();
+    let mut d = Decoder::new(bytes, "column chunk");
+    if rows > bytes.len() {
+        return Err(Error::corruption("column", "row count exceeds chunk size"));
+    }
+    let mut out: Vec<Vec<Option<Value>>> = keys.iter().map(|_| vec![None; rows]).collect();
+    for row in 0..rows {
+        let n = d.get_len(lim.max_items, 2)?;
+        let mut prev: Option<&str> = None;
+        for _ in 0..n {
+            let k = d.get_str(lim.max_string_bytes)?;
+            if prev.is_some_and(|p| k <= p) {
+                return Err(Error::corruption(
+                    "map",
+                    "keys not strictly increasing (duplicate or unsorted key)",
+                ));
+            }
+            prev = Some(k);
+            match keys.binary_search_by(|x| x.as_str().cmp(k)) {
+                Ok(i) => out[i][row] = Some(decode_value(&mut d, &lim)?),
+                Err(_) => stratadb_schema::codec::skip_value(&mut d, &lim)?,
+            }
+        }
+    }
+    d.expect_end()?;
+    Ok(out)
+}
+
 /// Decode a chunk. `rows` comes from the (checksummed) footer.
 pub(crate) fn decode_column(
     id: ColumnId,

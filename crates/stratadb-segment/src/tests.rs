@@ -401,3 +401,123 @@ fn v3_shredding_preserves_rows_null_vs_missing_and_detects_corruption() {
     std::fs::write(&p, &bytes).unwrap();
     assert!(SegmentReader::open(&p).unwrap().verify().is_err());
 }
+
+fn arb_attr_value() -> impl Strategy<Value = Value> {
+    let leaf = prop_oneof![
+        Just(Value::Null),
+        any::<bool>().prop_map(Value::Bool),
+        any::<i64>().prop_map(Value::Int),
+        any::<u64>().prop_map(Value::UInt),
+        (-1e6f64..1e6).prop_map(Value::Float),
+        "[a-z\u{e9}]{0,6}".prop_map(Value::String),
+        prop::collection::vec(any::<u8>(), 0..4).prop_map(Value::Bytes),
+        any::<i64>().prop_map(Value::Timestamp),
+    ];
+    leaf.prop_recursive(2, 8, 3, |inner| {
+        prop_oneof![
+            prop::collection::vec(inner.clone(), 0..3).prop_map(Value::List),
+            prop::collection::btree_map("[a-c]{1,2}", inner, 0..3).prop_map(Value::Map),
+        ]
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// Key projection equals looking keys up in fully decoded maps, for
+    /// shredded keys (frequent), residual keys (rare) and absent keys, in both
+    /// scopes, with and without shredding.
+    #[test]
+    fn read_map_keys_equals_full_maps(
+        rows in prop::collection::vec(
+            (prop::collection::btree_map(
+                prop::sample::select(vec!["hot", "warm", "rare", "x.y", ""]).prop_map(str::to_owned),
+                arb_attr_value(),
+                0..5,
+            ),
+             prop::collection::btree_map(
+                prop::sample::select(vec!["host", "zone"]).prop_map(str::to_owned),
+                arb_attr_value(),
+                0..2,
+            )),
+            1..60,
+        ),
+        hot_every in 1usize..3,
+        keys in prop::collection::btree_set(
+            prop::sample::select(vec!["hot", "warm", "rare", "x.y", "", "absent", "host", "zone"]).prop_map(str::to_owned),
+            1..5,
+        ),
+        shred in any::<bool>(),
+    ) {
+        let events: Vec<Event> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, (mut a, r))| {
+                let mut e = Event::new(tenant(), 1_000 + i as i64, 2_000);
+                if i % hot_every == 0 {
+                    a.insert("hot".into(), Value::Int(i as i64)); // frequent → shredded
+                }
+                e.attributes = a;
+                e.resource_attributes = r;
+                e
+            })
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let mut refs: Vec<RowRef<'_>> = events
+            .iter()
+            .enumerate()
+            .map(|(i, e)| RowRef { seq: 1 + i as u64, idx: 0, event: e })
+            .collect();
+        let path = dir.path().join(segment_file_name(1));
+        let opts = WriteOptions { compress: true, shred };
+        write_segment_opts(&path, 1, &tenant(), &mut refs, 0, Vec::new(), &opts).unwrap();
+        let r = SegmentReader::open(&path).unwrap();
+        let keys: Vec<String> = keys.into_iter().collect();
+        for (scope, id) in [(Scope::Attributes, ColumnId::Attributes), (Scope::Resource, ColumnId::ResourceAttributes)] {
+            let full = r.read_column(id).unwrap().into_maps().unwrap();
+            let (cols, bytes) = r.read_map_keys(scope, &keys).unwrap();
+            // Bytes are read whenever some key is shredded or the map chunk is projected.
+            prop_assert!(bytes > 0);
+            for (k, col) in keys.iter().zip(&cols) {
+                prop_assert_eq!(col.len(), full.len());
+                for (row, m) in full.iter().enumerate() {
+                    prop_assert_eq!(&col[row], &m.get(k).cloned(), "key {:?} row {}", k, row);
+                }
+            }
+        }
+    }
+}
+
+/// `skip_value` rejects exactly what `decode_value` rejects on corrupt input.
+#[test]
+fn skip_value_validates_like_decode() {
+    use stratadb_common::codec::{Decoder, Encoder};
+    use stratadb_schema::codec::{decode_value, encode_value, skip_value, DecodeLimits};
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(
+        "a".to_owned(),
+        Value::List(vec![Value::from("é"), Value::Int(-5)]),
+    );
+    m.insert(
+        "b".to_owned(),
+        Value::Map(std::collections::BTreeMap::from([(
+            "z".to_owned(),
+            Value::Null,
+        )])),
+    );
+    let mut e = Encoder::new();
+    encode_value(&mut e, &Value::Map(m));
+    let good = e.into_inner();
+    let lim = DecodeLimits::default();
+    for i in 0..good.len() {
+        for flip in [0x01u8, 0x80, 0xff] {
+            let mut b = good.clone();
+            b[i] ^= flip;
+            let mut d1 = Decoder::new(&b, "t");
+            let mut d2 = Decoder::new(&b, "t");
+            let dec = decode_value(&mut d1, &lim).map(|_| d1.position());
+            let skp = skip_value(&mut d2, &lim).map(|()| d2.position());
+            assert_eq!(dec.ok(), skp.ok(), "byte {i} flip {flip:#x}");
+        }
+    }
+}
