@@ -7,6 +7,7 @@
 pub mod ast;
 pub mod eval;
 pub mod exec;
+mod groups;
 pub mod lexer;
 pub mod page;
 pub mod parser;

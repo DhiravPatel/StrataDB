@@ -53,3 +53,17 @@ segment), not I/O or decode. Exact-id lookups already read one of three
 segments thanks to Bloom pruning (queries 01/02: ~1.5 ms). Revisit when
 segments gain row groups / page-level reads, or when profiles show filter
 evaluation dominating id lookups.
+
+## Implemented (2026-11-25): index lifecycle (F-006..F-008)
+Filters are segment footer extensions, so their "manifest" is the segment
+footer and they are published atomically with the segment. `Engine::indexes`
+lists them; with verification it reads each segment's rows and checks
+(1) **no false negatives** — every indexed value / trigram is in its filter
+(a miss would make queries skip matching rows), and (2) whether the stored
+filters are byte-identical to what the current settings build (filter
+construction is deterministic), i.e. current vs stale. `rebuild_indexes`
+rewrites stale or unsound segments through the compaction `rewrite` path
+(crash-safe, covered by the crash matrix). CLI: `strata indexes
+list|verify|rebuild [--dry-run]`; `verify` exits non-zero on false negatives.
+Changing `bloom_attribute_keys` or n-gram settings applies to new segments;
+run `strata indexes rebuild` to apply it to existing ones.

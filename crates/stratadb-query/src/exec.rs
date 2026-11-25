@@ -761,8 +761,7 @@ struct Ctx<'a> {
     stats: QueryStats,
     mem: usize,
     rows: Vec<Row>,
-    groups: HashMap<Vec<u8>, usize>,
-    group_vals: Vec<(Vec<Datum>, Vec<AggState>)>,
+    groups: crate::groups::GroupTable<AggState>,
     page: Option<PageCtx>,
     /// Scratch buffer for group keys (reused across rows).
     key_buf: Vec<u8>,
@@ -806,8 +805,7 @@ impl<'a> Ctx<'a> {
             stats: QueryStats::default(),
             mem: 0,
             rows: Vec::new(),
-            groups: HashMap::new(),
-            group_vals: Vec::new(),
+            groups: crate::groups::GroupTable::new(plan.group_by.len(), plan.aggregates.len()),
             page,
             keep,
             key_buf: Vec::new(),
@@ -959,14 +957,10 @@ impl Ctx<'_> {
                     buf[at..at + 4].copy_from_slice(&n.to_le_bytes());
                     enc = Encoder::from_vec(buf);
                 }
-                let kb = enc.into_inner();
-                let found = self.groups.get(kb.as_slice()).copied();
-                let idx = match found {
-                    Some(i) => {
-                        self.key_buf = kb;
-                        self.key_buf.clear();
-                        i
-                    }
+                let mut kb = enc.into_inner();
+                let h = self.groups.hash(&kb);
+                let idx = match self.groups.find(h, &kb) {
+                    Some(g) => g,
                     None => {
                         // First row of a new group: materialize its key values.
                         let keys: Vec<Datum> = self
@@ -979,23 +973,18 @@ impl Ctx<'_> {
                             + 64
                             + keys.iter().map(datum_size).sum::<usize>()
                             + 48 * self.plan.aggregates.len();
-                        let states = self
-                            .plan
-                            .aggregates
-                            .iter()
-                            .map(|(f, _)| AggState::new(*f))
-                            .collect();
-                        self.group_vals.push((keys, states));
-                        self.groups.insert(kb, self.group_vals.len() - 1);
-                        self.group_vals.len() - 1
+                        let states = self.plan.aggregates.iter().map(|(f, _)| AggState::new(*f));
+                        self.groups.insert(h, &kb, keys, states)
                     }
                 };
+                kb.clear();
+                self.key_buf = kb;
                 for (j, (_, arg)) in self.plan.aggregates.iter().enumerate() {
                     let d = match arg {
                         Some(a) => eval_expr(a, b, i)?,
                         None => None,
                     };
-                    self.group_vals[idx].1[j].update(arg.is_none(), d)?;
+                    self.groups.states_mut(idx)[j].update(arg.is_none(), d)?;
                 }
             } else {
                 let out: Vec<Datum> = self
@@ -1212,7 +1201,7 @@ struct Partial {
     stats: QueryStats,
     rows: Vec<Row>,
     /// Groups in first-seen order: (key bytes, key values, states).
-    groups: Vec<(Vec<u8>, Vec<Datum>, Vec<AggState>)>,
+    groups: crate::groups::GroupTable<AggState>,
     mem: usize,
 }
 
@@ -1253,18 +1242,14 @@ fn scan_parallel(
                     )?;
                     p.process(&batch)?;
                     p.check_budget()?;
-                    let mut groups: Vec<(Vec<u8>, usize)> = p.groups.drain().collect();
-                    groups.sort_by_key(|(_, idx)| *idx);
-                    let vals = std::mem::take(&mut p.group_vals);
-                    let mut vals: Vec<Option<(Vec<Datum>, Vec<AggState>)>> =
-                        vals.into_iter().map(Some).collect();
+                    let empty = crate::groups::GroupTable::new(
+                        template.plan.group_by.len(),
+                        template.plan.aggregates.len(),
+                    );
                     Ok(Partial {
                         stats: std::mem::take(&mut p.stats),
                         rows: std::mem::take(&mut p.rows),
-                        groups: groups
-                            .into_iter()
-                            .filter_map(|(kb, idx)| vals[idx].take().map(|(k, st)| (kb, k, st)))
-                            .collect(),
+                        groups: std::mem::replace(&mut p.groups, empty),
                         mem: p.mem,
                     })
                 })();
@@ -1311,16 +1296,19 @@ fn scan_parallel(
         ctx.mem += p.mem;
         ctx.rows.extend(p.rows);
         ctx.maybe_compact();
-        for (kb, keys, states) in p.groups {
-            match ctx.groups.get(&kb) {
-                Some(&idx) => {
-                    for (a, b) in ctx.group_vals[idx].1.iter_mut().zip(&states) {
+        // Partial groups in their first-seen order → global first-seen order.
+        for g in 0..p.groups.len() {
+            let (kb, keys, states) = p.groups.group(g);
+            let h = ctx.groups.hash(kb);
+            match ctx.groups.find(h, kb) {
+                Some(idx) => {
+                    for (a, b) in ctx.groups.states_mut(idx).iter_mut().zip(states) {
                         a.merge(b)?;
                     }
                 }
                 None => {
-                    ctx.group_vals.push((keys, states));
-                    ctx.groups.insert(kb, ctx.group_vals.len() - 1);
+                    ctx.groups
+                        .insert(h, kb, keys.iter().cloned(), states.iter().cloned());
                 }
             }
         }
@@ -1473,16 +1461,17 @@ fn run(
     ctx.check_budget()?;
 
     if plan.aggregate {
-        if ctx.group_vals.is_empty() && plan.group_by.is_empty() {
-            let states = plan
-                .aggregates
-                .iter()
-                .map(|(f, _)| AggState::new(*f))
-                .collect();
-            ctx.group_vals.push((Vec::new(), states));
+        if ctx.groups.is_empty() && plan.group_by.is_empty() {
+            let states = plan.aggregates.iter().map(|(f, _)| AggState::new(*f));
+            let h = ctx.groups.hash(&[]);
+            ctx.groups.insert(h, &[], std::iter::empty(), states);
         }
-        let groups = std::mem::take(&mut ctx.group_vals);
-        for (keys, states) in groups {
+        let groups = std::mem::replace(
+            &mut ctx.groups,
+            crate::groups::GroupTable::new(plan.group_by.len(), plan.aggregates.len()),
+        );
+        for g in 0..groups.len() {
+            let (_, keys, states) = groups.group(g);
             let out = plan
                 .outputs
                 .iter()

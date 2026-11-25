@@ -8,6 +8,7 @@
 pub mod audit;
 pub mod auth;
 pub mod config;
+pub mod telemetry;
 pub mod tls;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -124,6 +125,7 @@ pub struct AppState {
     running: Arc<std::sync::Mutex<std::collections::HashMap<String, Running>>>,
     auth_limiter: Arc<std::sync::Mutex<AuthLimiter>>,
     audit: Option<Arc<audit::AuditLog>>,
+    metrics: Arc<telemetry::ServerMetrics>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -249,6 +251,7 @@ impl AppState {
             })),
             cfg: Arc::new(cfg),
             audit: None,
+            metrics: Arc::default(),
         }
     }
 }
@@ -544,7 +547,18 @@ async fn commit(
     Ok(Committed { receipt, accepted })
 }
 
+/// Ingest with acknowledgement-latency measurement (committed requests only).
 async fn ingest(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let started = Instant::now();
+    let r = ingest_inner(State(st.clone()), headers, body).await;
+    if r.status().is_success() {
+        st.metrics
+            .ingest_acked(telemetry::Endpoint::Ingest, started.elapsed());
+    }
+    r
+}
+
+async fn ingest_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let principal = match authenticate(&st, &headers, Permission::Ingest) {
         Ok(p) => p,
         Err(r) => return r,
@@ -659,7 +673,18 @@ fn otlp_error(e: &Error, proto: bool) -> Response {
 }
 
 /// `POST /v1/logs` — OTLP/HTTP logs, protobuf or JSON (spec §7.6, docs/api/otlp.md).
+/// OTLP/HTTP logs with acknowledgement-latency measurement.
 async fn otlp_logs(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let started = Instant::now();
+    let r = otlp_logs_inner(State(st.clone()), headers, body).await;
+    if r.status().is_success() {
+        st.metrics
+            .ingest_acked(telemetry::Endpoint::Otlp, started.elapsed());
+    }
+    r
+}
+
+async fn otlp_logs_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let ctype = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -849,7 +874,34 @@ fn row_object(names: &[String], row: &[Datum]) -> J {
     J::Object(m)
 }
 
+/// Query with latency and outcome measurement. Unauthenticated/unauthorized
+/// requests are not counted (they are not queries).
 async fn query(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let started = Instant::now();
+    let r = query_inner(State(st.clone()), headers, body).await;
+    let status = r.status();
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return r;
+    }
+    if status.is_success() {
+        st.metrics.query_done("ok", started.elapsed());
+        return r;
+    }
+    // Error bodies are small JSON objects carrying the error kind.
+    let (parts, b) = r.into_parts();
+    let bytes = axum::body::to_bytes(b, 64 * 1024).await.unwrap_or_default();
+    let kind = serde_json::from_slice::<J>(&bytes)
+        .ok()
+        .and_then(|j| j["error"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    st.metrics.query_done(
+        telemetry::ServerMetrics::outcome_of(&kind),
+        started.elapsed(),
+    );
+    Response::from_parts(parts, axum::body::Body::from(bytes))
+}
+
+async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let principal = match authenticate(&st, &headers, Permission::Query) {
         Ok(p) => p,
         Err(r) => return r,
@@ -936,6 +988,7 @@ async fn query(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> R
     .await;
     match res {
         Ok((out, next_cursor)) => {
+            st.metrics.query_work(&out.stats);
             let names = unique_names(&out.columns);
             let rows: Vec<J> = out.rows.iter().map(|r| row_object(&names, r)).collect();
             let s = &out.stats;
@@ -1123,6 +1176,28 @@ async fn metrics(State(st): State<AppState>, headers: HeaderMap) -> Response {
         "1 if the engine is in the failed state.",
         f64::from(u8::from(s.failed.is_some())),
     );
+    s.wal_metrics.sync_seconds.render(
+        &mut out,
+        "stratadb_wal_sync_seconds",
+        "WAL fsync latency (group commits and segment rotations).",
+        "",
+        true,
+    );
+    s.wal_metrics.group_size.render(
+        &mut out,
+        "stratadb_wal_group_commit_records",
+        "Records made durable by one WAL fsync (group-commit size).",
+        "",
+        true,
+    );
+    s.flush_seconds.render(
+        &mut out,
+        "stratadb_flush_seconds",
+        "Duration of memtable flushes that wrote segments.",
+        "",
+        true,
+    );
+    st.metrics.render(&mut out);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],

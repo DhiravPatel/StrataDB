@@ -149,6 +149,10 @@ impl NgramSet {
         self.filters.values().map(Bloom::size_bytes).sum()
     }
 
+    pub fn fields(&self) -> impl Iterator<Item = &NgramField> {
+        self.filters.keys()
+    }
+
     /// Whether the field may contain a string with all of `probes`
     /// (`true` when the field has no filter).
     pub fn may_match(&self, f: &NgramField, probes: &[String]) -> bool {
@@ -212,6 +216,31 @@ impl NgramSet {
             filters.insert(f, b);
         }
         Self { filters }
+    }
+
+    /// Fields whose filter lacks a trigram of a string in `rows` (a false
+    /// negative would make `LIKE` skip matching data). Empty = sound.
+    pub fn false_negatives(&self, rows: &[RowRef<'_>]) -> Vec<String> {
+        let mut bad = std::collections::BTreeSet::new();
+        for r in rows {
+            let e = r.event;
+            for (f, b) in &self.filters {
+                let v = match f {
+                    NgramField::Body => match &e.body {
+                        Some(Value::String(s)) => Some(s.as_str()),
+                        _ => None,
+                    },
+                    NgramField::Attr(k) => e.attributes.get(k).and_then(Value::as_str),
+                    NgramField::Resource(k) => e.resource_attributes.get(k).and_then(Value::as_str),
+                };
+                if let Some(s) = v {
+                    if grams(s).any(|g| !b.may_contain(&g)) {
+                        bad.insert(f.describe());
+                    }
+                }
+            }
+        }
+        bad.into_iter().collect()
     }
 
     pub fn to_extension(&self) -> Extension {

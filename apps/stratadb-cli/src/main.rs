@@ -173,6 +173,11 @@ enum Cmd {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// List, verify or rebuild per-segment index filters (Bloom, trigram).
+    Indexes {
+        #[command(subcommand)]
+        cmd: IndexCmd,
+    },
     /// Manage encryption-at-rest keys (ADR-0024).
     Keys {
         #[command(subcommand)]
@@ -234,6 +239,28 @@ enum BackupCmd {
         path: PathBuf,
         #[arg(long)]
         data_dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum IndexCmd {
+    /// Filters per segment (fields, sizes); reads footers only.
+    List {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Read every segment and check its filters against the rows: no false
+    /// negatives (exit 1 otherwise) and whether they match current settings.
+    Verify {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Rewrite segments whose filters are stale or unsound from their rows.
+    Rebuild {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -817,6 +844,7 @@ fn run(cli: Cli) -> Result<bool> {
             e.close()?;
         }
         Cmd::Keys { cmd } => return keys(cmd),
+        Cmd::Indexes { cmd } => return indexes(cmd),
         Cmd::Doctor { data_dir } => {
             let r = doctor::run(&data_dir, key_provider().as_deref());
             let worst = r.worst();
@@ -850,6 +878,66 @@ fn run(cli: Cli) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+fn indexes(cmd: IndexCmd) -> Result<bool> {
+    let row = |s: &stratadb_storage::SegmentIndexes| {
+        let mut j = json!({"segment": s.segment_id, "tenant": s.tenant.as_str(), "rows": s.rows,
+                           "bloom": s.bloom_fields, "bloom_bytes": s.bloom_bytes,
+                           "ngram": s.ngram_fields, "ngram_bytes": s.ngram_bytes});
+        if let Some(c) = &s.check {
+            j["current"] = json!(c.current);
+            j["false_negatives"] = json!(c.false_negatives);
+        }
+        j
+    };
+    match cmd {
+        IndexCmd::List { data_dir } => {
+            let e = open(data_dir, false)?;
+            for s in e.indexes(false)? {
+                println!("{}", row(&s));
+            }
+            e.close()?;
+            Ok(true)
+        }
+        IndexCmd::Verify { data_dir } => {
+            let e = open(data_dir, false)?;
+            let all = e.indexes(true)?;
+            e.close()?;
+            let (mut stale, mut unsound) = (0, 0);
+            for s in &all {
+                println!("{}", row(s));
+                if let Some(c) = &s.check {
+                    stale += usize::from(!c.current);
+                    unsound += usize::from(!c.false_negatives.is_empty());
+                }
+            }
+            println!(
+                "{}",
+                json!({"segments": all.len(), "stale": stale, "unsound": unsound,
+                       "result": if unsound > 0 { "fail" } else if stale > 0 { "stale" } else { "ok" },
+                       "hint": if unsound + stale > 0 { "run `strata indexes rebuild`" } else { "" }})
+            );
+            if unsound > 0 {
+                return Err(Error::corruption(
+                    "indexes",
+                    format!("{unsound} segment(s) have filters missing stored values"),
+                ));
+            }
+            Ok(true)
+        }
+        IndexCmd::Rebuild { data_dir, dry_run } => {
+            let e = open(data_dir, false)?;
+            let r = e.rebuild_indexes(dry_run)?;
+            e.close()?;
+            println!(
+                "{}",
+                json!({"segments_checked": r.segments_checked, "stale": r.segments_stale,
+                       "unsound": r.segments_unsound, "rebuilt": r.segments_rebuilt, "dry_run": r.dry_run})
+            );
+            Ok(true)
+        }
+    }
 }
 
 fn keys(cmd: KeysCmd) -> Result<bool> {

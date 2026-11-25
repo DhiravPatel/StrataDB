@@ -521,3 +521,45 @@ fn skip_value_validates_like_decode() {
         }
     }
 }
+
+/// A filter built from other rows than the segment's misses values; the
+/// verification must report it (a false negative would hide matching rows).
+#[test]
+fn false_negatives_are_detected() {
+    let mk = |ids: std::ops::Range<i64>| -> Vec<Event> {
+        ids.map(|i| {
+            let mut e = Event::new(tenant(), 1, 1);
+            e.trace_id = Some(format!("{i:032x}"));
+            e.attributes
+                .insert("request_id".into(), Value::String(format!("r{i}")));
+            e.body = Some(Value::String(format!("unique body token{i}x")));
+            e
+        })
+        .collect()
+    };
+    fn refs(evs: &[Event]) -> Vec<RowRef<'_>> {
+        evs.iter()
+            .map(|e| RowRef {
+                seq: 1,
+                idx: 0,
+                event: e,
+            })
+            .collect()
+    }
+    let (a, b) = (mk(0..50), mk(1000..1050));
+    let keys = vec!["request_id".to_owned()];
+    let bloom = bloom::BloomSet::build(&refs(&a), &keys, &[]);
+    let ngram = ngram::NgramSet::build(&refs(&a), true, &[], &[]);
+    assert!(bloom.false_negatives(&refs(&a)).is_empty());
+    assert!(ngram.false_negatives(&refs(&a)).is_empty());
+    let fb = bloom.false_negatives(&refs(&b));
+    assert!(fb.contains(&"bloom(trace_id)".to_owned()), "{fb:?}");
+    assert!(
+        fb.contains(&"bloom(attributes['request_id'])".to_owned()),
+        "{fb:?}"
+    );
+    assert_eq!(
+        ngram.false_negatives(&refs(&b)),
+        vec!["ngram(body)".to_owned()]
+    );
+}

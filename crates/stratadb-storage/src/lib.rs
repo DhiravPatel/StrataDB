@@ -9,10 +9,11 @@ pub mod memtable;
 
 pub use engine::{
     restore_backup, verify_backup, BackupManifest, BackupReport, CommitLevel, CompactionOptions,
-    CompactionReport, Engine, EngineOptions, EngineStats, FlushReport, OpenReport, RestoreReport,
-    RetentionReport, SegmentHandle, Snapshot, TenantUsage, UpgradeReport, WriteReceipt,
+    CompactionReport, Engine, EngineOptions, EngineStats, FlushReport, IndexCheck,
+    IndexRebuildReport, OpenReport, RestoreReport, RetentionReport, SegmentHandle, SegmentIndexes,
+    Snapshot, TenantUsage, UpgradeReport, WriteReceipt,
 };
 pub use idempotency::IdempotencyKey;
 pub use manifest::{Manifest, RetentionPolicy, SegmentEntry};
 pub use memtable::MemRow;
-pub use stratadb_wal::{Durability, RecoveryPolicy, WalOptions};
+pub use stratadb_wal::{Durability, RecoveryPolicy, WalMetrics, WalOptions};

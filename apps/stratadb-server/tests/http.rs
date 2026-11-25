@@ -1351,3 +1351,122 @@ async fn query_pagination_over_http() {
         assert_eq!(st, 400, "{body}");
     }
 }
+
+/// `/metrics` exposes latency histograms and query outcomes in valid
+/// Prometheus text format, consistent with the requests made, without tenant
+/// names (spec §2.5, §3.2, §25).
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_histograms_and_query_outcomes() {
+    let s = start(ServerConfig::default()).await;
+    for i in 0..5 {
+        let (st, _) = req(
+            &s,
+            "POST",
+            "/api/v1/ingest",
+            Some(&s.a_rw),
+            "application/json",
+            &format!(r#"{{"service":"m","body":"metric {i}"}}"#),
+        )
+        .await;
+        assert_eq!(st, 200);
+    }
+    for _ in 0..3 {
+        assert_eq!(query(&s, &s.a_rw, "SELECT count(*) FROM logs").await.0, 200);
+    }
+    assert_eq!(query(&s, &s.a_rw, "SELECT nope FROM logs").await.0, 400);
+    // Unauthenticated requests are not queries.
+    assert_eq!(
+        query(&s, "sdb_bad_token", "SELECT 1 FROM logs").await.0,
+        401
+    );
+    let (st, text) = req(
+        &s,
+        "GET",
+        "/api/v1/metrics",
+        Some(&s.metrics),
+        "text/plain",
+        "",
+    )
+    .await;
+    assert_eq!(st, 200);
+
+    // Every sample line is `name{labels} value` with a declared family.
+    let mut families = std::collections::BTreeSet::new();
+    let mut samples: Vec<(String, String, f64)> = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("# TYPE ") {
+            families.insert(rest.split(' ').next().unwrap().to_owned());
+            continue;
+        }
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let (series, value) = line
+            .rsplit_once(' ')
+            .unwrap_or_else(|| panic!("bad line {line:?}"));
+        let v: f64 = value
+            .parse()
+            .unwrap_or_else(|_| panic!("bad value in {line:?}"));
+        let (name, labels) = match series.split_once('{') {
+            Some((n, l)) => (n.to_owned(), l.trim_end_matches('}').to_owned()),
+            None => (series.to_owned(), String::new()),
+        };
+        let family = ["_bucket", "_sum", "_count"]
+            .iter()
+            .find_map(|suf| name.strip_suffix(suf).filter(|f| families.contains(*f)))
+            .unwrap_or(&name)
+            .to_owned();
+        assert!(families.contains(&family), "undeclared family for {line:?}");
+        samples.push((name, labels, v));
+    }
+    let get = |name: &str, labels: &str| {
+        samples
+            .iter()
+            .find(|(n, l, _)| n == name && l == labels)
+            .map(|(_, _, v)| *v)
+            .unwrap_or_else(|| panic!("missing {name}{{{labels}}}"))
+    };
+    assert_eq!(
+        get("stratadb_ingest_ack_seconds_count", "endpoint=\"ingest\""),
+        5.0
+    );
+    assert_eq!(
+        get("stratadb_ingest_ack_seconds_count", "endpoint=\"otlp\""),
+        0.0
+    );
+    assert_eq!(get("stratadb_queries_total", "outcome=\"ok\""), 3.0);
+    assert_eq!(get("stratadb_queries_total", "outcome=\"invalid\""), 1.0);
+    assert_eq!(get("stratadb_query_seconds_count", ""), 4.0);
+    assert!(get("stratadb_query_rows_scanned_total", "") >= 15.0);
+    assert!(
+        get("stratadb_wal_sync_seconds_count", "") >= 5.0,
+        "group commit fsyncs"
+    );
+    assert!(get("stratadb_wal_group_commit_records_count", "") >= 1.0);
+    // Histograms: cumulative buckets, +Inf bucket == count.
+    for (fam, labels) in [
+        ("stratadb_ingest_ack_seconds", "endpoint=\"ingest\","),
+        ("stratadb_query_seconds", ""),
+        ("stratadb_wal_sync_seconds", ""),
+    ] {
+        let buckets: Vec<f64> = samples
+            .iter()
+            .filter(|(n, l, _)| n == &format!("{fam}_bucket") && l.starts_with(labels))
+            .map(|(_, _, v)| *v)
+            .collect();
+        assert!(
+            buckets.len() > 5 && buckets.windows(2).all(|w| w[0] <= w[1]),
+            "{fam}"
+        );
+        let count_labels = labels.trim_end_matches(',');
+        assert_eq!(
+            *buckets.last().unwrap(),
+            get(&format!("{fam}_count"), count_labels),
+            "{fam}"
+        );
+    }
+    assert!(
+        !text.contains("tenant-a") && !text.contains("tenant-b"),
+        "no tenant labels"
+    );
+}

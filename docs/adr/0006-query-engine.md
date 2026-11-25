@@ -54,6 +54,13 @@ other values without allocating). Query 10 of the suite: 22× faster, 26× fewer
 segment bytes (`benchmarks/reports/2026-11-25-map-projection-ab.md`).
 `QueryOptions::enable_map_projection` disables it.
 
+### Update 2026-11-25: flat aggregation groups
+Groups live in a flat `GroupTable` (hashbrown `HashTable` of indices, key-byte
+arena, flat key/state arrays) hashed with aHash (random per-table seed).
+High-cardinality `GROUP BY` uses 2.2× less CPU; low-cardinality unchanged
+(`benchmarks/reports/2026-11-25-grouping-flat.md`). The remaining dominant cost
+for high-cardinality string keys is decoding each value into an owned string.
+
 ## Revisit conditions
 If the supported SQL surface grows to joins/window functions, or benchmarks
 show vectorized Arrow execution is materially faster on Class B/C workloads.

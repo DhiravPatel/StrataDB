@@ -71,6 +71,40 @@ pub struct UpgradeReport {
     pub dry_run: bool,
 }
 
+/// Index filters of one segment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SegmentIndexes {
+    pub segment_id: u64,
+    pub tenant: TenantId,
+    pub rows: u64,
+    pub bloom_fields: Vec<String>,
+    pub bloom_bytes: usize,
+    pub ngram_fields: Vec<String>,
+    pub ngram_bytes: usize,
+    /// Present when verified.
+    pub check: Option<IndexCheck>,
+}
+
+/// Result of verifying one segment's filters against its rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexCheck {
+    /// Filters missing a value stored in the segment: queries could skip
+    /// matching rows. Must be empty.
+    pub false_negatives: Vec<String>,
+    /// The stored filters are byte-identical to what the current
+    /// configuration builds from the rows (false = stale settings).
+    pub current: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexRebuildReport {
+    pub segments_checked: usize,
+    pub segments_stale: usize,
+    pub segments_unsound: usize,
+    pub segments_rebuilt: usize,
+    pub dry_run: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetentionReport {
     pub segments_dropped: usize,
@@ -464,6 +498,105 @@ impl Shared {
     }
 
     /// Opportunistic deletion of obsolete files (background loop).
+    pub(super) fn indexes(&self, verify: bool) -> Result<Vec<SegmentIndexes>> {
+        self.check_healthy()?;
+        let segs = Arc::clone(&self.state.lock().segments);
+        let mut out = Vec::with_capacity(segs.len());
+        for h in segs.iter() {
+            let bloom = h.bloom();
+            let ngram = h.ngram();
+            let check = if verify {
+                let rows = h.reader.read_rows()?;
+                let refs: Vec<RowRef<'_>> = rows
+                    .iter()
+                    .map(|r| RowRef {
+                        seq: r.seq,
+                        idx: r.idx,
+                        event: &r.event,
+                    })
+                    .collect();
+                let mut false_negatives =
+                    bloom.map(|b| b.false_negatives(&refs)).unwrap_or_default();
+                false_negatives.extend(ngram.map(|n| n.false_negatives(&refs)).unwrap_or_default());
+                let expected = self.index_extensions(&refs);
+                let footer = h.reader.footer();
+                let current = [
+                    stratadb_segment::bloom::EXT_BLOOM,
+                    stratadb_segment::ngram::EXT_NGRAM,
+                ]
+                .iter()
+                .all(|tag| {
+                    footer.extension(*tag).map(|x| &x.data)
+                        == expected.iter().find(|x| x.tag == *tag).map(|x| &x.data)
+                });
+                Some(IndexCheck {
+                    false_negatives,
+                    current,
+                })
+            } else {
+                None
+            };
+            out.push(SegmentIndexes {
+                segment_id: h.entry.id,
+                tenant: h.entry.tenant.clone(),
+                rows: h.entry.row_count,
+                bloom_fields: bloom
+                    .map(|b| b.fields().map(|f| f.describe()).collect())
+                    .unwrap_or_default(),
+                bloom_bytes: bloom.map_or(0, |b| b.size_bytes()),
+                ngram_fields: ngram
+                    .map(|n| n.fields().map(|f| f.describe()).collect())
+                    .unwrap_or_default(),
+                ngram_bytes: ngram.map_or(0, |n| n.size_bytes()),
+                check,
+            });
+        }
+        Ok(out)
+    }
+
+    pub(super) fn rebuild_indexes(&self, dry_run: bool) -> Result<IndexRebuildReport> {
+        let checked = self.indexes(true)?;
+        let mut report = IndexRebuildReport {
+            segments_checked: checked.len(),
+            dry_run,
+            ..Default::default()
+        };
+        let mut targets = BTreeSet::new();
+        for s in &checked {
+            if let Some(c) = &s.check {
+                if !c.false_negatives.is_empty() {
+                    report.segments_unsound += 1;
+                    tracing::error!(segment = s.segment_id, filters = ?c.false_negatives,
+                        "index filters miss stored values; rebuilding");
+                }
+                if !c.current {
+                    report.segments_stale += 1;
+                }
+                if !c.current || !c.false_negatives.is_empty() {
+                    targets.insert(s.segment_id);
+                }
+            }
+        }
+        if dry_run || targets.is_empty() {
+            return Ok(report);
+        }
+        let mut man = self.manifest.lock();
+        for id in targets {
+            // The segment may have been compacted away since the check.
+            let seg = {
+                let segs = Arc::clone(&self.state.lock().segments);
+                segs.iter().find(|h| h.entry.id == id).cloned()
+            };
+            let Some(seg) = seg else { continue };
+            self.check_disk(seg.entry.file_bytes)?;
+            let tenant = seg.entry.tenant.clone();
+            self.rewrite(&mut man, &tenant, &[seg], &|_| true)?;
+            report.segments_rebuilt += 1;
+        }
+        self.reclaim_obsolete(&mut man)?;
+        Ok(report)
+    }
+
     pub(super) fn reclaim_obsolete_now(&self) -> Result<usize> {
         if self.state.lock().obsolete.is_empty() {
             return Ok(0);

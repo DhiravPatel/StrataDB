@@ -15,7 +15,7 @@ OpenAPI 3.1 document: [openapi.json](openapi.json) (a test asserts every documen
 | POST | `/ingest/batch`, `/ingest` | `ingest` | NDJSON (default) or `application/json` object/array |
 | POST | `/query` | `query` | `{"query", "timeout_ms"?, "max_rows"?, "query_id"?, "database"?: "default", "page_size"?, "cursor"?}`; unknown fields → 400; response includes `query_id` |
 | GET / DELETE | `/query/{id}` | `query` | status / cancel a **running** query of the caller's tenant (others' ids → 404); a cancelled query fails with `cancelled` |
-| GET | `/metrics` | `cluster.read` | Prometheus text format |
+| GET | `/metrics` | `cluster.read` | Prometheus text format (series: docs/operations/metrics.md) |
 | POST | `/admin/compaction` | `cluster.admin` | runs compaction passes until nothing is left to merge |
 | POST | `/admin/backup` | `backup.create` | `{"name": "<[A-Za-z0-9_-]{1,64}>"}`; requires `--backup-dir`; 409 if the name exists |
 | GET / PUT / DELETE | `/retention` | `retention.manage` | caller's tenant only; PUT `{"max_age_days": n, "hold": bool}` |

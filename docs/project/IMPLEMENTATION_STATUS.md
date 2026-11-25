@@ -6,7 +6,7 @@ reserved for features that additionally passed an independent review / release
 gate; **nothing is VERIFIED yet.**
 
 Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
-`-D warnings` ✅, `cargo test --workspace` ✅ (273 tests, 0 failures).
+`-D warnings` ✅, `cargo test --workspace` ✅ (280 tests, 0 failures).
 
 | ID | Feature | State | Evidence | Known limitations |
 |----|---------|-------|----------|-------------------|
@@ -33,13 +33,14 @@ Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
 | E-013 | Allocation-free grouping (borrowed group-key encoding, slice lookup) | TESTED | `group_key_into_equals_group_key_bytes` proptest (1 000 cases; injected tag bug caught), all query equivalence tests; report `2026-11-25-grouping.md` (1.3–3.0× on group-by queries) | map decoding dominates non-shredded keys |
 | E-014 | Parallel segment scans with partial aggregation (ordered merge, query-wide budgets) | TESTED | `query/tests/parallel.rs` (2), `row_budget_stops_parallel_workers_early`, full query suite under parallelism; 4 injected bugs caught; report `2026-11-25-parallel-ab.md` (2.2–2.6×) | memtable + merge sequential; float sums not bit-identical to sequential |
 | E-015 | Attribute key projection (no whole-map decode for key references) | TESTED | `read_map_keys_equals_full_maps`, `skip_value_validates_like_decode`, engine equivalence proptest with the switch off; report `2026-11-25-map-projection-ab.md` (22× on query 10) | whole-map references still decode every row |
+| E-016 | Flat aggregation groups (HashTable + arena, aHash) | TESTED | `groups::tests`, full query suite (equivalence, parallel group order); report `2026-11-25-grouping-flat.md` (2.2× less CPU on high-cardinality GROUP BY) | string keys still decoded into owned strings |
 | E-011 | Stable keyset pagination (row queries; HTTP `page_size`/`cursor`; Rust/Python/Go SDK helpers) | TESTED | `query/tests/pagination.rs` (9 tests incl. proptest; mutation-checked: removing the tie-break, the `as_of` bound, the strict cursor comparison or loosening either pruning rule each fails tests), `query_pagination_over_http`, SDK conformance (ADR-0023) | aggregates/EXPLAIN not paginated; deep pages of non-time orders rescan |
 | F-001 | Segment statistics | TESTED | footer stats + `verify` | — |
 | F-002 | Timestamp pruning | TESTED | pruning tests + equivalence proptest | segments not time-partitioned |
 | F-003 | Bloom filters (ids + selected attributes) | TESTED | bloom unit tests, `bloom_filters_prune_exact_id_lookups_without_false_negatives`, equivalence proptest, A/B report | rebuild requires compaction |
 | F-005 | Trigram filters for `LIKE`/`ILIKE` segment pruning (body + configured attributes) | TESTED | `ngram` unit tests incl. no-false-negative proptest vs reference LIKE, `ngram_filters_prune_like_scans_without_changing_results`, engine equivalence proptest with LIKE/ILIKE, 2 injected bugs caught; A/B report `2026-11-25-ngram-ab.md` | runs < 3 chars, `NOT LIKE`, `OR` not pruned; rebuild requires compaction |
 | F-004 | Exact-match postings | DESIGN (deferred, ADR-0005) | Bloom + vectorized scan; no row groups yet | revisit with row groups |
-| F-006..F-008 | Index manifest/verify/rebuild | NOT_STARTED | — | — |
+| F-006..F-008 | Index list/verify/rebuild (per-segment filters) | TESTED | `query/tests/indexes.rs` (stale settings detected, rebuild prunes, results unchanged, idempotent, durable), `false_negatives_are_detected`, CLI `indexes_list_verify_rebuild`; `strata indexes list|verify|rebuild` | rebuild rewrites whole segments; offline (CLI) |
 | G-001..G-003 | HTTP server, auth, batch ingest endpoint | TESTED | `apps/stratadb-server/tests/http.rs` (5) + auth unit tests (2) + manual curl smoke | no TLS; token reload needs restart |
 | G-004 | WAL integration of API writes | TESTED | receipts carry commit_seq + durability | — |
 | G-006 | Idempotency keys (bounded, durable) | TESTED | `storage/tests/idempotency.rs`, crash-matrix retries, `idempotent_ingest_over_http` (ADR-0019) | compaction must preserve extension tag 1 |
@@ -59,7 +60,7 @@ Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
 | — | Encryption at rest (KEK provider, wrapped DEKs, sealed segments/manifest, encrypted WAL, rotation, encrypted backups) | TESTED | `stratadb-crypto` (8), WAL encryption tests (2), `storage/tests/encryption.rs` (6 + golden fixture), encrypted power-loss simulation (1 320 states), CLI workflow, server config test (ADR-0024) | file KEK provider only; offline rotation |
 | H-005 | Retention (per tenant, legal hold) | TESTED | `tests/maintenance.rs`, CLI + HTTP endpoints (ADR-0020) | periodic, not instantaneous |
 | H-006, H-007 | Backup, verify, restore + drills | TESTED | `tests/backup.rs`, CLI drill, HTTP backup (ADR-0010) | full backups only; no encryption |
-| H-008 | Metrics | IMPLEMENTED | `/api/v1/metrics` (Prometheus text, cluster.read) | no latency histograms; no query metrics |
+| H-008 | Metrics | TESTED | `/api/v1/metrics`: engine counters, latency histograms (ingest ack, query, WAL fsync, flush), group-commit size, query outcomes and work; `metrics_histograms_and_query_outcomes` (exposition validity, cumulative buckets, counts), histogram unit tests; docs/operations/metrics.md | no OTel trace export; no per-tenant series (by design) |
 | H-009 | CLI incl. `doctor` (read-only diagnostics) | TESTED | `apps/stratadb-cli/tests/cli.rs`, `tests/doctor.rs` (detects corruption, provably read-only) | local admin only |
 | H-010 | Docker/compose/systemd + healthcheck | IMPLEMENTED | `deployments/`, `strata-server healthcheck` smoke | **image build not verified** (no Docker daemon) |
 | H-011 | Fuzzing (14 targets) | TESTED | stable mutation test in default suite; 30k-iteration campaign; cargo-fuzz targets in `fuzz/` (docs/testing/fuzzing.md) | |

@@ -20,7 +20,7 @@
 | `[storage] wal_segment_max_bytes` | — | 64 MiB | |
 | `[storage] disk_reserve_bytes` / `disk_reserve_ratio` | — | 512 MiB / 0.02 | writes pause below the reserve |
 | `[storage] default_retention_days` | flag | keep forever | per-tenant policies override |
-| `[storage] bloom_attribute_keys` | — | request_id, user_id, session_id, correlation_id | new segments only |
+| `[storage] bloom_attribute_keys` | — | request_id, user_id, session_id, correlation_id | new segments; `strata indexes rebuild` applies it to existing ones |
 | `[storage] ngram_index` | — | true | trigram filters on `body` prune `LIKE`/`ILIKE` scans; new segments only |
 | `[storage] ngram_attribute_keys` | — | none | string attributes indexed the same way; new segments only |
 | `[encryption] key_file` | `STRATADB_KEY_FILE`, `--key-file` | none | enables encryption at rest (ADR-0024, runbooks/encryption.md); restart required |

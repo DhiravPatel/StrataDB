@@ -10,6 +10,7 @@ pub mod error;
 pub mod failpoint;
 pub mod fsutil;
 pub mod ids;
+pub mod metrics;
 #[cfg(feature = "simfs")]
 pub mod simfs;
 pub mod time;

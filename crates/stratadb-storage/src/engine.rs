@@ -50,7 +50,10 @@ mod maintenance;
 pub use backup::{
     restore_backup, verify_backup, BackupFile, BackupManifest, BackupReport, RestoreReport,
 };
-pub use maintenance::{CompactionOptions, CompactionReport, RetentionReport, UpgradeReport};
+pub use maintenance::{
+    CompactionOptions, CompactionReport, IndexCheck, IndexRebuildReport, RetentionReport,
+    SegmentIndexes, UpgradeReport,
+};
 
 use crate::idempotency::{self, BatchMeta, DedupIndex, IdempotencyKey, Reservation};
 use crate::manifest::RetentionPolicy;
@@ -296,6 +299,10 @@ pub struct EngineStats {
     pub disk_free_bytes: u64,
     pub disk_total_bytes: u64,
     pub disk_write_rejections: u64,
+    /// WAL fsync latency and group-commit size distributions.
+    pub wal_metrics: stratadb_wal::WalMetrics,
+    /// Duration of flushes that wrote at least one memtable.
+    pub flush_seconds: stratadb_common::metrics::HistogramSnapshot,
 }
 
 /// A consistent, tenant-scoped read view (spec §9.4): committed segments plus
@@ -405,6 +412,7 @@ struct Shared {
     bg: Mutex<BgSignal>,
     bg_cv: Condvar,
     counters: Counters,
+    flush_seconds: stratadb_common::metrics::Histogram,
     open_report: OpenReport,
     dedup: Mutex<DedupIndex>,
     disk: Mutex<DiskState>,
@@ -739,6 +747,7 @@ impl Engine {
             bg: Mutex::new(BgSignal::default()),
             bg_cv: Condvar::new(),
             counters: Counters::default(),
+            flush_seconds: stratadb_common::metrics::Histogram::latency(),
             open_report: report,
             dedup: Mutex::new(dedup),
             disk: Mutex::new(DiskState {
@@ -806,6 +815,20 @@ impl Engine {
     /// only reports what would change.
     pub fn upgrade_segments(&self, dry_run: bool) -> Result<UpgradeReport> {
         self.shared.upgrade(dry_run)
+    }
+
+    /// Index filters of every committed segment (spec §12.8). With `verify`,
+    /// each segment's rows are read to check that no filter misses a stored
+    /// value and whether the filters match the current configuration.
+    pub fn indexes(&self, verify: bool) -> Result<Vec<SegmentIndexes>> {
+        self.shared.indexes(verify)
+    }
+
+    /// Rebuild the filters of segments that are stale (configuration changed)
+    /// or unsound, by rewriting them from their rows (spec §3.1). `dry_run`
+    /// only reports which segments would be rebuilt.
+    pub fn rebuild_indexes(&self, dry_run: bool) -> Result<IndexRebuildReport> {
+        self.shared.rebuild_indexes(dry_run)
     }
 
     /// Run one compaction pass (at most one merge group per tenant) and delete
@@ -1000,6 +1023,14 @@ impl Shared {
                 data: idempotency::encode_extension(metas),
             });
         }
+        x.extend(self.index_extensions(rows));
+        x
+    }
+
+    /// Index extensions (Bloom, trigram) the current configuration builds for
+    /// `rows`. Deterministic: equal rows and settings give equal bytes.
+    pub(crate) fn index_extensions(&self, rows: &[RowRef<'_>]) -> Vec<stratadb_segment::Extension> {
+        let mut x = Vec::new();
         if self.opts.bloom_enabled {
             let b = stratadb_segment::bloom::BloomSet::build(
                 rows,
@@ -1176,6 +1207,7 @@ impl Shared {
 
     fn flush(&self) -> Result<FlushReport> {
         self.check_healthy()?;
+        let started = Instant::now();
         let mut man = self.manifest.lock();
         self.freeze_active()?;
         let mut report = FlushReport {
@@ -1196,6 +1228,7 @@ impl Shared {
         }
         if report.memtables_flushed > 0 {
             self.counters.flushes.fetch_add(1, Ordering::Relaxed);
+            self.flush_seconds.observe_duration(started.elapsed());
         }
         Ok(report)
     }
@@ -1395,6 +1428,8 @@ impl Shared {
             disk_total_bytes: self.disk_space().1,
             disk_write_rejections: c.disk_rejections.load(Ordering::Relaxed),
             duplicates_suppressed: c.duplicates.load(Ordering::Relaxed),
+            wal_metrics: self.wal.metrics(),
+            flush_seconds: self.flush_seconds.snapshot(),
         }
     }
 }

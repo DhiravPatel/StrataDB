@@ -2,6 +2,17 @@
 
 ## Unreleased (0.0.1)
 ### Added
+- Index lifecycle: `Engine::indexes`/`rebuild_indexes` and `strata indexes
+  list|verify|rebuild` — verification checks filters against the rows (no
+  false negatives; current vs stale settings), rebuild rewrites stale or
+  unsound segments.
+- Metrics: latency histograms for ingest acknowledgement (per endpoint),
+  queries, WAL fsync and flushes; WAL group-commit size; `queries_total` by
+  outcome; query rows/bytes/segments counters (docs/operations/metrics.md).
+  No tenant labels (bounded cardinality, no tenant-name disclosure).
+- Flat aggregation groups (`hashbrown::HashTable` + key arena, aHash):
+  high-cardinality `GROUP BY` uses 2.2× less CPU
+  (`benchmarks/reports/2026-11-25-grouping-flat.md`).
 - Fuzz targets `cursor`, `sealed` (encryption formats, encrypted WAL recovery)
   and `map_projection`; 10-minute libFuzzer campaigns found no crashes
   (≈ 8.2 M runs); CI fuzz smoke covers all 14 targets.

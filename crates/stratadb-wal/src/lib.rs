@@ -148,6 +148,17 @@ pub struct Wal {
     opts: WalOptions,
     inner: Mutex<Inner>,
     cv: Condvar,
+    /// fsync latency of the active segment (group commits and rotations).
+    sync_seconds: stratadb_common::metrics::Histogram,
+    /// Records made durable by one fsync (group-commit size, spec §8.4).
+    group_size: stratadb_common::metrics::Histogram,
+}
+
+/// WAL latency/size distributions.
+#[derive(Debug, Clone)]
+pub struct WalMetrics {
+    pub sync_seconds: stratadb_common::metrics::HistogramSnapshot,
+    pub group_size: stratadb_common::metrics::HistogramSnapshot,
 }
 
 impl std::fmt::Debug for Wal {
@@ -478,12 +489,22 @@ impl Wal {
                 poisoned: None,
             }),
             cv: Condvar::new(),
+            sync_seconds: stratadb_common::metrics::Histogram::latency(),
+            group_size: stratadb_common::metrics::Histogram::sizes(),
         };
         Ok((wal, report))
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// fsync latency and group-commit size distributions since open.
+    pub fn metrics(&self) -> WalMetrics {
+        WalMetrics {
+            sync_seconds: self.sync_seconds.snapshot(),
+            group_size: self.group_size.snapshot(),
+        }
     }
 
     pub fn options(&self) -> &WalOptions {
@@ -615,8 +636,10 @@ impl Wal {
                 }
             }
             let target = g.written_seq;
+            let records = target.saturating_sub(g.durable_seq);
             let file = Arc::clone(&g.file);
             let path = g.path.clone();
+            let started = Instant::now();
             let res = MutexGuard::unlocked(&mut g, || -> Result<()> {
                 failpoint::hit("wal::before_sync")?;
                 fsutil::sync_file(&file, &path, true).ctx(|| "fsyncing WAL segment".to_owned())?;
@@ -625,7 +648,11 @@ impl Wal {
             });
             g.syncing = false;
             match res {
-                Ok(()) => g.durable_seq = g.durable_seq.max(target),
+                Ok(()) => {
+                    self.sync_seconds.observe_duration(started.elapsed());
+                    self.group_size.observe(records as f64);
+                    g.durable_seq = g.durable_seq.max(target);
+                }
                 Err(e) => Self::poison(&mut g, format!("sync failed: {e}")),
             }
             self.cv.notify_all();
@@ -634,10 +661,16 @@ impl Wal {
 
     fn rotate_locked(&self, g: &mut MutexGuard<'_, Inner>) -> Result<()> {
         // The old segment must be fully durable before it becomes immutable.
+        let started = Instant::now();
+        let records = g.written_seq.saturating_sub(g.durable_seq);
         if let Err(e) = fsutil::sync_file(&g.file, &g.path, true) {
             let why = format!("sync before rotation failed: {e}");
             Self::poison(g, why.clone());
             return Err(Error::indeterminate(why));
+        }
+        self.sync_seconds.observe_duration(started.elapsed());
+        if records > 0 {
+            self.group_size.observe(records as f64);
         }
         g.durable_seq = g.durable_seq.max(g.written_seq);
         self.cv.notify_all();

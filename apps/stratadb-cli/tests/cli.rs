@@ -148,3 +148,51 @@ fn end_to_end() {
         .success());
     assert!(strata(&["compact", "--data-dir", d]).status.success());
 }
+
+#[test]
+fn indexes_list_verify_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().join("data");
+    let d = d.to_str().unwrap();
+    assert!(strata(&["init", "--data-dir", d]).status.success());
+    let input = dir.path().join("e.ndjson");
+    let mut f = std::fs::File::create(&input).unwrap();
+    for i in 0..30 {
+        writeln!(
+            f,
+            r#"{{"body":"m{i}","trace_id":"{i:032x}","attributes":{{"request_id":"r{i}"}}}}"#
+        )
+        .unwrap();
+    }
+    drop(f);
+    assert!(strata(&[
+        "ingest",
+        "--data-dir",
+        d,
+        "--tenant",
+        "t",
+        "--file",
+        input.to_str().unwrap()
+    ])
+    .status
+    .success());
+    let o = strata(&["indexes", "list", "--data-dir", d]);
+    assert!(o.status.success());
+    let rows: Vec<serde_json::Value> = stdout(&o)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0]["bloom"].to_string().contains("request_id"));
+    assert!(rows[0]["ngram"].to_string().contains("ngram(body)"));
+    let o = strata(&["indexes", "verify", "--data-dir", d]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let last: serde_json::Value = serde_json::from_str(stdout(&o).lines().last().unwrap()).unwrap();
+    assert_eq!(last["result"], "ok");
+    let o = strata(&["indexes", "rebuild", "--data-dir", d, "--dry-run"]);
+    let r: serde_json::Value = serde_json::from_str(stdout(&o).trim()).unwrap();
+    assert_eq!(
+        (r["stale"].as_u64(), r["rebuilt"].as_u64()),
+        (Some(0), Some(0))
+    );
+}

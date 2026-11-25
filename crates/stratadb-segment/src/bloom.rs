@@ -211,6 +211,28 @@ impl BloomSet {
         Self { filters }
     }
 
+    /// Fields whose filter is missing a value present in `rows` (a false
+    /// negative would make queries skip matching data). Empty = sound.
+    pub fn false_negatives(&self, rows: &[RowRef<'_>]) -> Vec<String> {
+        let mut bad = BTreeSet::new();
+        for r in rows {
+            let e = r.event;
+            for (f, b) in &self.filters {
+                let v: Option<&str> = match f {
+                    BloomField::TraceId => e.trace_id.as_deref(),
+                    BloomField::SpanId => e.span_id.as_deref(),
+                    BloomField::EventId => e.event_id.as_deref(),
+                    BloomField::Attr(k) => e.attributes.get(k).and_then(Value::as_str),
+                    BloomField::Resource(k) => e.resource_attributes.get(k).and_then(Value::as_str),
+                };
+                if v.is_some_and(|v| !b.may_contain(v)) {
+                    bad.insert(f.describe());
+                }
+            }
+        }
+        bad.into_iter().collect()
+    }
+
     pub fn to_extension(&self) -> Extension {
         let mut e = Encoder::new();
         e.put_u8(VERSION);

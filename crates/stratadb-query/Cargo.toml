@@ -11,6 +11,8 @@ stratadb-common.workspace = true
 stratadb-schema.workspace = true
 stratadb-segment.workspace = true
 stratadb-storage.workspace = true
+hashbrown.workspace = true
+ahash.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

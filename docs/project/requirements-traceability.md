@@ -6,25 +6,25 @@ Maps spec requirements → tasks → acceptance tests. Status: ✅ tested ·
 | Spec | Requirement | Task | Acceptance test / evidence | Status |
 |------|-------------|------|----------------------------|--------|
 | §0.3.3, §8.3 | No acknowledged write lost under configured mode | C-005, C-008 | `stratadb-storage/tests/crash.rs`, `power_loss_sim.rs` (2 428 simulated power-loss states), WAL `concurrent_*` | ✅ process crash and simulated power loss (device honours flushes) |
-| §0.3.4, §18.4 | No cross-tenant query results | H-002 | `tenant_isolation_in_storage`, `tenant_isolation_in_queries` | ◐ storage/query ✅, API ☐ |
+| §0.3.4, §18.4 | No cross-tenant query results | H-002 | `tenant_isolation_in_storage`, `tenant_isolation_in_queries`, server `tenant_isolation_across_the_api` | ✅ |
 | §0.3.6 | Persistent formats versioned | B-004, C-001, D-001 | version-rejection tests in wal/segment/schema/manifest | ✅ |
 | §0.3.7 | Inspectable/verifiable storage | D-005 | `strata segments verify`, `SegmentReader::verify` | ✅ |
-| §2.1 | Single + batch ingestion; partial batch errors | G-003 | CLI `end_to_end` (per-line rejections) | ◐ CLI only |
+| §2.1 | Single + batch ingestion; partial batch errors | G-003 | CLI `end_to_end`, server `ingest_partial_batch_and_receipt` | ✅ |
 | §2.1 | HTTP ingestion endpoint, partial batch errors, auth + tenant routing | G-001..G-003 | `apps/stratadb-server/tests/http.rs` | ✅ |
 | §2.1, §7.6, §23.2 | OTLP logs (HTTP protobuf + JSON, gzip), official-fixture & official-exporter interop | G-007 | `otlp_proto` tests, `otlp_http_json_logs`, `otlp_interop` | ◐ (no gRPC) |
 | §2.1, §23.1 | Rust, Python, Go SDKs | G-008 | `sdk/README.md` conformance runs | ✅ |
 | §22.2, §29.4 | Config file, env overrides, validation, redacted display | — | `config.rs` tests | ✅ |
 | §29.1–29.2 | Docker, compose, systemd, non-root, healthcheck | H-010 | `deployments/` | ◐ (image build unverified) |
 | §2.1 | Ingestion states distinguished | ADR-0009 | `WriteReceipt.level`, `async_mode_reports_weaker_commit_level` | ◐ (replicated/flushed states not exposed per write) |
-| §2.1, §7.3 | Idempotency key support | G-006 | — | ☐ |
+| §2.1, §7.3 | Idempotency key support | G-006 | `storage/tests/idempotency.rs`, `idempotent_ingest_over_http`, crash-matrix retries (ADR-0019) | ✅ (bounded window) |
 | §2.2, §6.1 | Canonical event model; tenant from auth | B-001 | `maps_spec_example`, `payload_cannot_override_tenant` | ✅ |
 | §2.2, §6.4 | No silent coercion; type-conflict policy | B-002, ADR-0008 | schema json tests; planner `validation_errors` | ✅ |
 | §2.3 | Projection, time filters, =/!=, numeric cmp, AND/OR/NOT, IN, IS NULL/MISSING, LIKE, ORDER BY, LIMIT, GROUP BY, COUNT/MIN/MAX/SUM/AVG, time bucket, map access, timeout/cancel, EXPLAIN [ANALYZE] | E-001..E-010 | `stratadb-query/tests/query.rs` | ✅ |
 | §2.3 | Pagination with stable semantics | E-011 | `stratadb-query/tests/pagination.rs` (incl. proptest), server `http.rs::query_pagination_over_http`, Rust/Python/Go SDK conformance (ADR-0023) | ✅ |
 | §2.4 | Administration (segments, verify, WAL state) | H-009 | `strata segments`, `strata status` | ◐ |
-| §2.5, §25 | Prometheus, OTel traces, health endpoints | H-008 | `/metrics`, `/health`, `/ready` | ◐ (no traces, no histograms) |
+| §2.5, §25 | Prometheus, OTel traces, health endpoints | H-008 | `/metrics`, `/health`, `/ready` | ◐ (histograms ✅ docs/operations/metrics.md; no OTel traces) |
 | §3.1 | No silent corruption; deterministic recovery; checksums | C-003, C-006, D-005 | bit-flip/truncation tests, `crash.rs` idempotency | ✅ |
-| §3.1 | Indexes rebuildable | F-008 | — | ☐ |
+| §3.1 | Indexes rebuildable | F-006..F-008 | `query/tests/indexes.rs` (stale detection, rebuild, restart), `false_negatives_are_detected`, CLI `indexes_list_verify_rebuild` | ✅ |
 | §3.4, §13.6 | Query time/memory/rows/concurrency limits | E-010 | `budgets_and_cancellation_are_enforced` | ◐ (no concurrency limit / per-tenant quotas) |
 | §3.4, §7.4 | Bounded queues, backpressure, disk reserve, per-tenant ingest + storage quotas | G-005 | backpressure, disk-reserve and quota tests | ✅ |
 | §25.2 | Structured logs with correlation id, no secrets | A-003 | `request_ids_are_propagated_or_generated_safely` | ◐ (no OTel traces) |
@@ -44,7 +44,7 @@ Maps spec requirements → tasks → acceptance tests. Status: ✅ tested ·
 | §10.6 | Detect/quarantine corruption; partial-result marker | D-008 | `corrupt_segment_detected_*`, quarantine test | ◐ (no partial results; queries fail) |
 | §11 | Encodings + LZ4 chunk compression with uncompressed fallback | RFC-0001 | segment v2 tests, compression A/B report | ◐ (no zstd / policy tiers) |
 | §12.5 | Bloom filters, EXPLAIN shows index use | F-003 | bloom tests + A/B report | ✅ |
-| §12.3–12.4 | Exact-match postings, inverted indexes | F-004, F-005 | — | ☐ |
+| §12.3–12.4 | Exact-match postings, inverted indexes | F-004, F-005 | trigram filters (`ngram_filters_prune_like_scans_without_changing_results`, ADR-0005); postings deferred | ◐ |
 | §13.4 | Predicate/projection/partition pruning; optimizer equivalence | F-002 | `optimized_equals_unoptimized_equals_reference` | ✅ |
 | §14 | Search modes, tokenization, regex safety | — | LIKE/ILIKE only | ◐ |
 | §15 | Catalog | ADR-0007 | manifest | ◐ |
@@ -58,7 +58,7 @@ Maps spec requirements → tasks → acceptance tests. Status: ✅ tested ·
 | §19 | Backup/verify/restore + drills | H-006, H-007 | `tests/backup.rs`, CLI drill, runbook | ◐ (no incremental, no old-version backup yet; encrypted backups ✅) |
 | §20 | Distributed | I-* | — | ⏸ |
 | §21 | HTTP API incl. query status/cancel, OpenAPI | G-001 | `docs/api/openapi.json`, http tests | ✅ |
-| §22 | CLI incl. `doctor` (§22.3) | H-009 | `apps/stratadb-cli/tests/{cli,doctor}.rs` | ◐ (no `shell`, no fd/TLS-expiry checks in doctor) |
+| §22 | CLI incl. `doctor` (§22.3), `shell`, `indexes`, `keys`, export/import | H-009 | `apps/stratadb-cli/tests/{cli,doctor,export_import,encryption}.rs` | ◐ (no fd/TLS-expiry checks in doctor) |
 | §26.2 | Property tests (codec, segment, WAL, query) | — | proptest in common/schema/wal/segment/query | ✅ |
 | §26.3 | Fuzzing (WAL, segment, footer, manifest, backup, query+eval, JSON, OTLP, config, tokens, audit) | H-011 | `crates/stratadb-fuzz`, `fuzz/` | ✅ |
 | §26.5 | Crash points incl. compaction/retention/backup | C-008 | `docs/testing/crash-matrix.md` | ◐ |

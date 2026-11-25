@@ -47,6 +47,10 @@ lz4_flex = { version = "0.14", default-features = false, features = ["std", "saf
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 # Already in the tree via rustls (TLS); reused for encryption at rest (ADR-0024).
 ring = "0.17"
+# HashTable for flat aggregation groups (already in the lockfile; no deps).
+hashbrown = { version = "0.17", default-features = false }
+# Randomly seeded fast hasher for aggregation groups (already in the lockfile via parquet).
+ahash = { version = "0.8", default-features = false, features = ["std", "runtime-rng"] }
 zeroize = "1"
 
 [workspace.lints.rust]

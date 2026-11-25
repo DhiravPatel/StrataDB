@@ -32,9 +32,9 @@ hash-chained audit log (admin actions fail closed); Bloom filters ext tag 2
 (string values only) with A/B evidence; TOML config with flag > env > file precedence.
 
 ## Exact next tasks (priority order)
-1. Query execution follow-ups: parallel group merge (query 08 is now
-   merge-bound); intra-segment parallelism; row-selective decoding of whole
-   maps (`SELECT *` with selective filters).
+1. Query execution follow-ups: decode high-cardinality string group keys
+   without owned strings (now the dominant cost of query 08); intra-segment
+   parallelism; row-selective decoding of whole maps.
 2. Run the Docker image build + an OpenTelemetry Collector binary (needs Docker).
 3. Longer seeded libFuzzer campaigns (≥ 30 min/target) for all 14 targets.
 
@@ -50,7 +50,9 @@ violations) and **WAL format v2** (`synced_through`; fixes fail-closed after
 reordered un-synced tails); **trigram filters for LIKE** (F-005; postings F-004
 deferred, ADR-0005); **export/import/shell** (`strata export` with
 checkpoint/resume, idempotent `ingest --import-id`, `strata shell`); **allocation-free grouping** (1.3–3.0× on group-by
-queries); **encryption at rest** (ADR-0024); **parallel segment scans** (2.2–2.6×); **Parquet import/export** (ADR-0025). Gate: see IMPLEMENTATION_STATUS.md.
+queries); **encryption at rest** (ADR-0024); **parallel segment scans** (2.2–2.6×); flat
+aggregation groups (2.2× less CPU); latency histograms and query metrics;
+index list/verify/rebuild; **Parquet import/export** (ADR-0025). Gate: see IMPLEMENTATION_STATUS.md.
 
 ## Owner actions required
 1. Confirm license (ADR-0016) and add LICENSE.
