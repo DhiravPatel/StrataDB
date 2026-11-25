@@ -2,7 +2,7 @@
 
 | Artifact | Current version | Reader accepts | Notes |
 |----------|-----------------|----------------|-------|
-| WAL segment | 1 | 1 | `Unsupported` for others |
+| WAL segment | 2 | 1, 2 | v2 adds `synced_through` per frame (wal-v2.md); v1 segments are replayed, never appended to; fixtures `tests/fixtures/storage-v1` (v1), `tests/fixtures/wal-v2`; others → `FormatVersion` |
 | Event encoding | 1 | 1 | |
 | Segment | 3 (provisional) | 1, 2, 3 | v2: LZ4 chunks (RFC-0001); v3: shredded attributes (RFC-0002); compaction upgrades older segments |
 | Manifest | 1 | 1 | unknown JSON fields rejected |

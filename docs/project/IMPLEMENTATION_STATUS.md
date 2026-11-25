@@ -6,7 +6,7 @@ reserved for features that additionally passed an independent review / release
 gate; **nothing is VERIFIED yet.**
 
 Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
-`-D warnings` ✅, `cargo test --workspace` ✅ (222 tests, 0 failures).
+`-D warnings` ✅, `cargo test --workspace` ✅ (230 tests, 0 failures).
 
 | ID | Feature | State | Evidence | Known limitations |
 |----|---------|-------|----------|-------------------|
@@ -21,8 +21,8 @@ Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
 | A-006 | Testkit / fixtures | TESTED | `stratadb-testkit` (7 seeded profiles, determinism + validity tests); golden fixture | — |
 | B-001..B-005 | Event schema, typed values, timestamps, schema version, validation | TESTED | schema crate (16 tests incl. proptest) | explicit schema registration not implemented |
 | B-006 | Serialization compatibility tests | TESTED | golden v1 data dir `tests/fixtures/storage-v1` + `reads_storage_v1_fixture` | single version so far |
-| C-001..C-007 | WAL format, append, checksum, rotation, sync policies, recovery, reclamation | TESTED | wal crate (21 tests: bit flips, torn tail at every offset, gaps, concurrency, poison) | power-loss not simulated |
-| C-008 | Crash injection tests | TESTED | `storage/tests/crash.rs` (15 points, real process exit) + `power_loss.rs` (WAL-tail-loss model, 3 modes) | no fault-injecting FS (reordering, lost renames) |
+| C-001..C-007 | WAL format v2 (reads v1), append, checksum, rotation, sync policies, recovery, reclamation | TESTED | wal crate (24 tests: bit flips v1+v2, torn tail at every offset, gaps, concurrency, poison, reordered un-synced tail, v1 read-not-append, golden `tests/fixtures/wal-v2`) | last acknowledged record damaged with nothing after it is indistinguishable from a torn tail |
+| C-008 | Crash injection tests | TESTED | `storage/tests/crash.rs` (process exit at every failpoint) + `power_loss_sim.rs` (simfs recorder: 512 crash points, 2 428 recovered power-loss states incl. lost/torn/reordered sectors and lost un-synced renames; sensitivity-checked by removing 3 fsyncs) + `power_loss.rs` | lying hardware not modelled; states sampled, not exhaustive |
 | D-001..D-005 | Segment format v3 (LZ4 chunks + shredded attributes; reads v1–v3), writer, reader, footer, checksums | TESTED | segment crate (11 tests: every-byte flip v1+v2, truncation, proptest, compression fallback), `v1_fixture_upgrades_through_compaction` | provisional (ADR-0001, RFC-0001) |
 | D-006 | Manifest | TESTED | manifest tests (flip/truncation/unknown fields/invariants) | O(segments) rewrite per commit |
 | D-007 | Flush transaction | TESTED | engine + crash tests | single flush thread |

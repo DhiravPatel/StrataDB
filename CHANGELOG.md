@@ -2,6 +2,15 @@
 
 ## Unreleased (0.0.1)
 ### Added
+- Power-loss simulation (`stratadb_common::simfs`, feature `simfs`): crash
+  images around every fsync, materialized as lost/torn/reordered sector and
+  lost-rename states; `stratadb-storage/tests/power_loss_sim.rs` recovers
+  2 428 states across `sync`/`group_commit`/`async` with zero violations.
+### Changed
+- **WAL format v2** (reads v1): frames carry `synced_through`, letting recovery
+  truncate an un-synced tail that power loss persisted out of order instead of
+  refusing to open (found by the simulation). v1 segments are replayed and never
+  appended to. All data-file fsyncs go through `fsutil::sync_file`.
 - Vectorized `WHERE` evaluation: typed column kernels over selection vectors,
   `LIKE` compiled once, severity predicates via lookup table; scalar fallback
   for other shapes; `QueryOptions::enable_vectorized` and `strata-bench

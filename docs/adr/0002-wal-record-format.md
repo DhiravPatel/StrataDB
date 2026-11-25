@@ -39,5 +39,17 @@ offset, mid-log corruption fail-closed, gap/overlap detection, concurrent
 Sync/GroupCommit, poison-on-fsync-failure; `stratadb-storage/tests/crash.rs`
 process-crash matrix.
 
+## Update 2026-11-25: format v2 (`synced_through`)
+Power-loss simulation showed that out-of-order persistence of un-synced
+appends (an earlier frame lost, a later one surviving) made v1 recovery fail
+closed after an ordinary power cut (`async`, or `group_commit` with several
+frames in flight). v2 adds `synced_through` (8 bytes) to the frame header so
+recovery can prove such a tail was never fsynced and truncate it, while still
+failing closed when a later frame proves the damaged record had been synced.
+Alternatives rejected: unconditional truncate-at-first-error (silently loses
+acknowledged records after media damage); separate sync-marker records (extra
+writes, consume sequence numbers); a watermark file (an extra fsync per
+group). Spec: docs/storage-format/wal-v2.md.
+
 ## Revisit conditions
 Encryption at rest (ADR pending, §18.6) will require a v2 frame or segment-level envelope.

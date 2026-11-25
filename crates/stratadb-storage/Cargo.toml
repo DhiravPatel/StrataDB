@@ -22,7 +22,7 @@ sha2.workspace = true
 fs4.workspace = true
 
 [dev-dependencies]
-stratadb-common = { workspace = true, features = ["failpoints"] }
+stratadb-common = { workspace = true, features = ["failpoints", "simfs"] }
 tempfile.workspace = true
 proptest.workspace = true
 

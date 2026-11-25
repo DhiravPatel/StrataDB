@@ -9,6 +9,8 @@ publish.workspace = true
 [features]
 # Enables named crash/error injection points. Never enable in release builds.
 failpoints = []
+# Power-loss simulation recorder (simfs.rs). Test builds only.
+simfs = []
 
 [dependencies]
 thiserror.workspace = true

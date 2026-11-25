@@ -1,5 +1,8 @@
 # WAL format v1
 
+> Read-only since 2026-11-25: new segments are written as [v2](wal-v2.md),
+> which adds `synced_through` to each frame and refines recovery rule 5.
+
 ## Segment header (32 bytes)
 | Offset | Size | Field | Notes |
 |--------|------|-------|-------|

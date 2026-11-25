@@ -32,16 +32,14 @@ hash-chained audit log (admin actions fail closed); Bloom filters ext tag 2
 (string values only) with A/B evidence; TOML config with flag > env > file precedence.
 
 ## Exact next tasks (priority order)
-1. Fault-injecting filesystem shim for full power-loss simulation (reordering,
-   lost un-fsynced renames).
-2. Token inverted index for `body` (F-005) and exact-match postings (F-004).
-3. CSV / Parquet export (§30.3), `strata shell` REPL (§22.1) — export can
+1. Token inverted index for `body` (F-005) and exact-match postings (F-004).
+2. CSV / Parquet export (§30.3), `strata shell` REPL (§22.1) — export can
    stream via `execute_page` cursors.
-4. Encryption at rest (§18.6) behind a pluggable key provider.
-5. Query execution follow-ups: per-row projection/grouping without `Value`
+3. Encryption at rest (§18.6) behind a pluggable key provider.
+4. Query execution follow-ups: per-row projection/grouping without `Value`
    clones (query 08/09/10 are now grouping-bound), parallel segment scans.
-6. Run the Docker image build + an OpenTelemetry Collector binary (needs Docker).
-7. Longer seeded libFuzzer campaigns (≥ 30 min/target); add a `cursor` fuzz
+5. Run the Docker image build + an OpenTelemetry Collector binary (needs Docker).
+6. Longer seeded libFuzzer campaigns (≥ 30 min/target); add a `cursor` fuzz
    target (decoder is proptested but not yet in `stratadb-fuzz::TARGETS`).
 
 Done since the last handoff: segment v3 attribute shredding (2.6–4.5× on attribute
@@ -50,7 +48,10 @@ per-tenant rate/storage quotas, JSON structured logs with request ids,
 `strata upgrade` with verified backup gate; **stable keyset pagination**
 (E-011, ADR-0023: `execute_page`, HTTP `page_size`/`cursor`/`next_cursor`,
 SDK `query_pages`/`QueryAllPages`); **vectorized `WHERE` evaluation** (E-012,
-1.2–3.5× on filtered suite queries, report `2026-11-25-vectorized-ab.md`). Gate: 222 tests passing.
+1.2–3.5× on filtered suite queries, report `2026-11-25-vectorized-ab.md`);
+**power-loss simulation** (simfs recorder, 2 428 recovered states, 0
+violations) and **WAL format v2** (`synced_through`; fixes fail-closed after
+reordered un-synced tails). Gate: see IMPLEMENTATION_STATUS.md.
 
 ## Owner actions required
 1. Confirm license (ADR-0016) and add LICENSE.

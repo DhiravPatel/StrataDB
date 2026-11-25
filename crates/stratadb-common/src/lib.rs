@@ -10,6 +10,8 @@ pub mod error;
 pub mod failpoint;
 pub mod fsutil;
 pub mod ids;
+#[cfg(feature = "simfs")]
+pub mod simfs;
 pub mod time;
 
 pub use error::{Error, ErrorKind, IoResultExt, Result};

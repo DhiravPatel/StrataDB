@@ -34,7 +34,7 @@ use stratadb_common::checksum::crc32c;
 use stratadb_common::{failpoint, fsutil, time, Error, IoResultExt, Result};
 
 pub use format::RecordType;
-use format::{FRAME_HEADER_LEN, HEADER_LEN};
+use format::{InvalidTail, FORMAT_VERSION, FRAME_HEADER_LEN, HEADER_LEN};
 
 /// When an append is acknowledged relative to fsync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,9 +89,12 @@ pub struct Truncation {
     pub offset: u64,
     pub bytes_discarded: u64,
     pub reason: String,
-    /// True only under `ForceTruncate`: valid frames existed after the damage
-    /// and were discarded.
+    /// Valid frames existed after the damage and were discarded: either
+    /// provably un-synced (power loss reordered the writes; see
+    /// `format::InvalidTail::UnsyncedReordered`) or under `ForceTruncate`.
     pub discarded_valid_frames: bool,
+    /// How the damaged tail was classified.
+    pub kind: format::InvalidTail,
 }
 
 /// Summary of a recovery scan.
@@ -154,10 +157,11 @@ fn create_segment(dir: &Path, base_seq: u64) -> Result<(File, PathBuf)> {
     let header = format::encode_header(&format::SegmentHeader {
         base_seq,
         created_ms: time::now_unix_millis(),
+        version: FORMAT_VERSION,
     });
     f.write_all(&header)
         .ctx(|| format!("writing WAL header {}", tmp.display()))?;
-    f.sync_all().ctx(|| format!("fsyncing {}", tmp.display()))?;
+    fsutil::sync_file(&f, &tmp, false).ctx(|| format!("fsyncing {}", tmp.display()))?;
     drop(f);
     fs::rename(&tmp, &path).ctx(|| format!("renaming {}", tmp.display()))?;
     fsutil::fsync_dir(dir)?;
@@ -221,6 +225,7 @@ impl Wal {
         // * sequences missing before a segment's base are allowed only if they are
         //   all <= replay_after (already durable in committed segments).
         let mut last_seq: u64 = replay_after;
+        let mut last_version = FORMAT_VERSION;
         // Next sequence after the previous segment's final valid frame.
         let mut prev_next: Option<u64> = None;
         let n = segs.len();
@@ -260,10 +265,11 @@ impl Wal {
                 ));
             }
             report.segments_scanned += 1;
+            last_version = header.version;
             let mut pos = HEADER_LEN;
             let mut next = *base;
             while pos < data.len() {
-                match format::parse_frame(&data[pos..]) {
+                match format::parse_frame(&data[pos..], header.version) {
                     Ok(frame) => {
                         if frame.seq != next {
                             return Err(Error::corruption(
@@ -297,13 +303,17 @@ impl Wal {
                                 format!("{reason} at offset {pos} in a non-final WAL segment"),
                             ));
                         }
-                        let later = format::find_later_valid_frame(&data[pos + 1..], next);
-                        if later.is_some() && opts.recovery != RecoveryPolicy::ForceTruncate {
+                        let kind =
+                            format::classify_invalid_tail(&data[pos + 1..], next, header.version);
+                        if kind == InvalidTail::PossiblyDurableDamage
+                            && opts.recovery != RecoveryPolicy::ForceTruncate
+                        {
                             return Err(Error::corruption(
                                 &loc,
                                 format!(
-                                    "{reason} at offset {pos} is followed by valid frames; \
-                                     refusing to truncate (possible mid-log corruption). \
+                                    "{reason} at offset {pos} (expected seq {next}) is followed by \
+                                     valid frames written after it was synced; refusing to \
+                                     truncate (possible damage to acknowledged records). \
                                      Inspect the WAL; recovery policy ForceTruncate discards them."
                                 ),
                             ));
@@ -313,7 +323,7 @@ impl Wal {
                             .open(path)
                             .ctx(|| format!("opening {loc} for truncation"))?;
                         f.set_len(pos as u64).ctx(|| format!("truncating {loc}"))?;
-                        f.sync_all().ctx(|| format!("fsyncing {loc}"))?;
+                        fsutil::sync_file(&f, path, false).ctx(|| format!("fsyncing {loc}"))?;
                         tracing::warn!(segment = %loc, offset = pos, bytes = data.len() - pos,
                             %reason, "truncated invalid WAL tail");
                         report.truncation = Some(Truncation {
@@ -321,7 +331,8 @@ impl Wal {
                             offset: pos as u64,
                             bytes_discarded: (data.len() - pos) as u64,
                             reason: reason.to_string(),
-                            discarded_valid_frames: later.is_some(),
+                            discarded_valid_frames: kind != InvalidTail::Torn,
+                            kind,
                         });
                         break;
                     }
@@ -333,11 +344,13 @@ impl Wal {
 
         let next_seq = last_seq + 1;
         let (file, path, base_seq, len, closed) = match segs.last() {
-            // Reuse the last segment only if appending `next_seq` keeps it contiguous.
-            Some((base, path)) if prev_next == Some(next_seq) => {
+            // Reuse the last segment only if appending `next_seq` keeps it
+            // contiguous and it has the current format (frames of one segment
+            // share one layout; older segments are never appended to).
+            Some((base, path)) if prev_next == Some(next_seq) && last_version == FORMAT_VERSION => {
                 let f = open_append(path)?;
                 // Make recovered (possibly unsynced) bytes durable before new appends.
-                f.sync_all()
+                fsutil::sync_file(&f, path, false)
                     .ctx(|| format!("fsyncing {}", path.display()))?;
                 let len = f
                     .metadata()
@@ -426,10 +439,12 @@ impl Wal {
             self.rotate_locked(&mut g)?;
         }
         let seq = g.next_seq;
+        // Everything <= durable_seq was fsynced before this frame is written.
         format::encode_frame_into(
             &mut frame,
             record_type,
             seq,
+            g.durable_seq,
             payload.len() as u32,
             payload_crc,
         );
@@ -487,9 +502,10 @@ impl Wal {
             }
             let target = g.written_seq;
             let file = Arc::clone(&g.file);
+            let path = g.path.clone();
             let res = MutexGuard::unlocked(&mut g, || -> Result<()> {
                 failpoint::hit("wal::before_sync")?;
-                file.sync_data().ctx(|| "fsyncing WAL segment".to_owned())?;
+                fsutil::sync_file(&file, &path, true).ctx(|| "fsyncing WAL segment".to_owned())?;
                 failpoint::hit("wal::after_sync")?;
                 Ok(())
             });
@@ -504,7 +520,7 @@ impl Wal {
 
     fn rotate_locked(&self, g: &mut MutexGuard<'_, Inner>) -> Result<()> {
         // The old segment must be fully durable before it becomes immutable.
-        if let Err(e) = g.file.sync_data() {
+        if let Err(e) = fsutil::sync_file(&g.file, &g.path, true) {
             let why = format!("sync before rotation failed: {e}");
             Self::poison(g, why.clone());
             return Err(Error::indeterminate(why));

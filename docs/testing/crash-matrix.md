@@ -32,7 +32,8 @@ idempotent; database writable and verifiable afterwards.
 ¹ The engine acknowledges *after* memtable insert, so this point is "after
 durable commit, before ack + visibility".
 ² With process crashes the rename is already visible; the "old manifest"
-branch requires power-loss simulation (not yet available).
+branch is covered by the power-loss simulation below (states captured before
+the directory fsync that follows the manifest rename).
 
 ## Power-loss model (partial) — `crates/stratadb-storage/tests/power_loss.rs`
 Model: WAL frames with `seq > durable_seq` are discarded from an image of the
@@ -45,8 +46,45 @@ before being referenced. Checks per mode:
 | `group_commit` | every acknowledged batch survives | ✅ tested |
 | `async` | flushed / synced batches survive; WAL may end below the manifest boundary and recovery must not reuse sequence numbers | ✅ tested (asserts the WAL-behind-manifest path is exercised) |
 
-Not modelled: intra-file write reordering, lost un-fsynced renames/dir
-entries, lying hardware → requires a fault-injecting filesystem (docs/project/TASKS.md T-P1-PL).
+The simulation below supersedes this model; it is kept as a fast regression test.
+
+## Power-loss simulation — `crates/stratadb-storage/tests/power_loss_sim.rs`
+Recorder: `stratadb_common::simfs` (feature `simfs`, test builds only). Every
+data-file fsync (`fsutil::sync_file`) and directory fsync (`fsutil::fsync_dir`)
+records the durable state; a crash image is captured immediately before and
+after each of them. Every image is recovered as: only-synced state; full
+state (process crash); and random states in which each un-synced 512-byte
+sector is new or old/zero (lost, torn or reordered writes), file sizes revert,
+and un-synced creates/renames/unlinks are lost (atomically per connected
+component, so renames — including replace-renames — stay atomic). Model and
+assumptions: docs/storage-format/durability.md.
+
+Workload: 30 idempotent batches × 3 events, 2 KiB WAL segments (rotation every
+few batches), flush every 5 batches, compaction every 12. Invariants per
+state: the engine opens without operator action; acknowledged (`sync`,
+`group_commit`) or flushed (`async`) batches present exactly once; batches
+all-or-nothing; nothing not yet written appears; `async` survivors form a
+prefix; sampled states (1 in 7) also retry every acknowledged batch with its
+key (must be a duplicate), write, flush and reopen.
+
+| Mode | Crash points | Recovered states | Result |
+|------|--------------|------------------|--------|
+| `sync` | 190 | 1 140 | ✅ 0 violations |
+| `group_commit` | 190 | 760 | ✅ 0 violations |
+| `async` | 132 | 528 | ✅ 0 violations (28 states need the WAL v2 reordered-tail rule; asserted > 0) |
+
+Found and fixed by this simulation: with WAL v1, an un-synced tail persisted
+out of order (earlier frame lost, later frame survived) made recovery refuse
+to open — 28 of 528 `async` states (docs/storage-format/wal-v2.md).
+
+Sensitivity (each mutation run once, then reverted): removing the directory
+fsync after the manifest rename → 724 violating states; removing the segment
+file fsync before publishing → 1 432; acknowledging group commits without the
+WAL fsync → 579 (`sync` + `group_commit`).
+
+Not modelled: lying hardware (flushes ignored), bit rot, sub-sector tearing,
+cross-file write ordering beyond fsync boundaries is modelled but not
+exhaustively enumerated (random sampling, 2–4 variants per crash point).
 
 ## Format compatibility — `crates/stratadb-storage/tests/compat.rs`
 Golden v1 data directory in `tests/fixtures/storage-v1/` (2 tenants, 2 segments,

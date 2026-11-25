@@ -26,9 +26,12 @@
 - Format upgrades (`strata upgrade`) cannot be rolled back except by restoring a backup.
 
 ## Durability / testing gaps
-- Crash tests simulate **process** crashes. Power loss is covered only by a
-  partial model (unsynced WAL frames dropped); write reordering within files
-  and lost un-fsynced directory operations are not simulated.
+- Power loss is tested by **simulation** (simfs recorder: lost/torn/reordered
+  un-synced sectors, lost un-synced directory operations), sampling 2–6 states
+  per crash point rather than enumerating all of them. Devices that ignore
+  flush requests ("lying hardware") are out of scope. Damage to the last
+  acknowledged WAL record with no later frame is indistinguishable from a torn
+  tail (truncated).
 - Fsync failures poison the WAL by design; recovery requires restart.
 
 ## Performance

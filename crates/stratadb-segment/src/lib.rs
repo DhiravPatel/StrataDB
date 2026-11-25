@@ -709,7 +709,7 @@ pub fn write_segment_opts(
     }
     f.write_all(&bytes)
         .ctx(|| format!("writing segment {}", tmp.display()))?;
-    f.sync_all().ctx(|| format!("fsyncing {}", tmp.display()))?;
+    fsutil::sync_file(&f, &tmp, false).ctx(|| format!("fsyncing {}", tmp.display()))?;
     drop(f);
     std::fs::rename(&tmp, path).ctx(|| format!("renaming {}", tmp.display()))?;
     let parent = path

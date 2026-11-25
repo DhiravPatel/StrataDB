@@ -86,20 +86,22 @@ fn check_wal(dir: &Path, flushed: u64, r: &mut Report) {
             continue;
         };
         bytes += data.len() as u64;
-        match format::decode_header(&data, &p.display().to_string()) {
+        let version = match format::decode_header(&data, &p.display().to_string()) {
             Err(e) => {
                 problems.push(format!("FAIL {e}"));
                 continue;
             }
-            Ok(h) if h.base_seq != *base => {
-                problems.push(format!("FAIL {}: header/file name mismatch", p.display()))
+            Ok(h) => {
+                if h.base_seq != *base {
+                    problems.push(format!("FAIL {}: header/file name mismatch", p.display()));
+                }
+                h.version
             }
-            Ok(_) => {}
-        }
+        };
         let mut pos = format::HEADER_LEN;
         let mut next = *base;
         while pos < data.len() {
-            match format::parse_frame(&data[pos..]) {
+            match format::parse_frame(&data[pos..], version) {
                 Ok(f) if f.seq == next => {
                     frames += 1;
                     last_seq = f.seq;
@@ -115,12 +117,18 @@ fn check_wal(dir: &Path, flushed: u64, r: &mut Report) {
                     break;
                 }
                 Err(reason) => {
-                    let later = format::find_later_valid_frame(&data[pos + 1..], next).is_some();
+                    // Same classification as WAL recovery.
+                    let kind = format::classify_invalid_tail(&data[pos + 1..], next, version);
                     let last = i + 1 == segs.len();
-                    if last && !later {
+                    if last && kind != format::InvalidTail::PossiblyDurableDamage {
                         problems.push(format!(
-                            "WARN {}: torn tail at offset {pos} ({reason}); next open will truncate {} unacknowledged bytes",
+                            "WARN {}: {} at offset {pos} ({reason}); next open will truncate {} un-synced bytes",
                             p.display(),
+                            if kind == format::InvalidTail::Torn {
+                                "torn tail"
+                            } else {
+                                "un-synced tail persisted out of order (power loss)"
+                            },
                             data.len() - pos
                         ));
                     } else {

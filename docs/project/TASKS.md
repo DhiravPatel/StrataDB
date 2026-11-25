@@ -7,9 +7,8 @@ Legend: ✅ done (tested) · ▶ next · ☐ pending. IDs follow spec §35.
 ✅ E-001..E-012 (E-011 stable pagination, ADR-0023; E-012 vectorized filters) · ✅ F-001 F-002 · ✅ H-009 (local CLI) · ✅ engine backpressure
 
 ## Next (in order)
-1. ◐ **T-P1-PL** Power-loss: WAL-tail-loss model done (`power_loss.rs`).
-   Remaining: fault-injecting filesystem shim (write reordering within a
-   file, lost un-fsynced renames/dir entries).
+1. ✅ **T-P1-PL** Power-loss simulation (`simfs` recorder + `power_loss_sim.rs`);
+   found and fixed WAL fail-closed on reordered un-synced tails (WAL v2).
 2. ✅ **B-006** Golden v1 fixtures (`tests/fixtures/storage-v1`).
 3. ✅ **A-006** `stratadb-testkit`: deterministic synthetic dataset generator
    (spec §27.3 profiles; seeded) shared by tests and benchmarks.

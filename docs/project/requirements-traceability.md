@@ -5,7 +5,7 @@ Maps spec requirements → tasks → acceptance tests. Status: ✅ tested ·
 
 | Spec | Requirement | Task | Acceptance test / evidence | Status |
 |------|-------------|------|----------------------------|--------|
-| §0.3.3, §8.3 | No acknowledged write lost under configured mode | C-005, C-008 | `stratadb-storage/tests/crash.rs` (15 cases), WAL `concurrent_*` | ◐ process crash ✅, power loss ☐ |
+| §0.3.3, §8.3 | No acknowledged write lost under configured mode | C-005, C-008 | `stratadb-storage/tests/crash.rs`, `power_loss_sim.rs` (2 428 simulated power-loss states), WAL `concurrent_*` | ✅ process crash and simulated power loss (device honours flushes) |
 | §0.3.4, §18.4 | No cross-tenant query results | H-002 | `tenant_isolation_in_storage`, `tenant_isolation_in_queries` | ◐ storage/query ✅, API ☐ |
 | §0.3.6 | Persistent formats versioned | B-004, C-001, D-001 | version-rejection tests in wal/segment/schema/manifest | ✅ |
 | §0.3.7 | Inspectable/verifiable storage | D-005 | `strata segments verify`, `SegmentReader::verify` | ✅ |

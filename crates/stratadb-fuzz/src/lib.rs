@@ -21,14 +21,17 @@ fn tenant() -> TenantId {
 
 pub fn fuzz_wal_frames(data: &[u8]) {
     let _ = stratadb_wal::format::decode_header(data, "fuzz");
-    let mut pos = 0;
-    while pos < data.len() {
-        match stratadb_wal::format::parse_frame(&data[pos..]) {
-            Ok(f) => pos += f.encoded_len(),
-            Err(_) => break,
+    for version in [1, 2] {
+        let mut pos = 0;
+        while pos < data.len() {
+            match stratadb_wal::format::parse_frame(&data[pos..], version) {
+                Ok(f) => pos += f.encoded_len(),
+                Err(_) => break,
+            }
         }
+        let _ = stratadb_wal::format::find_later_valid_frame(data, 1, version);
+        let _ = stratadb_wal::format::classify_invalid_tail(data, 1, version);
     }
-    let _ = stratadb_wal::format::find_later_valid_frame(data, 1);
 }
 
 /// Full WAL recovery over an arbitrary final segment file.

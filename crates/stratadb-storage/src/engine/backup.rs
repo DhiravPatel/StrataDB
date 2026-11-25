@@ -99,8 +99,7 @@ fn copy_hashed(from: &Path, to: &Path) -> Result<(u64, String)> {
             .ctx(|| format!("writing {}", to.display()))?;
         total += n as u64;
     }
-    dst.sync_all()
-        .ctx(|| format!("fsyncing {}", to.display()))?;
+    fsutil::sync_file(&dst, to, false).ctx(|| format!("fsyncing {}", to.display()))?;
     Ok((total, hex(&h.finalize())))
 }
 

@@ -132,7 +132,9 @@ fn torn_tail_at_every_offset_recovers_exact_prefix() {
     let mut bounds = vec![HEADER_LEN];
     let mut pos = HEADER_LEN;
     while pos < full.len() {
-        pos += format::parse_frame(&full[pos..]).unwrap().encoded_len();
+        pos += format::parse_frame(&full[pos..], format::FORMAT_VERSION)
+            .unwrap()
+            .encoded_len();
         bounds.push(pos);
     }
     for cut in HEADER_LEN..full.len() {
@@ -350,4 +352,140 @@ proptest! {
             prop_assert_eq!(p, &payloads[i]);
         }
     }
+}
+
+/// Power loss with out-of-order persistence (WAL v2): an un-synced frame is
+/// lost while a later un-synced frame survives. Recovery must truncate (no
+/// acknowledged record can be affected), not fail closed.
+#[test]
+fn reordered_unsynced_tail_is_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wal, _, _) = collect(dir.path(), opts(Durability::Sync), 0).unwrap();
+    for i in 1..=3 {
+        wal.append(RecordType::EventBatch, &payload(i)).unwrap(); // synced
+    }
+    drop(wal);
+    // Simulate two more async appends that were never fsynced.
+    let mut o = opts(Durability::Async);
+    o.segment_max_bytes = 1 << 20;
+    let (wal, _, _) = collect(dir.path(), o.clone(), 0).unwrap();
+    wal.append(RecordType::EventBatch, &payload(4)).unwrap();
+    wal.append(RecordType::EventBatch, &payload(5)).unwrap();
+    std::mem::forget(wal); // no close-time sync
+    let seg = last_segment(dir.path());
+    let mut data = fs::read(&seg).unwrap();
+    // Locate frame 4 and zero it (lost sector); frame 5 survives.
+    let mut pos = HEADER_LEN;
+    for _ in 1..=3 {
+        pos += format::parse_frame(&data[pos..], 2).unwrap().encoded_len();
+    }
+    let f4 = format::parse_frame(&data[pos..], 2).unwrap();
+    assert_eq!((f4.seq, f4.synced_through), (4, Some(3)));
+    let len4 = f4.encoded_len();
+    data[pos..pos + len4].fill(0);
+    fs::write(&seg, &data).unwrap();
+
+    let (_, recs, rep) = collect(dir.path(), opts(Durability::Sync), 0).unwrap();
+    assert_eq!(recs.iter().map(|r| r.0).collect::<Vec<_>>(), vec![1, 2, 3]);
+    let t = rep.truncation.unwrap();
+    assert_eq!(t.kind, format::InvalidTail::UnsyncedReordered);
+    assert!(t.discarded_valid_frames);
+}
+
+/// A v1 segment written by an older release is replayed, never appended to:
+/// new records go to a fresh v2 segment; damage followed by valid frames in a
+/// v1 segment still fails closed (v1 cannot prove the frames were un-synced).
+#[test]
+fn v1_segments_are_read_and_not_appended_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let v1 = |frames: &[(u64, &[u8])]| {
+        let mut b = format::encode_header(&format::SegmentHeader {
+            base_seq: 1,
+            created_ms: 0,
+            version: 1,
+        })
+        .to_vec();
+        for (seq, p) in frames {
+            b.extend(format::encode_frame_v1(RecordType::EventBatch, *seq, p));
+        }
+        b
+    };
+    let seg = dir.path().join(format::segment_file_name(1));
+    fs::write(&seg, v1(&[(1, b"a"), (2, b"b")])).unwrap();
+    let (wal, recs, _) = collect(dir.path(), opts(Durability::Sync), 0).unwrap();
+    assert_eq!(recs, vec![(1, b"a".to_vec()), (2, b"b".to_vec())]);
+    assert_eq!(wal.append(RecordType::EventBatch, b"c").unwrap(), 3);
+    drop(wal);
+    let files = segment_files(dir.path());
+    assert_eq!(files.len(), 2, "{files:?}");
+    let new = fs::read(&files[1]).unwrap();
+    assert_eq!(format::decode_header(&new, "t").unwrap().version, 2);
+    let (_, recs, _) = collect(dir.path(), opts(Durability::Sync), 0).unwrap();
+    assert_eq!(recs.len(), 3);
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut data = v1(&[(1, b"a"), (2, b"b"), (3, b"c")]);
+    data[HEADER_LEN + 17] ^= 0xff; // damage record 1's payload
+    fs::write(dir.path().join(format::segment_file_name(1)), &data).unwrap();
+    let err = collect(dir.path(), opts(Durability::Sync), 0).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Corruption);
+}
+
+fn fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/wal-v2")
+}
+
+fn fixture_payload(i: u64) -> Vec<u8> {
+    format!("wal-v2 fixture record {i}").into_bytes()
+}
+
+/// Golden WAL v2 directory: one segment, records 1..=4 with `synced_through`
+/// 0, 1, 2, 3 (written under `sync`). Never regenerate to fix a failure.
+#[test]
+fn reads_wal_v2_fixture() {
+    let src = fixture_dir();
+    let dir = tempfile::tempdir().unwrap();
+    for f in fs::read_dir(&src).unwrap() {
+        let f = f.unwrap();
+        fs::copy(f.path(), dir.path().join(f.file_name())).unwrap();
+    }
+    let seg = dir.path().join(format::segment_file_name(1));
+    let data = fs::read(&seg).unwrap();
+    let h = format::decode_header(&data, "fixture").unwrap();
+    assert_eq!((h.base_seq, h.version), (1, 2));
+    let mut pos = HEADER_LEN;
+    for i in 1..=4u64 {
+        let f = format::parse_frame(&data[pos..], 2).unwrap();
+        assert_eq!((f.seq, f.synced_through), (i, Some(i - 1)));
+        assert_eq!(f.payload, fixture_payload(i).as_slice());
+        pos += f.encoded_len();
+    }
+    assert_eq!(pos, data.len());
+    let (_, recs, rep) = collect(dir.path(), opts(Durability::Sync), 0).unwrap();
+    assert_eq!(
+        recs,
+        (1..=4).map(|i| (i, fixture_payload(i))).collect::<Vec<_>>()
+    );
+    assert!(rep.truncation.is_none());
+}
+
+/// One-off generator for `tests/fixtures/wal-v2` (refuses to overwrite).
+#[test]
+#[ignore = "writes tests/fixtures/wal-v2; run once when introducing the format"]
+fn generate_wal_v2_fixture() {
+    let out = fixture_dir();
+    assert!(!out.exists(), "fixture exists; never regenerate it");
+    let tmp = tempfile::tempdir().unwrap();
+    let (wal, _, _) = collect(tmp.path(), opts(Durability::Sync), 0).unwrap();
+    for i in 1..=4 {
+        wal.append(RecordType::EventBatch, &fixture_payload(i))
+            .unwrap();
+    }
+    drop(wal);
+    fs::create_dir_all(&out).unwrap();
+    fs::copy(
+        tmp.path().join(format::segment_file_name(1)),
+        out.join(format::segment_file_name(1)),
+    )
+    .unwrap();
 }

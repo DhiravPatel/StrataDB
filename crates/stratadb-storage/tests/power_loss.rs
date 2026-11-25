@@ -6,9 +6,8 @@
 //! referenced, so their committed state survives; stale `.tmp` files may or
 //! may not survive and recovery must cope with both.
 //!
-//! Not modelled: reordering of unsynced writes inside a file, lost directory
-//! entries for un-fsynced renames, or lying hardware. A fault-injecting
-//! filesystem layer is needed for those (docs/project/TASKS.md T-P1-PL).
+//! Superseded by the full simulation in `power_loss_sim.rs` (reordering,
+//! torn sectors, lost un-fsynced renames); kept as a fast regression test.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code: panics are failures
 
@@ -19,7 +18,7 @@ use std::path::Path;
 use stratadb_common::TenantId;
 use stratadb_schema::Event;
 use stratadb_storage::{Durability, Engine, EngineOptions};
-use stratadb_wal::format::{parse_frame, parse_segment_file_name, HEADER_LEN};
+use stratadb_wal::format::{decode_header, parse_frame, parse_segment_file_name, HEADER_LEN};
 
 fn tenant() -> TenantId {
     TenantId::new("pl").unwrap()
@@ -63,9 +62,10 @@ fn lose_unsynced_wal(data: &Path, durable_seq: u64) {
             continue;
         };
         let bytes = fs::read(&p).unwrap();
+        let version = decode_header(&bytes, "test").unwrap().version;
         let mut pos = HEADER_LEN;
         while pos < bytes.len() {
-            let f = parse_frame(&bytes[pos..]).unwrap();
+            let f = parse_frame(&bytes[pos..], version).unwrap();
             if f.seq > durable_seq {
                 break;
             }

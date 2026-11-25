@@ -25,9 +25,32 @@ pub const DIR_MODE: u32 = 0o700;
 
 /// Fsync a directory so that entries created, renamed, or removed in it are durable.
 pub fn fsync_dir(dir: &Path) -> Result<()> {
+    #[cfg(feature = "simfs")]
+    crate::simfs::dir_sync(dir, false);
     let f = File::open(dir).ctx(|| format!("opening directory {} for fsync", dir.display()))?;
     f.sync_all()
-        .ctx(|| format!("fsyncing directory {}", dir.display()))
+        .ctx(|| format!("fsyncing directory {}", dir.display()))?;
+    #[cfg(feature = "simfs")]
+    crate::simfs::dir_sync(dir, true);
+    Ok(())
+}
+
+/// Fsync file data (`data_only`: `sync_data`, else `sync_all`). Every fsync
+/// of a data file goes through here so power-loss simulation can observe it.
+/// `path` is the file's current name (used only by the simulator).
+pub fn sync_file(f: &File, path: &Path, data_only: bool) -> std::io::Result<()> {
+    #[cfg(feature = "simfs")]
+    crate::simfs::file_sync(path, false);
+    #[cfg(not(feature = "simfs"))]
+    let _ = path;
+    if data_only {
+        f.sync_data()?;
+    } else {
+        f.sync_all()?;
+    }
+    #[cfg(feature = "simfs")]
+    crate::simfs::file_sync(path, true);
+    Ok(())
 }
 
 /// Create `dir` (and parents) with owner-only permissions, fsyncing the parent
@@ -68,12 +91,15 @@ pub fn tmp_path(path: &Path) -> PathBuf {
 
 /// Create a new file for writing with owner-only permissions. Fails if it exists.
 pub fn create_new_file(path: &Path) -> Result<File> {
-    OpenOptions::new()
+    let f = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(FILE_MODE)
         .open(path)
-        .ctx(|| format!("creating {}", path.display()))
+        .ctx(|| format!("creating {}", path.display()))?;
+    #[cfg(feature = "simfs")]
+    crate::simfs::file_created(path);
+    Ok(f)
 }
 
 /// Atomically replace `path` with `contents`:
@@ -91,7 +117,7 @@ pub fn atomic_write(path: &Path, contents: &[u8], failpoint_prefix: &str) -> Res
     let mut f = create_new_file(&tmp)?;
     f.write_all(contents)
         .ctx(|| format!("writing {}", tmp.display()))?;
-    f.sync_all().ctx(|| format!("fsyncing {}", tmp.display()))?;
+    sync_file(&f, &tmp, false).ctx(|| format!("fsyncing {}", tmp.display()))?;
     drop(f);
     crate::failpoint::hit(&format!("{failpoint_prefix}::before_rename"))?;
     fs::rename(&tmp, path).ctx(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
