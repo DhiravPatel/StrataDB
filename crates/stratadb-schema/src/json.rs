@@ -196,6 +196,103 @@ pub fn event_from_json(
     Ok(ev)
 }
 
+/// JSON form of a value (export/query output). JSON-native types map 1:1;
+/// `Timestamp` becomes an RFC 3339 string and `Bytes` a lowercase hex string,
+/// so those two do not round-trip through [`json_to_value`] (they come back as
+/// strings).
+pub fn value_to_json(v: &Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        Value::Null => J::Null,
+        Value::Bool(b) => J::Bool(*b),
+        Value::Int(i) => J::from(*i),
+        Value::UInt(u) => J::from(*u),
+        Value::Float(f) => serde_json::Number::from_f64(*f).map_or(J::Null, J::Number),
+        Value::String(s) => J::String(s.clone()),
+        Value::Bytes(b) => J::String(b.iter().map(|x| format!("{x:02x}")).collect()),
+        Value::Timestamp(t) => J::String(stratadb_common::time::format_rfc3339(*t)),
+        Value::List(l) => J::Array(l.iter().map(value_to_json).collect()),
+        Value::Map(m) => J::Object(
+            m.iter()
+                .map(|(k, v)| (k.clone(), value_to_json(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// The JSON input that [`event_from_json`] maps back to `ev` (except
+/// `ingest_time`, `schema_version` and `tenant_id`, which the server assigns).
+///
+/// Exact inverse for every event produced by [`event_from_json`]:
+/// `event_from_json(&event_to_json(&e), ..) == e` up to `ingest_time`
+/// (property-tested). Lossy for events from other sources only where JSON
+/// cannot express them: `Timestamp`/`Bytes` values nested in body or
+/// attributes (exported as strings), non-finite floats (null), and an OTLP
+/// severity number paired with unrelated severity text (the normalized
+/// severity is kept, the text dropped).
+pub fn event_to_json(ev: &Event) -> serde_json::Value {
+    let mut o = serde_json::Map::new();
+    o.insert(
+        "event_time".into(),
+        serde_json::Value::String(stratadb_common::time::format_rfc3339(ev.event_time)),
+    );
+    let s = |x: &str| serde_json::Value::String(x.to_owned());
+    if let Some(v) = &ev.service {
+        o.insert("service".into(), s(v));
+    }
+    if let Some(sev) = severity_to_json(ev.severity, ev.severity_text.as_deref()) {
+        o.insert("severity".into(), sev);
+    }
+    if let Some(b) = &ev.body {
+        o.insert("body".into(), value_to_json(b));
+    }
+    for (k, v) in [
+        ("trace_id", &ev.trace_id),
+        ("span_id", &ev.span_id),
+        ("event_id", &ev.event_id),
+    ] {
+        if let Some(v) = v {
+            o.insert(k.into(), s(v));
+        }
+    }
+    let map = |m: &BTreeMap<String, Value>| {
+        serde_json::Value::Object(
+            m.iter()
+                .map(|(k, v)| (k.clone(), value_to_json(v)))
+                .collect(),
+        )
+    };
+    if !ev.attributes.is_empty() {
+        o.insert("attributes".into(), map(&ev.attributes));
+    }
+    if !ev.resource_attributes.is_empty() {
+        o.insert("resource_attributes".into(), map(&ev.resource_attributes));
+    }
+    serde_json::Value::Object(o)
+}
+
+/// Inverse of the `severity`/`level` input rules of [`event_from_json`]: the
+/// JSON `severity` input that reproduces `(sev, text)` (`None`: omit it).
+pub fn severity_to_json(sev: Severity, text: Option<&str>) -> Option<serde_json::Value> {
+    let Some(t) = text else {
+        // Input was absent (Unspecified) or the canonical spelling.
+        return (sev != Severity::Unspecified).then(|| serde_json::Value::from(sev.as_str()));
+    };
+    // Input was a number n: severity = from_otlp_number(n), text = n.to_string().
+    if let Ok(n) = t.parse::<i64>() {
+        if n.to_string() == t && Severity::from_otlp_number(n) == sev {
+            return Some(serde_json::Value::from(n));
+        }
+    }
+    // Input was a known non-canonical spelling, or unknown text (Unspecified).
+    let parsed = Severity::parse(t);
+    if parsed == Some(sev) || (parsed.is_none() && sev == Severity::Unspecified) {
+        return Some(serde_json::Value::from(t));
+    }
+    // Not producible by JSON ingest (e.g. OTLP number + unrelated text).
+    (sev != Severity::Unspecified).then(|| serde_json::Value::from(sev.as_str()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +377,164 @@ mod tests {
         let lim = Limits::default();
         let ev = event_from_json(&json!({"n": u64::MAX}), &t(), NOW, &lim).unwrap();
         assert_eq!(ev.attributes["n"], Value::UInt(u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod roundtrip {
+    use super::*;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    pub(super) const NOW: i64 = 1_795_170_600_123_456_789;
+    const DAY: i64 = 86_400_000_000_000;
+
+    fn arb_json(depth: u32) -> BoxedStrategy<serde_json::Value> {
+        let leaf = prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::from),
+            any::<i64>().prop_map(serde_json::Value::from),
+            (i64::MAX as u64..=u64::MAX).prop_map(serde_json::Value::from),
+            (-1e12f64..1e12).prop_map(serde_json::Value::from),
+            "[a-zA-Z0-9 _.%\u{e9}-]{0,12}".prop_map(serde_json::Value::from),
+        ];
+        if depth == 0 {
+            return leaf.boxed();
+        }
+        prop_oneof![
+            3 => leaf,
+            1 => prop::collection::vec(arb_json(depth - 1), 0..3).prop_map(serde_json::Value::Array),
+            1 => prop::collection::btree_map("[a-z.]{1,6}", arb_json(depth - 1), 0..3)
+                .prop_map(|m| serde_json::Value::Object(m.into_iter().collect())),
+        ]
+        .boxed()
+    }
+
+    pub(super) fn arb_input_pub() -> impl Strategy<Value = serde_json::Value> {
+        arb_input()
+    }
+
+    fn arb_input() -> impl Strategy<Value = serde_json::Value> {
+        let severity = prop_oneof![
+            Just(None),
+            prop::sample::select(vec![
+                "ERROR",
+                "error",
+                "Warning",
+                "INFO",
+                "notice",
+                "UNSPECIFIED",
+                "",
+                "boom",
+                "17",
+                "007",
+            ])
+            .prop_map(|s| Some(json!(s))),
+            (-3i64..30).prop_map(|n| Some(json!(n))),
+        ];
+        (
+            // Within the accepted window around NOW (max age / future skew).
+            prop::option::of(NOW - 30 * DAY..NOW + 3_000_000_000_000),
+            prop::option::of("[a-z-]{1,8}"),
+            severity,
+            prop::option::of(arb_json(2)),
+            prop::option::of("[0-9a-fA-F]{32}"),
+            prop::option::of("[a-z0-9]{1,8}"),
+            prop::collection::btree_map("[a-z.]{1,6}", arb_json(1), 0..4),
+            prop::collection::btree_map("[a-z.]{1,6}", arb_json(1), 0..3),
+            prop::collection::btree_map("x_[a-z]{1,4}", arb_json(1), 0..2),
+        )
+            .prop_map(|(t, svc, sev, body, trace, eid, attrs, res, extra)| {
+                let mut o = serde_json::Map::new();
+                if let Some(t) = t {
+                    o.insert("event_time".into(), json!(t));
+                }
+                if let Some(s) = svc {
+                    o.insert("service".into(), json!(s));
+                }
+                if let Some(s) = sev {
+                    o.insert("severity".into(), s);
+                }
+                if let Some(b) = body {
+                    o.insert("body".into(), b);
+                }
+                if let Some(t) = trace {
+                    o.insert("trace_id".into(), json!(t));
+                }
+                if let Some(e) = eid {
+                    o.insert("event_id".into(), json!(e));
+                }
+                if !attrs.is_empty() {
+                    o.insert("attributes".into(), json!(attrs));
+                }
+                if !res.is_empty() {
+                    o.insert("resource".into(), json!(res));
+                }
+                // Unknown top-level keys land in attributes on ingest.
+                for (k, v) in extra {
+                    o.insert(k, v);
+                }
+                serde_json::Value::Object(o)
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+        /// export(ingest(j)) re-ingests to the identical event.
+        #[test]
+        fn event_json_round_trips(j in arb_input()) {
+            let t = TenantId::new("rt").unwrap();
+            let lim = Limits::default();
+            if let Ok(e) = event_from_json(&j, &t, NOW, &lim) {
+                let out = event_to_json(&e);
+                let back = event_from_json(&out, &t, NOW, &lim)
+                    .map_err(|err| TestCaseError::fail(format!("{err}: {out}")))?;
+                prop_assert_eq!(back, e, "exported as {}", out);
+            }
+        }
+    }
+
+    #[test]
+    fn documented_lossy_cases() {
+        let t = TenantId::new("rt").unwrap();
+        let mut e = Event::new(t.clone(), 5, 5);
+        e.attributes.insert("ts".into(), Value::Timestamp(0));
+        e.attributes
+            .insert("raw".into(), Value::Bytes(vec![1, 255]));
+        e.severity = Severity::Error;
+        e.severity_text = Some("boom".into()); // OTLP-style pair
+        let j = event_to_json(&e);
+        assert_eq!(j["attributes"]["ts"], "1970-01-01T00:00:00.000000000Z");
+        assert_eq!(j["attributes"]["raw"], "01ff");
+        assert_eq!(j["severity"], "ERROR");
+    }
+}
+
+#[cfg(test)]
+mod roundtrip_coverage {
+    use super::*;
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::TestRunner;
+
+    /// Guard against a vacuous round-trip test: most generated inputs must be
+    /// valid events, and every severity input form must be exercised.
+    #[test]
+    fn generator_produces_mostly_valid_events() {
+        let mut runner = TestRunner::deterministic();
+        let t = TenantId::new("rt").unwrap();
+        let (mut ok, mut with_text, mut numeric) = (0, 0, 0);
+        for _ in 0..1000 {
+            let j = super::roundtrip::arb_input_pub()
+                .new_tree(&mut runner)
+                .unwrap()
+                .current();
+            if let Ok(e) = event_from_json(&j, &t, super::roundtrip::NOW, &Limits::default()) {
+                ok += 1;
+                with_text += usize::from(e.severity_text.is_some());
+                numeric += usize::from(j.get("severity").is_some_and(serde_json::Value::is_number));
+            }
+        }
+        assert!(ok > 800, "only {ok}/1000 generated inputs were valid");
+        assert!(with_text > 100 && numeric > 50, "{with_text} {numeric}");
     }
 }

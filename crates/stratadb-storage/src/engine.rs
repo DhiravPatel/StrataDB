@@ -98,10 +98,18 @@ pub struct EngineOptions {
     pub bloom_enabled: bool,
     pub bloom_attribute_keys: Vec<String>,
     pub bloom_resource_keys: Vec<String>,
+    /// Build per-segment trigram filters for `body` (and the string
+    /// attributes listed here) to prune `LIKE`/`ILIKE` scans. Spec §12.4.
+    pub ngram_enabled: bool,
+    pub ngram_attribute_keys: Vec<String>,
     /// LZ4-compress segment chunks (segment format v2, RFC-0001).
     pub segment_compression: bool,
     /// Store hot attribute keys as separate columns (segment v3, RFC-0002).
     pub segment_shredding: bool,
+    /// Encryption at rest (ADR-0024): source of the key-encryption key. When
+    /// set, new segments, the manifest and WAL segments are encrypted; an
+    /// encrypted data directory cannot be opened without it.
+    pub encryption: Option<Arc<dyn stratadb_crypto::KeyProvider>>,
 }
 
 impl EngineOptions {
@@ -130,8 +138,11 @@ impl EngineOptions {
                 .map(String::from)
                 .to_vec(),
             bloom_resource_keys: Vec::new(),
+            ngram_enabled: true,
+            ngram_attribute_keys: Vec::new(),
             segment_compression: true,
             segment_shredding: true,
+            encryption: None,
         }
     }
 }
@@ -188,6 +199,7 @@ pub struct SegmentHandle {
     pub entry: SegmentEntry,
     pub reader: SegmentReader,
     bloom: std::sync::OnceLock<Option<stratadb_segment::bloom::BloomSet>>,
+    ngram: std::sync::OnceLock<Option<stratadb_segment::ngram::NgramSet>>,
 }
 
 impl SegmentHandle {
@@ -202,6 +214,23 @@ impl SegmentHandle {
                     Ok(b) => Some(b),
                     Err(e) => {
                         tracing::warn!(segment = self.entry.id, error = %e, "ignoring undecodable bloom filters");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// The segment's trigram filters, decoded on first use (`None`: absent
+    /// or undecodable — then `LIKE` simply scans).
+    pub fn ngram(&self) -> Option<&stratadb_segment::ngram::NgramSet> {
+        self.ngram
+            .get_or_init(|| {
+                let x = self.reader.footer().extension(stratadb_segment::ngram::EXT_NGRAM)?;
+                match stratadb_segment::ngram::NgramSet::decode(&x.data) {
+                    Ok(n) => Some(n),
+                    Err(e) => {
+                        tracing::warn!(segment = self.entry.id, error = %e, "ignoring undecodable ngram filters");
                         None
                     }
                 }
@@ -380,6 +409,8 @@ struct Shared {
     dedup: Mutex<DedupIndex>,
     disk: Mutex<DiskState>,
     _lock_file: File,
+    /// Encryption keyring (ADR-0024); `None` for a plaintext directory.
+    keys: Option<Arc<stratadb_crypto::Keyring>>,
 }
 
 /// The storage engine. Cheap to share by reference across threads.
@@ -441,10 +472,15 @@ fn dir_has_files(dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn open_segment(dir: &Path, entry: &SegmentEntry, full_verify: bool) -> Result<SegmentHandle> {
+fn open_segment(
+    dir: &Path,
+    entry: &SegmentEntry,
+    full_verify: bool,
+    keys: Option<&stratadb_crypto::Keyring>,
+) -> Result<SegmentHandle> {
     let path = segment_path(dir, &entry.tenant, entry.id);
     let loc = path.display().to_string();
-    let reader = SegmentReader::open(&path).map_err(|e| match e.kind() {
+    let reader = SegmentReader::open_with(&path, keys).map_err(|e| match e.kind() {
         ErrorKind::Io if !path.exists() => Error::corruption(
             &loc,
             "segment referenced by the manifest is missing (restore from backup)",
@@ -471,6 +507,7 @@ fn open_segment(dir: &Path, entry: &SegmentEntry, full_verify: bool) -> Result<S
         entry: entry.clone(),
         reader,
         bloom: std::sync::OnceLock::new(),
+        ngram: std::sync::OnceLock::new(),
     })
 }
 
@@ -483,11 +520,38 @@ impl Engine {
         let lock_file = acquire_lock(&dir)?;
         let mut report = OpenReport::default();
 
+        // 0. Encryption keyring (ADR-0024): created before anything else is
+        // written encrypted; an encrypted directory never opens without its key.
+        if fsutil::remove_if_exists(&fsutil::tmp_path(&stratadb_crypto::Keyring::path(&dir)))? {
+            report.tmp_files_removed += 1;
+        }
+        let keys: Option<Arc<stratadb_crypto::Keyring>> =
+            match (&opts.encryption, stratadb_crypto::Keyring::exists(&dir)) {
+                (None, false) => None,
+                (None, true) => {
+                    return Err(Error::new(
+                        ErrorKind::PermissionDenied,
+                        "this data directory is encrypted (KEYRING present); configure its \
+                         key-encryption key",
+                    ))
+                }
+                (Some(p), true) => Some(Arc::new(
+                    stratadb_crypto::Keyring::load(&dir, p.as_ref())?
+                        .ok_or_else(|| Error::internal("KEYRING disappeared during open"))?,
+                )),
+                (Some(p), false) => {
+                    let k = stratadb_crypto::Keyring::create(&dir, p.as_ref())?;
+                    tracing::info!(kek = k.kek_id(), "encryption at rest enabled for new files");
+                    Some(Arc::new(k))
+                }
+            };
+        let k = keys.as_deref();
+
         // 1. Manifest (authoritative). Never silently re-initialize over data.
         if fsutil::remove_if_exists(&fsutil::tmp_path(&dir.join(crate::manifest::MANIFEST_FILE)))? {
             report.tmp_files_removed += 1;
         }
-        let mut manifest = match Manifest::load(&dir)? {
+        let mut manifest = match Manifest::load(&dir, k)? {
             Some(m) => m,
             None => {
                 if dir_has_files(&dir.join(WAL_DIR))? || dir_has_files(&dir.join(SEGMENTS_DIR))? {
@@ -498,7 +562,7 @@ impl Engine {
                     ));
                 }
                 let m = Manifest::initial();
-                m.commit(&dir)?;
+                m.commit(&dir, k)?;
                 report.created = true;
                 m
             }
@@ -517,7 +581,7 @@ impl Engine {
             }
             manifest.version += 1;
             manifest.obsolete_segments.clear();
-            manifest.commit(&dir)?;
+            manifest.commit(&dir, k)?;
         }
         report.manifest_version = manifest.version;
 
@@ -584,6 +648,7 @@ impl Engine {
                 &dir,
                 entry,
                 opts.verify_segments_on_open,
+                k,
             )?));
         }
         report.segments = handles.len();
@@ -605,7 +670,10 @@ impl Engine {
             |seq: u64, e: Error| Error::corruption(format!("WAL record {seq}"), e.to_string());
         let (wal, wal_report) = Wal::open(
             &dir.join(WAL_DIR),
-            opts.wal.clone(),
+            WalOptions {
+                keys: keys.clone(),
+                ..opts.wal.clone()
+            },
             manifest.flushed_through_seq,
             |seq, rtype, payload| {
                 let (events, meta) = match rtype {
@@ -679,6 +747,7 @@ impl Engine {
                 checked: None,
             }),
             _lock_file: lock_file,
+            keys,
             opts,
         });
         let engine = Engine {
@@ -939,6 +1008,15 @@ impl Shared {
             );
             x.push(b.to_extension());
         }
+        if self.opts.ngram_enabled || !self.opts.ngram_attribute_keys.is_empty() {
+            let n = stratadb_segment::ngram::NgramSet::build(
+                rows,
+                self.opts.ngram_enabled,
+                &self.opts.ngram_attribute_keys,
+                &[],
+            );
+            x.push(n.to_extension());
+        }
         x
     }
 
@@ -1155,7 +1233,7 @@ impl Shared {
                 written.push(path.clone());
                 let metas = frozen.metas.get(tenant).map_or(&[][..], Vec::as_slice);
                 let extensions = self.segment_extensions(&rows, metas);
-                let ws = stratadb_segment::write_segment_opts(
+                let ws = stratadb_segment::write_segment_sealed(
                     &path,
                     id,
                     tenant,
@@ -1163,6 +1241,7 @@ impl Shared {
                     created_ms,
                     extensions,
                     &self.segment_write_options(),
+                    self.keys.as_deref(),
                 )?;
                 let f = &ws.footer;
                 let entry = SegmentEntry {
@@ -1183,7 +1262,7 @@ impl Shared {
                     lineage: Vec::new(),
                 };
                 // Read back from disk before publishing (catches write-path corruption).
-                let handle = open_segment(&self.dir, &entry, true)?;
+                let handle = open_segment(&self.dir, &entry, true, self.keys.as_deref())?;
                 report.bytes_written += ws.file_bytes;
                 handles.push(Arc::new(handle));
             }
@@ -1205,7 +1284,7 @@ impl Shared {
         next.flushed_through_seq = frozen.through_seq;
         next.segments
             .extend(handles.iter().map(|h| h.entry.clone()));
-        if let Err(e) = next.commit(&self.dir) {
+        if let Err(e) = next.commit(&self.dir, self.keys.as_deref()) {
             // The manifest may or may not be durable now: fail stop.
             let e = Error::indeterminate(format!("manifest commit failed: {e}"));
             self.fail(&e);

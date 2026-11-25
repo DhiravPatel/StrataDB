@@ -8,6 +8,7 @@ fn opts(d: Durability) -> WalOptions {
         segment_max_bytes: 4096,
         max_record_bytes: 1 << 20,
         recovery: RecoveryPolicy::TruncateTornTail,
+        keys: None,
     }
 }
 
@@ -403,8 +404,8 @@ fn v1_segments_are_read_and_not_appended_to() {
             base_seq: 1,
             created_ms: 0,
             version: 1,
-        })
-        .to_vec();
+            encryption: None,
+        });
         for (seq, p) in frames {
             b.extend(format::encode_frame_v1(RecordType::EventBatch, *seq, p));
         }
@@ -488,4 +489,107 @@ fn generate_wal_v2_fixture() {
         out.join(format::segment_file_name(1)),
     )
     .unwrap();
+}
+
+fn keyring(dir: &Path) -> Arc<stratadb_crypto::Keyring> {
+    let p = stratadb_crypto::StaticKeyProvider(stratadb_crypto::SecretKey::from_bytes([4; 32]));
+    Arc::new(stratadb_crypto::Keyring::create(dir, &p).unwrap())
+}
+
+fn enc_opts(keys: &Arc<stratadb_crypto::Keyring>) -> WalOptions {
+    WalOptions {
+        keys: Some(Arc::clone(keys)),
+        ..opts(Durability::Sync)
+    }
+}
+
+/// Encrypted WAL: payloads never appear in clear, replay decrypts them, every
+/// process starts a fresh segment (fresh frame key), and a missing key or a
+/// tampered ciphertext fails closed.
+#[test]
+fn encrypted_wal_round_trip() {
+    let kdir = tempfile::tempdir().unwrap();
+    let keys = keyring(kdir.path());
+    let dir = tempfile::tempdir().unwrap();
+    for round in 0..3u64 {
+        let (wal, recs, _) = collect(dir.path(), enc_opts(&keys), 0).unwrap();
+        assert_eq!(recs.len() as u64, round * 5);
+        for (i, (seq, p)) in recs.iter().enumerate() {
+            assert_eq!((*seq, p.clone()), (i as u64 + 1, payload(i as u64 + 1)));
+        }
+        for i in 1..=5 {
+            wal.append(RecordType::EventBatch, &payload(round * 5 + i))
+                .unwrap();
+        }
+    }
+    let files = segment_files(dir.path());
+    assert_eq!(files.len(), 3, "one new segment per process: {files:?}");
+    for f in &files {
+        let data = fs::read(f).unwrap();
+        let h = format::decode_header(&data, "t").unwrap();
+        assert!(h.encryption.is_some());
+        assert!(
+            !data.windows(9).any(|w| w == b"record-1-"),
+            "plaintext payload on disk"
+        );
+    }
+    // No key: refuse to open (never treat ciphertext as data).
+    let err = collect(dir.path(), opts(Durability::Sync), 0).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
+    // Another keyring (other DEKs): the DEK id may exist but authentication fails.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = keyring(other_dir.path());
+    let err = collect(dir.path(), enc_opts(&other), 0).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Corruption, "{err}");
+    // Tampering with a ciphertext byte (and fixing up the CRC) is detected.
+    let seg = &files[0];
+    let mut data = fs::read(seg).unwrap();
+    let hl = format::decode_header(&data, "t").unwrap().len();
+    let f = format::parse_frame(&data[hl..], 2).unwrap();
+    let (plen, st) = (f.payload.len(), f.synced_through.unwrap());
+    data[hl + FRAME_HEADER_LEN] ^= 1;
+    let crc = crc32c(&data[hl + FRAME_HEADER_LEN..hl + FRAME_HEADER_LEN + plen]);
+    let mut frame = data[hl..hl + FRAME_HEADER_LEN + plen].to_vec();
+    format::encode_frame_into(&mut frame, RecordType::EventBatch, 1, st, plen as u32, crc);
+    data[hl..hl + FRAME_HEADER_LEN].copy_from_slice(&frame[..FRAME_HEADER_LEN]);
+    fs::write(seg, &data).unwrap();
+    let err = collect(dir.path(), enc_opts(&keys), 0).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Corruption, "{err}");
+}
+
+/// The reordered-un-synced-tail rule (WAL v2) works on encrypted segments.
+#[test]
+fn encrypted_reordered_tail_is_truncated() {
+    let kdir = tempfile::tempdir().unwrap();
+    let keys = keyring(kdir.path());
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = enc_opts(&keys);
+    o.durability = Durability::Async;
+    o.segment_max_bytes = 1 << 20;
+    let (wal, _, _) = collect(dir.path(), o, 0).unwrap();
+    for i in 1..=4 {
+        wal.append(RecordType::EventBatch, &payload(i)).unwrap();
+    }
+    wal.sync().unwrap();
+    wal.append(RecordType::EventBatch, &payload(5)).unwrap();
+    wal.append(RecordType::EventBatch, &payload(6)).unwrap();
+    std::mem::forget(wal);
+    let seg = last_segment(dir.path());
+    let mut data = fs::read(&seg).unwrap();
+    let mut pos = format::decode_header(&data, "t").unwrap().len();
+    for _ in 1..=4 {
+        pos += format::parse_frame(&data[pos..], 2).unwrap().encoded_len();
+    }
+    let n5 = format::parse_frame(&data[pos..], 2).unwrap().encoded_len();
+    data[pos..pos + n5].fill(0); // frame 5 lost, frame 6 survived
+    fs::write(&seg, &data).unwrap();
+    let (_, recs, rep) = collect(dir.path(), enc_opts(&keys), 0).unwrap();
+    assert_eq!(
+        recs.iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+    assert_eq!(
+        rep.truncation.unwrap().kind,
+        format::InvalidTail::UnsyncedReordered
+    );
 }

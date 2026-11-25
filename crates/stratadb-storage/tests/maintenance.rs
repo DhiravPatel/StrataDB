@@ -68,7 +68,7 @@ fn compaction_merges_and_preserves_results() {
     assert_eq!(ids(&e, &a), before);
     assert_eq!(seg_files(dir.path(), "a"), 1);
     e.verify().unwrap();
-    let m = stratadb_storage::Manifest::load(dir.path())
+    let m = stratadb_storage::Manifest::load(dir.path(), None)
         .unwrap()
         .unwrap();
     assert_eq!(m.segments[0].lineage.len(), 6);
@@ -97,7 +97,7 @@ fn snapshots_pin_obsolete_segments() {
     // The old snapshot still reads its (now obsolete) segments.
     assert_eq!(snap.scan_all().unwrap().len(), 15);
     // A crash here must not resurrect obsolete segments as visible data.
-    let m = stratadb_storage::Manifest::load(dir.path())
+    let m = stratadb_storage::Manifest::load(dir.path(), None)
         .unwrap()
         .unwrap();
     assert_eq!(m.obsolete_segments.len(), 3);

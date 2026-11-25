@@ -2,6 +2,34 @@
 
 ## Unreleased (0.0.1)
 ### Added
+- Parquet export/import in `strata` (ADR-0025): `export --format parquet`
+  (events, row group per page, atomic rename), `ingest` of `*.parquet` (exact
+  timestamp conversion, aliases, extra columns → attributes); optional
+  `parquet` cargo feature (default on, CLI only).
+- Parallel segment scans for sorted and aggregate queries with partial
+  aggregation, ordered merge and query-wide budgets
+  (`QueryOptions::parallelism`, `strata-bench --no-parallel`); 2.2–2.6× on
+  multi-segment queries (`benchmarks/reports/2026-11-25-parallel-ab.md`).
+- Encryption at rest (ADR-0024): `stratadb-crypto` (ring AES-256-GCM +
+  HKDF), KEK file provider, KEYRING of wrapped data keys, sealed segment and
+  manifest containers, encrypted WAL segments, KEK/DEK rotation
+  (`strata keys generate|status|rotate-kek|rotate-dek`), encrypted backups,
+  `--key-file` / `STRATADB_KEY_FILE` / `[encryption] key_file`, `strata
+  upgrade` encrypts existing plaintext segments. Formats:
+  docs/storage-format/encryption-v1.md; runbook docs/runbooks/encryption.md.
+- Allocation-free grouping: group keys encoded from column data by reference
+  into a reused buffer (byte-identical keys, property-tested). Group-by queries
+  1.3–3.0× faster (`benchmarks/reports/2026-11-25-grouping.md`).
+- `strata export` (NDJSON/CSV, events or row query, paginated snapshot,
+  fsynced checkpoints and `--resume`, never overwrites), idempotent resumable
+  `strata ingest --import-id` with `--report`, and `strata shell`
+  (docs/operations/export-import.md). `stratadb_schema::json::event_to_json`
+  is the property-tested inverse of the ingest mapping.
+- Trigram (ngram) filters for substring search (F-005, ADR-0005): segment
+  footer extension tag 3 over `body` (and `storage.ngram_attribute_keys`)
+  prunes segments for `LIKE`/`ILIKE`; `ngram(body)` in `indexes_used`;
+  `strata-bench --no-ngram`. A/B: absent substring 3.0 ms → 3 µs, +0.17 %
+  storage, +11 % flush (`benchmarks/reports/2026-11-25-ngram-ab.md`).
 - Power-loss simulation (`stratadb_common::simfs`, feature `simfs`): crash
   images around every fsync, materialized as lost/torn/reordered sector and
   lost-rename states; `stratadb-storage/tests/power_loss_sim.rs` recovers

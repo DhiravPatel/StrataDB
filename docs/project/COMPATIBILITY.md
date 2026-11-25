@@ -8,6 +8,7 @@
 | Manifest | 1 | 1 | unknown JSON fields rejected |
 | Query language | StrataQL v0 | — | grammar in docs/query-language |
 | HTTP API | v1 (`/api/v1`) | v1 | `docs/api/http.md`, `docs/api/openapi.json`; additive fields only within v1 |
+| Encryption (KEYRING, sealed container, WAL flag) | 1 | 1 | ADR-0024, encryption-v1.md; fixture `tests/fixtures/encrypted-v1`; pre-encryption readers reject the WAL flag and the sealed magic |
 | Pagination cursor | 1 | 1 | opaque, client-held (ADR-0023); a release must decode every version it issued or reject it with `invalid_input` |
 
 Policy: ADR-0015. Pre-1.0 there is no on-disk compatibility promise across

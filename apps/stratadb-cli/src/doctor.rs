@@ -86,7 +86,7 @@ fn check_wal(dir: &Path, flushed: u64, r: &mut Report) {
             continue;
         };
         bytes += data.len() as u64;
-        let version = match format::decode_header(&data, &p.display().to_string()) {
+        let (version, header_len) = match format::decode_header(&data, &p.display().to_string()) {
             Err(e) => {
                 problems.push(format!("FAIL {e}"));
                 continue;
@@ -95,10 +95,10 @@ fn check_wal(dir: &Path, flushed: u64, r: &mut Report) {
                 if h.base_seq != *base {
                     problems.push(format!("FAIL {}: header/file name mismatch", p.display()));
                 }
-                h.version
+                (h.version, h.len())
             }
         };
-        let mut pos = format::HEADER_LEN;
+        let mut pos = header_len;
         let mut next = *base;
         while pos < data.len() {
             match format::parse_frame(&data[pos..], version) {
@@ -169,7 +169,7 @@ fn check_wal(dir: &Path, flushed: u64, r: &mut Report) {
     r.add("wal", status, d);
 }
 
-pub fn run(dir: &Path) -> Report {
+pub fn run(dir: &Path, key: Option<&dyn stratadb_crypto::KeyProvider>) -> Report {
     let mut r = Report { checks: Vec::new() };
     r.add(
         "version",
@@ -245,7 +245,52 @@ pub fn run(dir: &Path) -> Report {
         _ => r.add("disk", "warn", "could not measure free space"),
     }
 
-    let man = match Manifest::load(dir) {
+    // Encryption at rest (ADR-0024). WAL framing and checksums are checked
+    // without the key; manifest and segment contents need it.
+    let keys = match (stratadb_crypto::Keyring::exists(dir), key) {
+        (false, None) => {
+            r.add("encryption", "ok", "not enabled");
+            None
+        }
+        (false, Some(_)) => {
+            r.add(
+                "encryption",
+                "warn",
+                "a key was given but the directory is not encrypted (the next open enables \
+                 encryption for new files)",
+            );
+            None
+        }
+        (true, None) => {
+            r.add(
+                "encryption",
+                "warn",
+                "encrypted (KEYRING present); pass --key-file to verify the manifest and segments",
+            );
+            return r;
+        }
+        (true, Some(k)) => match stratadb_crypto::Keyring::load(dir, k) {
+            Ok(Some(ring)) => {
+                r.add(
+                    "encryption",
+                    "ok",
+                    format!(
+                        "enabled; key-encryption key {}, data keys {:?}, active {}",
+                        ring.kek_id(),
+                        ring.dek_ids(),
+                        ring.active().0
+                    ),
+                );
+                Some(ring)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                r.add("encryption", "fail", e.to_string());
+                return r;
+            }
+        },
+    };
+    let man = match Manifest::load(dir, keys.as_ref()) {
         Ok(Some(m)) => {
             r.add(
                 "manifest",
@@ -282,7 +327,9 @@ pub fn run(dir: &Path) -> Report {
             unsupported.insert(e.segment_format_version);
         }
         let p = stratadb_storage::manifest::segment_path(dir, &e.tenant, e.id);
-        match stratadb_segment::SegmentReader::open(&p).and_then(|rd| rd.verify().map(|()| rd)) {
+        match stratadb_segment::SegmentReader::open_with(&p, keys.as_ref())
+            .and_then(|rd| rd.verify().map(|()| rd))
+        {
             Ok(rd) if rd.footer_crc() == e.footer_crc && rd.footer().row_count == e.row_count => {
                 ok += 1;
                 rows += e.row_count;

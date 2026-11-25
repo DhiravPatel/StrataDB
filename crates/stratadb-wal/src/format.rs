@@ -85,17 +85,73 @@ pub struct SegmentHeader {
     pub created_ms: i64,
     /// Format version of the segment (decides the frame layout).
     pub version: u16,
+    /// Encrypted segment (header flag bit 0; ADR-0024): data-key id and the
+    /// per-segment salt of the frame key.
+    pub encryption: Option<EncryptionInfo>,
 }
 
-pub fn encode_header(h: &SegmentHeader) -> [u8; HEADER_LEN] {
-    let mut b = [0u8; HEADER_LEN];
+/// Header extension of an encrypted WAL segment (48 bytes after the 32-byte
+/// header): `dek_id u32 | salt [32] | reserved [8] = 0 | crc u32` (CRC-32C of
+/// the extension's first 44 bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptionInfo {
+    pub dek_id: u32,
+    pub salt: [u8; 32],
+}
+
+/// Header flag: the segment's frame payloads are encrypted.
+pub const FLAG_ENCRYPTED: u16 = 1;
+/// Length of the encryption header extension.
+pub const ENC_EXT_LEN: usize = 48;
+
+impl SegmentHeader {
+    /// Bytes before the first frame.
+    pub fn len(&self) -> usize {
+        HEADER_LEN
+            + if self.encryption.is_some() {
+                ENC_EXT_LEN
+            } else {
+                0
+            }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+/// Additional authenticated data of an encrypted frame: the frame header
+/// fields `record_type ‖ seq ‖ synced_through`.
+pub fn frame_aad(record_type: u8, seq: u64, synced_through: u64) -> [u8; 17] {
+    let mut a = [0u8; 17];
+    a[0] = record_type;
+    a[1..9].copy_from_slice(&seq.to_le_bytes());
+    a[9..17].copy_from_slice(&synced_through.to_le_bytes());
+    a
+}
+
+pub fn encode_header(h: &SegmentHeader) -> Vec<u8> {
+    let mut b = vec![0u8; HEADER_LEN];
     b[0..8].copy_from_slice(&MAGIC);
     b[8..10].copy_from_slice(&h.version.to_le_bytes());
-    b[10..12].copy_from_slice(&0u16.to_le_bytes());
+    let flags = if h.encryption.is_some() {
+        FLAG_ENCRYPTED
+    } else {
+        0
+    };
+    b[10..12].copy_from_slice(&flags.to_le_bytes());
     b[12..20].copy_from_slice(&h.base_seq.to_le_bytes());
     b[20..28].copy_from_slice(&h.created_ms.to_le_bytes());
     let crc = crc32c(&b[0..28]);
     b[28..32].copy_from_slice(&crc.to_le_bytes());
+    if let Some(e) = &h.encryption {
+        let mut x = [0u8; ENC_EXT_LEN];
+        x[0..4].copy_from_slice(&e.dek_id.to_le_bytes());
+        x[4..36].copy_from_slice(&e.salt);
+        let crc = crc32c(&x[0..44]);
+        x[44..48].copy_from_slice(&crc.to_le_bytes());
+        b.extend_from_slice(&x);
+    }
     b
 }
 
@@ -130,16 +186,37 @@ pub fn decode_header(b: &[u8], location: &str) -> Result<SegmentHeader> {
             supported: format!("{MIN_READ_VERSION}..={FORMAT_VERSION}"),
         });
     }
-    if le_u16(&b[10..12]) != 0 {
+    let flags = le_u16(&b[10..12]);
+    if flags & !FLAG_ENCRYPTED != 0 || (flags != 0 && version < 2) {
         return Err(Error::unsupported(format!(
             "{location}: unknown WAL header flags"
         )));
     }
+    let encryption = if flags & FLAG_ENCRYPTED != 0 {
+        let x = b
+            .get(HEADER_LEN..HEADER_LEN + ENC_EXT_LEN)
+            .ok_or_else(|| Error::corruption(location, "truncated WAL encryption header"))?;
+        if crc32c(&x[0..44]) != le_u32(&x[44..48]) || x[36..44] != [0u8; 8] {
+            return Err(Error::corruption(
+                location,
+                "WAL encryption header checksum mismatch",
+            ));
+        }
+        let mut salt = [0u8; 32];
+        salt.copy_from_slice(&x[4..36]);
+        Some(EncryptionInfo {
+            dek_id: le_u32(&x[0..4]),
+            salt,
+        })
+    } else {
+        None
+    };
     let created = le_u64(&b[20..28]);
     Ok(SegmentHeader {
         base_seq: le_u64(&b[12..20]),
         created_ms: i64::from_le_bytes(created.to_le_bytes()),
         version,
+        encryption,
     })
 }
 
@@ -351,6 +428,7 @@ mod tests {
                 base_seq: 42,
                 created_ms: 7,
                 version,
+                encryption: None,
             };
             let mut b = encode_header(&h);
             assert_eq!(decode_header(&b, "x").unwrap(), h);
@@ -362,12 +440,39 @@ mod tests {
                 base_seq: 1,
                 created_ms: 0,
                 version,
+                encryption: None,
             });
             assert!(matches!(
                 decode_header(&b, "x"),
                 Err(Error::FormatVersion { .. })
             ));
         }
+    }
+
+    #[test]
+    fn encrypted_header_extension() {
+        let h = SegmentHeader {
+            base_seq: 9,
+            created_ms: 1,
+            version: 2,
+            encryption: Some(EncryptionInfo {
+                dek_id: 3,
+                salt: [5; 32],
+            }),
+        };
+        let b = encode_header(&h);
+        assert_eq!(b.len(), h.len());
+        assert_eq!(decode_header(&b, "x").unwrap(), h);
+        for i in HEADER_LEN..b.len() {
+            let mut c = b.clone();
+            c[i] ^= 1;
+            assert!(decode_header(&c, "x").is_err(), "extension byte {i}");
+        }
+        assert!(decode_header(&b[..HEADER_LEN + 10], "x").is_err());
+        // v1 segments never carry flags.
+        let mut v1 = encode_header(&SegmentHeader { version: 1, ..h });
+        v1.truncate(HEADER_LEN);
+        assert!(decode_header(&v1, "x").is_err());
     }
 
     #[test]

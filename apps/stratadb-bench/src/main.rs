@@ -54,6 +54,12 @@ struct Args {
     /// Disable vectorized filter evaluation (A/B comparisons).
     #[arg(long)]
     no_vectorize: bool,
+    /// Disable trigram (ngram) filters for LIKE (A/B comparisons).
+    #[arg(long)]
+    no_ngram: bool,
+    /// Scan segments sequentially (A/B comparisons).
+    #[arg(long)]
+    no_parallel: bool,
 }
 
 fn pct(sorted: &[f64], p: f64) -> f64 {
@@ -98,6 +104,7 @@ fn run(a: Args) -> Result<J> {
     let mut opts = EngineOptions::new(&dir);
     opts.wal.durability = durability;
     opts.bloom_enabled = !a.no_bloom;
+    opts.ngram_enabled = !a.no_ngram;
     opts.segment_compression = !a.no_compression;
     opts.segment_shredding = !a.no_shredding;
     let engine = Engine::open(opts.clone())?;
@@ -161,10 +168,16 @@ fn run(a: Args) -> Result<J> {
         ("09_service_time_bucket", "SELECT service, time_bucket(INTERVAL '1 minute', event_time) AS b, count(*) FROM logs GROUP BY service, time_bucket(INTERVAL '1 minute', event_time)".into()),
         ("10_top_error_codes", "SELECT attributes['error.code'] AS code, count(*) AS n FROM logs WHERE severity IN ('ERROR', 'FATAL') GROUP BY attributes['error.code'] ORDER BY n DESC LIMIT 10".into()),
         ("12_historical_wide_range", "SELECT severity, count(*) FROM logs GROUP BY severity".into()),
+        ("13_absent_substring_search", "SELECT count(*) FROM logs WHERE body LIKE '%deadlock detected%'".into()),
     ];
     let qopts = QueryOptions {
         max_result_rows: 1_000_000,
         enable_vectorized: !a.no_vectorize,
+        parallelism: if a.no_parallel {
+            1
+        } else {
+            QueryOptions::default().parallelism
+        },
         ..QueryOptions::default()
     };
     let mut queries = Vec::new();
@@ -184,7 +197,7 @@ fn run(a: Args) -> Result<J> {
             "rows_scanned": s.rows_scanned, "rows_matched": s.rows_matched, "segment_bytes_read": s.bytes_read,
             "segments_total": s.segments_total, "segments_scanned": s.segments_scanned,
             "indexes_used": s.indexes_used,
-            "segments_pruned": s.segments_pruned_time + s.segments_pruned_keys + s.segments_pruned_severity + s.segments_pruned_bloom,
+            "segments_pruned": s.segments_pruned_time + s.segments_pruned_keys + s.segments_pruned_severity + s.segments_pruned_bloom + s.segments_pruned_ngram,
         }));
     }
     drop(snap);
@@ -207,7 +220,7 @@ fn run(a: Args) -> Result<J> {
                         "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)},
         "config": {"profile": profile.name(), "events": a.events, "batch_size": a.batch_size,
                    "tenants": a.tenants, "seed": a.seed, "durability": a.durability, "reps": a.reps,
-                   "bloom": !a.no_bloom, "compression": !a.no_compression, "shredding": !a.no_shredding, "vectorized": !a.no_vectorize,
+                   "bloom": !a.no_bloom, "compression": !a.no_compression, "shredding": !a.no_shredding, "vectorized": !a.no_vectorize, "ngram": !a.no_ngram, "parallel": !a.no_parallel,
                    "cache_state": "warm (same process, OS page cache not dropped)"},
         "ingest": {
             "wall_s": ingest_wall.as_secs_f64(),

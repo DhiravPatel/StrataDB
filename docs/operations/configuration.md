@@ -21,6 +21,9 @@
 | `[storage] disk_reserve_bytes` / `disk_reserve_ratio` | — | 512 MiB / 0.02 | writes pause below the reserve |
 | `[storage] default_retention_days` | flag | keep forever | per-tenant policies override |
 | `[storage] bloom_attribute_keys` | — | request_id, user_id, session_id, correlation_id | new segments only |
+| `[storage] ngram_index` | — | true | trigram filters on `body` prune `LIKE`/`ILIKE` scans; new segments only |
+| `[storage] ngram_attribute_keys` | — | none | string attributes indexed the same way; new segments only |
+| `[encryption] key_file` | `STRATADB_KEY_FILE`, `--key-file` | none | enables encryption at rest (ADR-0024, runbooks/encryption.md); restart required |
 | `[backup] dir` | `STRATADB_BACKUP_DIR` | none | enables HTTP backups |
 | `[security] insecure_allow_remote_without_tls` | flag | false | dev only |
 

@@ -563,7 +563,7 @@ async fn admin_endpoints_require_privileges_and_are_safe() {
     )
     .await;
     assert_eq!(st, 200, "{b}");
-    stratadb_storage::verify_backup(&root.path().join("nightly-1")).unwrap();
+    stratadb_storage::verify_backup(&root.path().join("nightly-1"), None).unwrap();
     // Same name again → conflict, original untouched.
     let (st, _) = req(
         &s,

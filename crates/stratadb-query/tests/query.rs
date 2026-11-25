@@ -466,6 +466,7 @@ enum P {
     RegionMissing,
     TraceEq(i64),
     ReqIn(Vec<i64>),
+    BodyLike(&'static str, bool),
     And(Box<P>, Box<P>),
     Or(Box<P>, Box<P>),
     Not(Box<P>),
@@ -481,6 +482,23 @@ fn arb_p() -> impl Strategy<Value = P> {
         Just(P::RegionMissing),
         (0i64..110).prop_map(P::TraceEq),
         proptest::collection::vec(0i64..110, 1..4).prop_map(P::ReqIn),
+        (
+            prop::sample::select(vec![
+                "%timed out%",
+                "%TIMED OUT%",
+                "%out #40",
+                "%out #4_",
+                "ok 1%",
+                "%k 3%",
+                "%deadlock%",
+                "Payment%",
+                "%#9%",
+                "%_%",
+                "%",
+            ]),
+            any::<bool>()
+        )
+            .prop_map(|(p, ci)| P::BodyLike(p, ci)),
     ];
     leaf.prop_recursive(3, 12, 2, |inner| {
         prop_oneof![
@@ -507,10 +525,37 @@ fn sql(p: &P) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        P::BodyLike(pat, ci) => format!("body {} '{pat}'", if *ci { "ILIKE" } else { "LIKE" }),
         P::And(a, b) => format!("({} AND {})", sql(a), sql(b)),
         P::Or(a, b) => format!("({} OR {})", sql(a), sql(b)),
         P::Not(a) => format!("NOT ({})", sql(a)),
     }
+}
+
+/// Reference LIKE by dynamic programming (`%`, `_`; no escapes in the
+/// generated patterns); ILIKE folds each character to lowercase.
+fn like_ref(text: &str, pat: &str, ci: bool) -> bool {
+    let f = |c: char| {
+        if ci {
+            c.to_lowercase().next().unwrap_or(c)
+        } else {
+            c
+        }
+    };
+    let t: Vec<char> = text.chars().map(f).collect();
+    let p: Vec<char> = pat.chars().map(f).collect();
+    let mut dp = vec![vec![false; t.len() + 1]; p.len() + 1];
+    dp[0][0] = true;
+    for i in 1..=p.len() {
+        for j in 0..=t.len() {
+            dp[i][j] = match p[i - 1] {
+                '%' => dp[i - 1][j] || (j > 0 && dp[i][j - 1]),
+                '_' => j > 0 && dp[i - 1][j - 1],
+                c => j > 0 && t[j - 1] == c && dp[i - 1][j - 1],
+            };
+        }
+    }
+    dp[p.len()][t.len()]
 }
 
 /// Independent three-valued reference evaluation directly over events.
@@ -528,6 +573,10 @@ fn reference(p: &P, e: &Event) -> Option<bool> {
         P::TraceEq(i) => e.trace_id.as_ref().map(|t| *t == format!("{i:032x}")),
         P::ReqIn(v) => match e.attributes.get("request_id") {
             Some(Value::String(s)) => Some(v.iter().any(|i| *s == format!("req_{i}"))),
+            _ => None,
+        },
+        P::BodyLike(pat, ci) => match &e.body {
+            Some(Value::String(s)) => Some(like_ref(s, pat, *ci)),
             _ => None,
         },
         P::And(a, b) => match (reference(a, e), reference(b, e)) {
@@ -681,4 +730,57 @@ fn shredded_attribute_columns_give_identical_results_with_less_io() {
         plain_one.stats.bytes_read
     );
     assert!(io.0 < io.1, "{io:?}");
+}
+
+#[test]
+fn ngram_filters_prune_like_scans_without_changing_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = fixture(dir.path());
+    // "out #40" occurs only in the segment holding events 40..60.
+    let sql = "SELECT event_id FROM logs WHERE body LIKE '%out #40%'";
+    let out = q(&e, "a", sql);
+    assert_eq!(ids(&out), vec!["e40"]);
+    assert_eq!(out.stats.segments_pruned_ngram, 3, "{:?}", out.stats);
+    assert!(out.stats.indexes_used.contains(&"ngram(body)".to_owned()));
+    // Case-insensitive patterns use the same (folded) index.
+    let out = q(
+        &e,
+        "a",
+        "SELECT event_id FROM logs WHERE body ILIKE '%OUT #40%'",
+    );
+    assert_eq!(ids(&out), vec!["e40"]);
+    assert_eq!(out.stats.segments_pruned_ngram, 3);
+    // A substring present in every segment prunes nothing; results unchanged.
+    let out = q(
+        &e,
+        "a",
+        "SELECT count(*) FROM logs WHERE body LIKE '%timed out%'",
+    );
+    assert_eq!(int(&out.rows[0][0]), 10);
+    assert_eq!(out.stats.segments_pruned_ngram, 0);
+    // Absent substring: every segment pruned, memtable still scanned.
+    let out = q(
+        &e,
+        "a",
+        "SELECT count(*) FROM logs WHERE body LIKE '%deadlock%'",
+    );
+    assert_eq!(int(&out.rows[0][0]), 0);
+    assert_eq!(out.stats.segments_pruned_ngram, 4);
+    // Short literals (< 3 chars) and NOT LIKE never prune.
+    let out = q(&e, "a", "SELECT count(*) FROM logs WHERE body LIKE '%#4%'");
+    assert_eq!(out.stats.segments_pruned_ngram, 0);
+    let out = q(
+        &e,
+        "a",
+        "SELECT count(*) FROM logs WHERE body NOT LIKE '%deadlock%'",
+    );
+    assert_eq!(int(&out.rows[0][0]), 100);
+    assert_eq!(out.stats.segments_pruned_ngram, 0);
+    let ex = q(
+        &e,
+        "a",
+        "EXPLAIN SELECT * FROM logs WHERE body LIKE '%deadlock%'",
+    );
+    let text = ex.explain.unwrap();
+    assert!(text.contains("ngram(body) (6 trigram(s))"), "{text}");
 }

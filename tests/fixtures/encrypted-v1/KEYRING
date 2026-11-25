@@ -1,0 +1,14 @@
+STRATADB-KEYRING v1 crc32c=5c2f8a86 len=395
+{
+  "version": 1,
+  "kek_id": "24bda5058b7e7f12",
+  "kek_check": "d9d658bac99dbc53bbb42bc4d8769fda281bff6c075aa9d0057fa49c0ce1fb6149c415157a249f1e5f6506252d1b",
+  "active": 1,
+  "deks": [
+    {
+      "id": 1,
+      "created_ms": 1795603713597,
+      "wrapped": "baa30f3448349b71de20eddb04ba50ddd5dfefba0e084df0be219a00eb23083858ad2e4435c64aabdab0abc934a3383e57dc3495badb4458232420d4"
+    }
+  ]
+}

@@ -72,6 +72,8 @@ key (must be a duplicate), write, flush and reopen.
 | `sync` | 190 | 1 140 | ✅ 0 violations |
 | `group_commit` | 190 | 760 | ✅ 0 violations |
 | `async` | 132 | 528 | ✅ 0 violations (28 states need the WAL v2 reordered-tail rule; asserted > 0) |
+| `sync`, encrypted (ADR-0024) | 194 | 776 | ✅ 0 violations (KEYRING creation, sealed manifest/segments, encrypted WAL) |
+| `async`, encrypted | 136 | 544 | ✅ 0 violations (46 reordered encrypted tails) |
 
 Found and fixed by this simulation: with WAL v1, an un-synced tail persisted
 out of order (earlier frame lost, later frame survived) made recovery refuse

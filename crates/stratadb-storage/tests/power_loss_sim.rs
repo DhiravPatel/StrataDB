@@ -37,8 +37,16 @@ fn tenant() -> TenantId {
     TenantId::new("pl").unwrap()
 }
 
+/// Whether the current simulation runs with encryption at rest.
+static ENCRYPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn opts(dir: &Path, d: Durability) -> EngineOptions {
     let mut o = EngineOptions::new(dir);
+    if ENCRYPTED.load(std::sync::atomic::Ordering::SeqCst) {
+        o.encryption = Some(std::sync::Arc::new(stratadb_crypto::StaticKeyProvider(
+            stratadb_crypto::SecretKey::from_bytes([42; 32]),
+        )));
+    }
     o.background = false;
     o.flush_on_close = false;
     o.wal.durability = d;
@@ -189,7 +197,12 @@ fn check(dir: &Path, d: Durability, tag: u64, deep: bool) -> Result<TailKind, St
 
 /// Returns how many states needed a reordered-tail truncation.
 fn simulate(d: Durability, random_variants: u64) -> usize {
+    simulate_with(d, random_variants, false)
+}
+
+fn simulate_with(d: Durability, random_variants: u64, encrypted: bool) -> usize {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    ENCRYPTED.store(encrypted, std::sync::atomic::Ordering::SeqCst);
     let work = tempfile::tempdir().unwrap();
     let images = record(&work.path().join("live"), d);
     assert!(images.len() > 100, "too few crash points: {}", images.len());
@@ -219,7 +232,8 @@ fn simulate(d: Durability, random_variants: u64) -> usize {
         }
     }
     eprintln!(
-        "{d:?}: {} crash points, {states} recovered states, {} failures; WAL tails: {kinds:?}",
+        "{d:?}{}: {} crash points, {states} recovered states, {} failures; WAL tails: {kinds:?}",
+        if encrypted { " (encrypted)" } else { "" },
         images.len(),
         failures.len()
     );
@@ -257,4 +271,16 @@ fn power_loss_async() {
     // The async workload leaves several un-synced frames in flight, so random
     // states must exercise the reordered-tail path (WAL v2).
     assert!(simulate(Durability::Async, 2) > 0);
+}
+
+#[test]
+fn power_loss_sync_encrypted() {
+    // Keyring creation, sealed manifests/segments and encrypted WAL segments
+    // are new durability transitions; the same invariants must hold.
+    simulate_with(Durability::Sync, 2, true);
+}
+
+#[test]
+fn power_loss_async_encrypted() {
+    assert!(simulate_with(Durability::Async, 2, true) > 0);
 }

@@ -12,6 +12,7 @@ failpoints = ["stratadb-common/failpoints"]
 [dependencies]
 stratadb-common.workspace = true
 stratadb-schema.workspace = true
+stratadb-crypto.workspace = true
 lz4_flex.workspace = true
 
 [dev-dependencies]

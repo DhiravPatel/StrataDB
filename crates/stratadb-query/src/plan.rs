@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 use stratadb_common::{Error, Result};
 use stratadb_schema::{Severity, Value};
 use stratadb_segment::bloom::BloomField;
+use stratadb_segment::ngram::NgramField;
 use stratadb_segment::ColumnId;
 
 use crate::ast::*;
@@ -48,6 +49,9 @@ pub struct Pruning {
     /// Bloom-filter probes: a matching row has one of these string values in
     /// the field. Only string literals are recorded (see segment::bloom).
     pub bloom: Vec<(BloomField, Vec<String>)>,
+    /// Trigram probes from `LIKE`/`ILIKE` conjuncts: a matching row's field
+    /// contains every one of these folded trigrams (see segment::ngram).
+    pub ngram: Vec<(NgramField, Vec<String>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -279,10 +283,25 @@ pub fn extract_pruning(filter: &Expr) -> Pruning {
             }
             Expr::Like {
                 expr,
+                pattern,
                 negated: false,
                 ..
+            } => {
+                if let Expr::Column(col) = expr.as_ref() {
+                    require_key(col, &mut p);
+                    let field = match col {
+                        ColumnRef::Body => Some(NgramField::Body),
+                        ColumnRef::Attr(k) => Some(NgramField::Attr(k.clone())),
+                        ColumnRef::Resource(k) => Some(NgramField::Resource(k.clone())),
+                        _ => None,
+                    };
+                    let probes = stratadb_segment::ngram::probes(pattern);
+                    if let (Some(f), false) = (field, probes.is_empty()) {
+                        p.ngram.push((f, probes));
+                    }
+                }
             }
-            | Expr::IsNull {
+            Expr::IsNull {
                 expr,
                 negated: false,
             }

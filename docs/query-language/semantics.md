@@ -53,6 +53,9 @@ and first in DESC**. Sorting is stable. Without `ORDER BY`, row order is
 unspecified (currently source order) and `LIMIT` may stop scanning early.
 
 ## Pagination
+`LIKE`/`ILIKE` never depend on indexes for correctness: trigram filters
+(ADR-0005) only skip segments that cannot contain a literal run of the pattern.
+
 Row queries can be paginated (`execute_page`; HTTP `page_size` / `cursor`;
 ADR-0023). Pages follow the total order `ORDER BY keys…, then commit order
 (seq, idx)`; without `ORDER BY`, commit order. Pages never overlap; every row
@@ -60,6 +63,14 @@ visible to the first page is returned exactly once (unless retention removes it
 meanwhile); rows committed after the first page are excluded; `LIMIT` caps the
 total across pages. Aggregates and `EXPLAIN` cannot be paginated. A cursor is
 valid only with the same tenant and query text (surrounding whitespace ignored).
+
+## Parallel execution
+Segments of sorted and aggregate queries are scanned in parallel
+(`QueryOptions::parallelism`, default min(CPUs, 8); 1 = sequential). Results
+are identical to a sequential scan — same rows, same order including ties,
+same group order — except that float `sum`/`avg` may differ in the last bits
+because additions happen in a different order (still deterministic for a given
+set of segments). Budgets apply to the whole query.
 
 ## Budgets (QueryOptions)
 Timeout (default 30 s) → `timeout`; cancellation → `cancelled`; rows scanned

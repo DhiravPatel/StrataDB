@@ -50,6 +50,13 @@ mod tag {
     pub const MAP: u8 = 10;
 }
 
+/// Encode `Value::String(s)` without constructing the value (byte-identical
+/// to `encode_value(e, &Value::String(s.to_owned()))`).
+pub fn encode_string_value(e: &mut Encoder, s: &str) {
+    e.put_u8(tag::STRING);
+    e.put_str(s);
+}
+
 pub fn encode_value(e: &mut Encoder, v: &Value) {
     match v {
         Value::Null => e.put_u8(tag::NULL),
@@ -67,10 +74,7 @@ pub fn encode_value(e: &mut Encoder, v: &Value) {
             e.put_u8(tag::FLOAT);
             e.put_f64(*f);
         }
-        Value::String(s) => {
-            e.put_u8(tag::STRING);
-            e.put_str(s);
-        }
+        Value::String(s) => encode_string_value(e, s),
         Value::Bytes(b) => {
             e.put_u8(tag::BYTES);
             e.put_bytes(b);

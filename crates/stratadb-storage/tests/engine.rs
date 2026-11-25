@@ -242,13 +242,13 @@ fn orphan_and_unreferenced_segments_are_cleaned_up_safely() {
     // unreferenced old id (must be quarantined, not deleted).
     std::fs::copy(&real, tdir.join(stratadb_segment::segment_file_name(99))).unwrap();
     std::fs::write(tdir.join("seg-00000000000000000099.sseg.tmp"), b"partial").unwrap();
-    let m = stratadb_storage::Manifest::load(dir.path())
+    let m = stratadb_storage::Manifest::load(dir.path(), None)
         .unwrap()
         .unwrap();
     let mut m2 = m.clone();
     m2.segments.clear();
     m2.version += 1;
-    m2.commit(dir.path()).unwrap();
+    m2.commit(dir.path(), None).unwrap();
     let e = Engine::open(opts(dir.path())).unwrap();
     let r = e.open_report();
     assert_eq!(r.orphan_segments_removed, 1);

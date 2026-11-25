@@ -83,13 +83,13 @@ fn backup_under_load_restores_consistent_point() {
     bg.join().unwrap();
     assert!(report.rows >= 105, "{report:?}");
 
-    let bm = verify_backup(&dest).unwrap();
+    let bm = verify_backup(&dest, None).unwrap();
     assert_eq!(bm.manifest_version, report.manifest_version);
     assert!(!dest.join("auth").exists(), "tokens must not be in backups");
 
     // Restore to a clean directory ("different machine").
     let target = root.path().join("restored");
-    let r = restore_backup(&dest, &target).unwrap();
+    let r = restore_backup(&dest, &target, None).unwrap();
     assert_eq!(r.rows, report.rows);
     let re = Engine::open(opts(&target)).unwrap();
     let restored = ids(&re, &a);
@@ -129,21 +129,21 @@ fn corruption_and_tampering_are_detected() {
     bad[30] ^= 1;
     std::fs::write(&seg, &bad).unwrap();
     assert_eq!(
-        verify_backup(&dest).unwrap_err().kind(),
+        verify_backup(&dest, None).unwrap_err().kind(),
         ErrorKind::Corruption
     );
     let target = root.path().join("r1");
-    assert!(restore_backup(&dest, &target).is_err());
+    assert!(restore_backup(&dest, &target, None).is_err());
     assert!(
         !target.exists(),
         "failed restore must not leave a target behind"
     );
     std::fs::write(&seg, &orig).unwrap();
-    verify_backup(&dest).unwrap();
+    verify_backup(&dest, None).unwrap();
 
     // 2. Missing file.
     std::fs::rename(&seg, root.path().join("moved")).unwrap();
-    assert!(verify_backup(&dest).is_err());
+    assert!(verify_backup(&dest, None).is_err());
     std::fs::rename(root.path().join("moved"), &seg).unwrap();
 
     // 3. Tampered backup manifest (path traversal attempt).
@@ -151,11 +151,11 @@ fn corruption_and_tampering_are_detected() {
     let raw = std::fs::read_to_string(&bpath).unwrap();
     std::fs::write(&bpath, raw.replace("segments/a/", "../../etc/")).unwrap();
     assert_eq!(
-        verify_backup(&dest).unwrap_err().kind(),
+        verify_backup(&dest, None).unwrap_err().kind(),
         ErrorKind::Corruption
     );
     std::fs::write(&bpath, raw).unwrap();
-    verify_backup(&dest).unwrap();
+    verify_backup(&dest, None).unwrap();
 }
 
 #[test]
@@ -175,14 +175,14 @@ fn refuses_to_overwrite() {
     std::fs::create_dir_all(&occupied).unwrap();
     std::fs::write(occupied.join("file"), b"x").unwrap();
     assert_eq!(
-        restore_backup(&dest, &occupied).unwrap_err().kind(),
+        restore_backup(&dest, &occupied, None).unwrap_err().kind(),
         ErrorKind::AlreadyExists
     );
     assert_eq!(std::fs::read(occupied.join("file")).unwrap(), b"x");
     // An existing empty directory is an acceptable target.
     let empty = root.path().join("empty");
     std::fs::create_dir_all(&empty).unwrap();
-    restore_backup(&dest, &empty).unwrap();
+    restore_backup(&dest, &empty, None).unwrap();
 }
 
 #[test]
@@ -205,5 +205,5 @@ fn interrupted_backup_is_not_published() {
     assert!(!dest.exists(), "a failed backup must not appear complete");
     // A retry succeeds (stale .tmp is replaced).
     e.backup(&dest).unwrap();
-    verify_backup(&dest).unwrap();
+    verify_backup(&dest, None).unwrap();
 }

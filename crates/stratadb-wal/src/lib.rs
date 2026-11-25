@@ -67,6 +67,10 @@ pub struct WalOptions {
     /// Largest payload accepted by `append`.
     pub max_record_bytes: u32,
     pub recovery: RecoveryPolicy,
+    /// Encrypt frame payloads of new segments (ADR-0024). Required to read
+    /// encrypted segments. When set, a segment is never appended to by a
+    /// later process (each segment's frame key sees every nonce at most once).
+    pub keys: Option<Arc<stratadb_crypto::Keyring>>,
 }
 
 impl Default for WalOptions {
@@ -78,6 +82,7 @@ impl Default for WalOptions {
             segment_max_bytes: 64 * 1024 * 1024,
             max_record_bytes: 32 * 1024 * 1024,
             recovery: RecoveryPolicy::TruncateTornTail,
+            keys: None,
         }
     }
 }
@@ -124,6 +129,10 @@ struct Inner {
     path: PathBuf,
     base_seq: u64,
     len: u64,
+    /// Bytes before the first frame of the active segment.
+    header_len: u64,
+    /// Frame key of the active segment (encrypted WAL).
+    frame_key: Option<stratadb_crypto::FrameKey>,
     /// Closed (non-active) segments, oldest first: (base_seq, path).
     closed: Vec<(u64, PathBuf)>,
     next_seq: u64,
@@ -149,16 +158,63 @@ impl std::fmt::Debug for Wal {
     }
 }
 
-fn create_segment(dir: &Path, base_seq: u64) -> Result<(File, PathBuf)> {
+/// A newly created active segment.
+struct NewSegment {
+    file: File,
+    path: PathBuf,
+    header_len: u64,
+    frame_key: Option<stratadb_crypto::FrameKey>,
+}
+
+/// Frame key of a segment from its header (keys required if encrypted).
+fn segment_frame_key(
+    h: &format::SegmentHeader,
+    keys: Option<&stratadb_crypto::Keyring>,
+    loc: &str,
+) -> Result<Option<stratadb_crypto::FrameKey>> {
+    let Some(e) = &h.encryption else {
+        return Ok(None);
+    };
+    let keys = keys.ok_or_else(|| {
+        Error::new(
+            stratadb_common::ErrorKind::PermissionDenied,
+            format!("{loc} is encrypted; configure the data directory's key"),
+        )
+    })?;
+    Ok(Some(stratadb_crypto::FrameKey::new(
+        keys.dek(e.dek_id, loc)?,
+        &e.salt,
+    )?))
+}
+
+fn create_segment(
+    dir: &Path,
+    base_seq: u64,
+    keys: Option<&stratadb_crypto::Keyring>,
+) -> Result<NewSegment> {
     let path = dir.join(format::segment_file_name(base_seq));
     let tmp = fsutil::tmp_path(&path);
     fsutil::remove_if_exists(&tmp)?;
     let mut f = fsutil::create_new_file(&tmp)?;
-    let header = format::encode_header(&format::SegmentHeader {
+    let encryption = match keys {
+        Some(k) => {
+            let mut salt = [0u8; 32];
+            stratadb_crypto::random(&mut salt)?;
+            Some(format::EncryptionInfo {
+                dek_id: k.active().0,
+                salt,
+            })
+        }
+        None => None,
+    };
+    let h = format::SegmentHeader {
         base_seq,
         created_ms: time::now_unix_millis(),
         version: FORMAT_VERSION,
-    });
+        encryption,
+    };
+    let frame_key = segment_frame_key(&h, keys, &path.display().to_string())?;
+    let header = format::encode_header(&h);
     f.write_all(&header)
         .ctx(|| format!("writing WAL header {}", tmp.display()))?;
     fsutil::sync_file(&f, &tmp, false).ctx(|| format!("fsyncing {}", tmp.display()))?;
@@ -166,8 +222,13 @@ fn create_segment(dir: &Path, base_seq: u64) -> Result<(File, PathBuf)> {
     fs::rename(&tmp, &path).ctx(|| format!("renaming {}", tmp.display()))?;
     fsutil::fsync_dir(dir)?;
     failpoint::hit("wal::rotate::after_create")?;
-    let f = open_append(&path)?;
-    Ok((f, path))
+    let file = open_append(&path)?;
+    Ok(NewSegment {
+        file,
+        path,
+        header_len: header.len() as u64,
+        frame_key,
+    })
 }
 
 fn open_append(path: &Path) -> Result<File> {
@@ -226,6 +287,7 @@ impl Wal {
         //   all <= replay_after (already durable in committed segments).
         let mut last_seq: u64 = replay_after;
         let mut last_version = FORMAT_VERSION;
+        let mut last_encrypted = false;
         // Next sequence after the previous segment's final valid frame.
         let mut prev_next: Option<u64> = None;
         let n = segs.len();
@@ -266,7 +328,9 @@ impl Wal {
             }
             report.segments_scanned += 1;
             last_version = header.version;
-            let mut pos = HEADER_LEN;
+            last_encrypted = header.encryption.is_some();
+            let frame_key = segment_frame_key(&header, opts.keys.as_deref(), &loc)?;
+            let mut pos = header.len();
             let mut next = *base;
             while pos < data.len() {
                 match format::parse_frame(&data[pos..], header.version) {
@@ -287,7 +351,19 @@ impl Wal {
                             ))
                         })?;
                         if frame.seq > replay_after {
-                            on_record(frame.seq, rtype, frame.payload)?;
+                            match &frame_key {
+                                Some(k) => {
+                                    let aad = format::frame_aad(
+                                        frame.record_type,
+                                        frame.seq,
+                                        frame.synced_through.unwrap_or(0),
+                                    );
+                                    let mut ct = frame.payload.to_vec();
+                                    let plain = k.open(frame.seq, &aad, &mut ct, &loc)?;
+                                    on_record(frame.seq, rtype, plain)?;
+                                }
+                                None => on_record(frame.seq, rtype, frame.payload)?,
+                            }
                             report.records_replayed += 1;
                         } else {
                             report.records_skipped += 1;
@@ -343,11 +419,19 @@ impl Wal {
         report.last_seq = last_seq;
 
         let next_seq = last_seq + 1;
-        let (file, path, base_seq, len, closed) = match segs.last() {
+        let mut frame_key_new = None;
+        let (file, path, base_seq, len, closed, header_len) = match segs.last() {
             // Reuse the last segment only if appending `next_seq` keeps it
             // contiguous and it has the current format (frames of one segment
-            // share one layout; older segments are never appended to).
-            Some((base, path)) if prev_next == Some(next_seq) && last_version == FORMAT_VERSION => {
+            // share one layout; older segments are never appended to). With
+            // encryption a new segment (new frame key) is always started, so
+            // sequence numbers reused after a truncated tail never reuse a nonce.
+            Some((base, path))
+                if prev_next == Some(next_seq)
+                    && last_version == FORMAT_VERSION
+                    && !last_encrypted
+                    && opts.keys.is_none() =>
+            {
                 let f = open_append(path)?;
                 // Make recovered (possibly unsynced) bytes durable before new appends.
                 fsutil::sync_file(&f, path, false)
@@ -357,14 +441,22 @@ impl Wal {
                     .ctx(|| format!("stat {}", path.display()))?
                     .len();
                 let closed = segs[..segs.len() - 1].to_vec();
-                (f, path.clone(), *base, len, closed)
+                (f, path.clone(), *base, len, closed, HEADER_LEN as u64)
             }
             _ => {
-                // No WAL yet, or the WAL ends before the manifest (e.g. Async
-                // tail lost on power failure after a flush): start a new
-                // segment so sequence numbers never repeat.
-                let (f, path) = create_segment(dir, next_seq)?;
-                (f, path, next_seq, HEADER_LEN as u64, segs.clone())
+                // No WAL yet, the WAL ends before the manifest (e.g. Async
+                // tail lost on power failure after a flush), or encryption:
+                // start a new segment so sequence numbers never repeat in it.
+                let n = create_segment(dir, next_seq, opts.keys.as_deref())?;
+                frame_key_new = n.frame_key;
+                (
+                    n.file,
+                    n.path,
+                    next_seq,
+                    n.header_len,
+                    segs.clone(),
+                    n.header_len,
+                )
             }
         };
 
@@ -376,6 +468,8 @@ impl Wal {
                 path,
                 base_seq,
                 len,
+                header_len,
+                frame_key: frame_key_new,
                 closed,
                 next_seq,
                 written_seq: last_seq,
@@ -435,19 +529,39 @@ impl Wal {
 
         let mut g = self.inner.lock();
         Self::check_poisoned(&g)?;
-        if g.len > HEADER_LEN as u64 && g.len + frame.len() as u64 > self.opts.segment_max_bytes {
+        if g.len > g.header_len && g.len + frame.len() as u64 > self.opts.segment_max_bytes {
             self.rotate_locked(&mut g)?;
         }
         let seq = g.next_seq;
         // Everything <= durable_seq was fsynced before this frame is written.
-        format::encode_frame_into(
-            &mut frame,
-            record_type,
-            seq,
-            g.durable_seq,
-            payload.len() as u32,
-            payload_crc,
-        );
+        let synced = g.durable_seq;
+        match &g.frame_key {
+            Some(k) => {
+                // Nonce = seq under this segment's key; sealed once.
+                let aad = format::frame_aad(record_type as u8, seq, synced);
+                frame.truncate(FRAME_HEADER_LEN);
+                let mut ct = payload.to_vec();
+                k.seal(seq, &aad, &mut ct)?;
+                frame.extend_from_slice(&ct);
+                let crc = crc32c(&ct);
+                format::encode_frame_into(
+                    &mut frame,
+                    record_type,
+                    seq,
+                    synced,
+                    ct.len() as u32,
+                    crc,
+                );
+            }
+            None => format::encode_frame_into(
+                &mut frame,
+                record_type,
+                seq,
+                synced,
+                payload.len() as u32,
+                payload_crc,
+            ),
+        }
 
         failpoint::hit("wal::before_write")?;
         if let Some(action) = failpoint::eval("wal::torn_write") {
@@ -528,15 +642,17 @@ impl Wal {
         g.durable_seq = g.durable_seq.max(g.written_seq);
         self.cv.notify_all();
         let base = g.next_seq;
-        let (file, path) = create_segment(&self.dir, base).inspect_err(|e| {
+        let n = create_segment(&self.dir, base, self.opts.keys.as_deref()).inspect_err(|e| {
             Self::poison(g, format!("segment rotation failed: {e}"));
         })?;
         let old_base = g.base_seq;
-        let old_path = std::mem::replace(&mut g.path, path);
+        let old_path = std::mem::replace(&mut g.path, n.path);
         g.closed.push((old_base, old_path));
-        g.file = Arc::new(file);
+        g.file = Arc::new(n.file);
         g.base_seq = base;
-        g.len = HEADER_LEN as u64;
+        g.len = n.header_len;
+        g.header_len = n.header_len;
+        g.frame_key = n.frame_key;
         tracing::debug!(base_seq = base, "rotated WAL segment");
         Ok(())
     }

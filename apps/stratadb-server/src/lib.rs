@@ -951,7 +951,7 @@ async fn query(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> R
                     "rows_scanned": s.rows_scanned, "rows_matched": s.rows_matched,
                     "segment_bytes_read": s.bytes_read, "segments_total": s.segments_total,
                     "segments_scanned": s.segments_scanned,
-                    "segments_pruned": s.segments_pruned_time + s.segments_pruned_keys + s.segments_pruned_severity + s.segments_pruned_bloom + s.segments_pruned_cursor,
+                    "segments_pruned": s.segments_pruned_time + s.segments_pruned_keys + s.segments_pruned_severity + s.segments_pruned_bloom + s.segments_pruned_ngram + s.segments_pruned_cursor,
                     "indexes_used": s.indexes_used,
                 },
             }))

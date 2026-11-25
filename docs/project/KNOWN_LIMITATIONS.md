@@ -1,6 +1,10 @@
 # Known limitations (current state, 0.0.1)
 
 ## Not implemented
+- Encryption at rest (ADR-0024) uses a key *file* provider only (no KMS/HSM
+  integration yet); rotation is offline (CLI, server stopped); the token store
+  and audit log are not encrypted (no event data); one extra WAL segment per
+  process start when encrypted; encryption cannot be disabled once enabled.
 - HTTP server (`strata-server`) has API-token auth, TLS (rustls), and an audit
   log. No mTLS, no certificate hot-reload, no audit-log rotation, no gRPC/OTLP,
   SDKs are synchronous/blocking (Go uses contexts). Docker/compose/systemd files exist but the
@@ -13,11 +17,14 @@
 - Compaction is single-threaded with a simple size-tiered policy.
 - Retention is applied periodically (default 60 s) at segment granularity; expired
   rows stay queryable until the next run. No per-row delete API.
-- Backups are full (no incremental), unencrypted, and must be copied to another
+- Backups are full (no incremental), encrypted only when the database is
+  (ADR-0024), and must be copied to another
   failure domain by the operator. Restore is offline only.
 - Indexes: footer statistics + per-segment Bloom filters for id fields and
-  selected string attributes. No exact-match postings or inverted (token) index;
-  `LIKE` always scans. Changing the Bloom key list affects only new segments.
+  selected string attributes; trigram filters prune `LIKE`/`ILIKE` segments
+  (literal runs ≥ 3 characters, top-level conjuncts only). No exact-match
+  postings (deferred: no row groups) and no token/phrase/prefix search
+  operators. Changing Bloom or ngram settings affects only new segments.
 - Idempotency is bounded (24 h / 100 000 keys by default); retries outside
   that bound, or retries without a key, are at-least-once.
 - Disk reserve (512 MiB / 2 %) pauses writes before the volume fills; if
@@ -38,9 +45,13 @@
 - Only one internal developer-laptop baseline exists (`benchmarks/reports/`). **No performance claims are made**; no competitor comparisons.
 - Segments use LZ4 chunk compression (v2); no zstd cold tier yet. Hot attribute keys (≥ 10 % of
   rows) are shredded into columns (v3); rarer keys stay in per-row maps.
-- `WHERE` filters are vectorized (typed kernels, ADR-0006 update); projection,
-  grouping and sort keys are still evaluated per matched row, and scans are
-  single-threaded. Whole-map predicates (`attributes = …`) use the scalar path. Memtable
+- `WHERE` filters are vectorized and group keys are encoded without copies
+  (ADR-0006 updates); projection and sort keys are still materialized per
+  matched row, attribute maps of non-shredded keys are decoded for every row of
+  a scanned segment (no late materialization). Segment scans of sorted and
+  aggregate queries are parallel (ADR-0006); unsorted `LIMIT` scans, the
+  memtable and the final merge are sequential; float `sum`/`avg` may differ in
+  the last bits from a sequential scan. Whole-map predicates (`attributes = …`) use the scalar path. Memtable
   snapshots copy `Arc` handles of the tenant's rows (O(memtable rows) per query).
 - Every committed segment keeps an open file descriptor.
 - Manifest is rewritten in full on every flush.
@@ -54,4 +65,10 @@
   cannot be paginated. Rows removed by retention between pages are skipped.
 - Query memory budget is an estimate, not exact accounting.
 - `strata` CLI requires exclusive access to the data directory (no server
-  must be running) and trusts the operator-supplied `--tenant`.
+  must be running) and trusts the operator-supplied `--tenant`; this includes
+  `export`, `ingest` and `shell`. There is no HTTP export endpoint yet.
+- Export formats are NDJSON, CSV and Parquet (ADR-0025: CLI only, events only,
+  uncompressed, no resume; independent-reader interop not yet verified —
+  pyarrow/DuckDB not installed on the dev machine). CSV cannot distinguish
+  missing from null and is not formula-escaped.
+- Resumable imports rely on the idempotency window (24 h / 100 000 keys).

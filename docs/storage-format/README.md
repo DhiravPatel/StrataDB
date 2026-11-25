@@ -7,6 +7,8 @@
 | Segment | 3 (reads 1–3; provisional) | [segment-v1.md](segment-v1.md), [RFC-0001](../rfcs/0001-segment-v2-compression.md), [RFC-0002](../rfcs/0002-attribute-shredding.md) | `crates/stratadb-segment` |
 | Manifest | 1 | [manifest-v1.md](manifest-v1.md) | `crates/stratadb-storage/src/manifest.rs` |
 
+Encryption at rest: [encryption-v1.md](encryption-v1.md) (KEYRING, sealed container, encrypted WAL segments).
+
 Durability semantics: [durability.md](durability.md). Data directory layout:
 
 ```text

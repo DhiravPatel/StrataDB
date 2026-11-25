@@ -54,6 +54,9 @@ struct ServeOpts {
     /// PEM private key for --tls-cert.
     #[arg(long, env = "STRATADB_TLS_KEY")]
     tls_key: Option<PathBuf>,
+    /// Key-encryption key file: enables encryption at rest (ADR-0024).
+    #[arg(long, env = "STRATADB_KEY_FILE")]
+    key_file: Option<PathBuf>,
 }
 
 impl ServeOpts {
@@ -74,6 +77,7 @@ impl ServeOpts {
                 backup_dir: self.backup_dir.clone(),
                 default_retention_days: self.default_retention_days,
                 insecure_allow_remote_without_tls: self.insecure_allow_remote_without_tls,
+                key_file: self.key_file.clone(),
             },
         )
     }

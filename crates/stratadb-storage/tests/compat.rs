@@ -153,7 +153,7 @@ fn v1_fixture_upgrades_through_compaction() {
     o.compaction.min_inputs = 2;
     let e = Engine::open(o.clone()).unwrap();
     e.flush().unwrap(); // WAL rows → a new v2 segment next to the v1 segment
-    let m = stratadb_storage::Manifest::load(tmp.path())
+    let m = stratadb_storage::Manifest::load(tmp.path(), None)
         .unwrap()
         .unwrap();
     let versions: BTreeMap<u64, u16> = m
@@ -172,7 +172,7 @@ fn v1_fixture_upgrades_through_compaction() {
     assert!(e.compact().unwrap().groups >= 1);
     drop(e);
     let e = Engine::open(o).unwrap();
-    let m = stratadb_storage::Manifest::load(tmp.path())
+    let m = stratadb_storage::Manifest::load(tmp.path(), None)
         .unwrap()
         .unwrap();
     assert!(m

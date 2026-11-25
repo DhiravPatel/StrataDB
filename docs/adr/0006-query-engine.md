@@ -28,6 +28,25 @@ Evidence: `benchmarks/reports/2026-11-25-vectorized-ab.md` (1.2–3.5× on the
 filtered queries of the suite). Projection, grouping and sort keys are still
 evaluated per matched row.
 
+### Update 2026-11-25: allocation-free grouping
+Group keys are encoded from column data by reference into a reused buffer and
+looked up by slice; owned key values are built only for new groups. Byte
+equality with `group_key_bytes` is property-tested. Evidence:
+`benchmarks/reports/2026-11-25-grouping.md` (1.3–3.0×). Remaining: whole-map
+decoding for non-shredded keys (needs late materialization), parallel segment
+scans with partial aggregation.
+
+### Update 2026-11-25: parallel segment scans
+Sorted and aggregate queries scan segments on up to `QueryOptions::parallelism`
+(default min(CPUs, 8)) scoped threads, one partial result per segment, merged
+in segment order (rows then stable-sorted; groups merged in first-seen order;
+`AggState::merge`). Row/memory budgets are query-wide (shared atomics) and
+workers stop as soon as they are exceeded or another worker fails. Unsorted
+`LIMIT` queries stay sequential (early stop). Float `sum`/`avg` may differ from
+a sequential scan in the last bits (addition order), deterministically.
+Evidence: `benchmarks/reports/2026-11-25-parallel-ab.md` (2.2–2.6× with 3
+segments). `parallelism = 1` disables it.
+
 ## Revisit conditions
 If the supported SQL surface grows to joins/window functions, or benchmarks
 show vectorized Arrow execution is materially faster on Class B/C workloads.

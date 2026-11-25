@@ -14,6 +14,7 @@ stratadb-common.workspace = true
 stratadb-schema.workspace = true
 stratadb-wal.workspace = true
 stratadb-segment.workspace = true
+stratadb-crypto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true
@@ -22,6 +23,7 @@ sha2.workspace = true
 fs4.workspace = true
 
 [dev-dependencies]
+stratadb-crypto.workspace = true
 stratadb-common = { workspace = true, features = ["failpoints", "simfs"] }
 tempfile.workspace = true
 proptest.workspace = true

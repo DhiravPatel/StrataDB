@@ -14,16 +14,27 @@ path = "src/main.rs"
 stratadb-common.workspace = true
 stratadb-schema.workspace = true
 stratadb-storage.workspace = true
+stratadb-crypto.workspace = true
 stratadb-query.workspace = true
 stratadb-wal.workspace = true
 stratadb-segment.workspace = true
 stratadb-server = { path = "../stratadb-server" }
 fs4.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+
+# Parquet import/export (ADR-0025). No Arrow, no compression codecs:
+# ~36 crates, all permissive licenses; CLI only.
+parquet = { version = "54", default-features = false, optional = true }
+
+[features]
+default = ["parquet"]
+parquet = ["dep:parquet"]
 
 [dev-dependencies]
 tempfile.workspace = true
+parquet = { version = "54", default-features = false }
 
 [lints]
 workspace = true

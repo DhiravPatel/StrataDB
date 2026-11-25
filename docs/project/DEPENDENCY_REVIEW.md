@@ -19,6 +19,9 @@ service, and transmit no data. Licenses verified with `cargo metadata` on 2026-1
 | fs4 | 1.1 (storage) | MIT OR Apache-2.0 | free-space query without our own `unsafe` (rustix) | disk reserve |
 | rustls | 0.23 (server) | Apache-2.0 OR ISC OR MIT | TLS (ADR-0021); stable line, not the 0.24 dev prerelease | `ring` provider (Apache-2.0 AND ISC) |
 | tokio-rustls | 0.26 (server) | MIT OR Apache-2.0 | async TLS streams | |
+| ring | 0.17 | Apache-2.0 AND ISC | encryption at rest (ADR-0024): AES-256-GCM, HKDF-SHA256, CSPRNG | already present via rustls; now a direct dependency of `stratadb-crypto` |
+| zeroize | 1 | MIT OR Apache-2.0 | clears key material on drop | already in the lockfile; no transitive deps |
+| parquet | 54 (CLI, feature `parquet`, default-features off) | Apache-2.0 | Parquet import/export (ADR-0025) | no Arrow, no codecs; 36 crates on macOS; transitive licenses all permissive (incl. CC0-1.0 tiny-keccak, Unicode-3.0 unicode-ident) |
 | rcgen (dev) | 0.14 | MIT OR Apache-2.0 | test certificates | dev-only |
 | flate2 | 1 (server, SDK) | MIT OR Apache-2.0 | gzip request bodies; `rust_backend` (miniz_oxide, pure Rust) | |
 | toml | 0.9 (server) | MIT OR Apache-2.0 | config file | parse + serde only |

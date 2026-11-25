@@ -38,6 +38,7 @@ optional extensions are ignored.
 |-----|----------|------|----------|
 | 1 | no | idempotency keys | `uvarint n` × (`bytes key`, `32 B request SHA-256`, `uvarint commit_seq`, `uvarint accepted`, `ivarint committed_ms`) for batches whose rows are in this segment |
 | 2 | no | Bloom filters | see `crates/stratadb-segment/src/bloom.rs` (version byte, per-field filters over string values, hash v1 = FNV-1a-64 + SplitMix64 double hashing, k = 7, ≈ 9.6 bits/value) |
+| 3 | no | trigram filters | see `crates/stratadb-segment/src/ngram.rs`: `u8 version (=1) \| uvarint n` × (`u8 kind` 1 body / 2 attribute / 3 resource, `[bytes key]`, Bloom `u8 k \| uvarint nbits \| bytes bits`) over every 3-character window of string values, characters folded with `c.to_lowercase().next()`; same hash as tag 2. Added 2026-11-25; optional, so older readers ignore it and segment format versions are unchanged |
 
 ## Columns (id → encoding)
 | id | column | encoding |

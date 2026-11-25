@@ -11,6 +11,7 @@ failpoints = ["stratadb-common/failpoints"]
 
 [dependencies]
 stratadb-common.workspace = true
+stratadb-crypto.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
 

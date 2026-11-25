@@ -32,14 +32,13 @@ hash-chained audit log (admin actions fail closed); Bloom filters ext tag 2
 (string values only) with A/B evidence; TOML config with flag > env > file precedence.
 
 ## Exact next tasks (priority order)
-1. Token inverted index for `body` (F-005) and exact-match postings (F-004).
-2. CSV / Parquet export (§30.3), `strata shell` REPL (§22.1) — export can
-   stream via `execute_page` cursors.
-3. Encryption at rest (§18.6) behind a pluggable key provider.
-4. Query execution follow-ups: per-row projection/grouping without `Value`
-   clones (query 08/09/10 are now grouping-bound), parallel segment scans.
-5. Run the Docker image build + an OpenTelemetry Collector binary (needs Docker).
-6. Longer seeded libFuzzer campaigns (≥ 30 min/target); add a `cursor` fuzz
+1. Verify Parquet exports with an independent reader (`pip install pyarrow`, then
+   `scripts/parquet_interop_check.py`); add it to CI.
+2. Query execution follow-ups: late materialization so non-shredded
+   attribute maps are decoded only for rows that pass the filter; parallel
+   group merge (query 08 is merge-bound); intra-segment parallelism.
+3. Run the Docker image build + an OpenTelemetry Collector binary (needs Docker).
+4. Longer seeded libFuzzer campaigns (≥ 30 min/target); add a `cursor` fuzz
    target (decoder is proptested but not yet in `stratadb-fuzz::TARGETS`).
 
 Done since the last handoff: segment v3 attribute shredding (2.6–4.5× on attribute
@@ -51,7 +50,10 @@ SDK `query_pages`/`QueryAllPages`); **vectorized `WHERE` evaluation** (E-012,
 1.2–3.5× on filtered suite queries, report `2026-11-25-vectorized-ab.md`);
 **power-loss simulation** (simfs recorder, 2 428 recovered states, 0
 violations) and **WAL format v2** (`synced_through`; fixes fail-closed after
-reordered un-synced tails). Gate: see IMPLEMENTATION_STATUS.md.
+reordered un-synced tails); **trigram filters for LIKE** (F-005; postings F-004
+deferred, ADR-0005); **export/import/shell** (`strata export` with
+checkpoint/resume, idempotent `ingest --import-id`, `strata shell`); **allocation-free grouping** (1.3–3.0× on group-by
+queries); **encryption at rest** (ADR-0024); **parallel segment scans** (2.2–2.6×); **Parquet import/export** (ADR-0025). Gate: see IMPLEMENTATION_STATUS.md.
 
 ## Owner actions required
 1. Confirm license (ADR-0016) and add LICENSE.

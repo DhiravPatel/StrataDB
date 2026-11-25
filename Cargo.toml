@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/stratadb-common",
+    "crates/stratadb-crypto",
     "crates/stratadb-schema",
     "crates/stratadb-wal",
     "crates/stratadb-segment",
@@ -28,6 +29,7 @@ stratadb-schema = { path = "crates/stratadb-schema" }
 stratadb-wal = { path = "crates/stratadb-wal" }
 stratadb-segment = { path = "crates/stratadb-segment" }
 stratadb-storage = { path = "crates/stratadb-storage" }
+stratadb-crypto = { path = "crates/stratadb-crypto" }
 stratadb-query = { path = "crates/stratadb-query" }
 stratadb-testkit = { path = "crates/stratadb-testkit" }
 
@@ -43,6 +45,9 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 sha2 = "0.10"
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
+# Already in the tree via rustls (TLS); reused for encryption at rest (ADR-0024).
+ring = "0.17"
+zeroize = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

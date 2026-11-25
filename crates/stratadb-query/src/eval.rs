@@ -241,12 +241,15 @@ pub fn sort_cmp(a: &Datum, b: &Datum) -> Ordering {
     }
 }
 
+/// Group-key byte for a missing value (no value encoding starts with it).
+pub const MISSING_KEY_TAG: u8 = 0xff;
+
 /// Canonical bytes for grouping: equal datums ⇔ equal bytes. Missing and
 /// null are distinct groups.
 pub fn group_key_bytes(d: &Datum) -> Vec<u8> {
     let mut e = Encoder::new();
     match d {
-        None => e.put_u8(0xff),
+        None => e.put_u8(MISSING_KEY_TAG),
         Some(v) => stratadb_schema::codec::encode_value(&mut e, v),
     }
     e.into_inner()

@@ -712,6 +712,32 @@ mod tests {
         }
     }
 
+    fn arb_group_expr() -> impl Strategy<Value = Expr> {
+        prop_oneof![
+            4 => arb_col(),
+            1 => arb_col().prop_map(|c| Expr::TimeBucket { width_ns: 2, expr: Box::new(c) }),
+            1 => arb_leaf(),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1000))]
+
+        /// The borrowed group-key encoder is byte-identical to encoding the
+        /// evaluated (owned) datum, so grouping semantics are unchanged.
+        #[test]
+        fn group_key_into_equals_group_key_bytes(rows in arb_rows(), e in arb_group_expr()) {
+            let t = TenantId::new("ab").unwrap();
+            let b = batch(&rows, &t);
+            for i in 0..b.len {
+                let mut enc = stratadb_common::codec::Encoder::new();
+                b.group_key_into(&e, i, &mut enc).unwrap();
+                let want = eval::group_key_bytes(&crate::exec::eval_expr(&e, &b, i).unwrap());
+                prop_assert_eq!(enc.into_inner(), want, "row {} of {:?}", i, e);
+            }
+        }
+    }
+
     #[test]
     fn common_shapes_compile_without_fallback() {
         let col = |c| Box::new(Expr::Column(c));

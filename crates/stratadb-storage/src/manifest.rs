@@ -218,20 +218,48 @@ impl Manifest {
         Ok(m)
     }
 
-    /// Load `<dir>/MANIFEST`; `Ok(None)` if it does not exist.
-    pub fn load(dir: &Path) -> Result<Option<Self>> {
+    /// Load `<dir>/MANIFEST`; `Ok(None)` if it does not exist. A sealed
+    /// (encrypted) manifest needs `keys`.
+    pub fn load(dir: &Path, keys: Option<&stratadb_crypto::Keyring>) -> Result<Option<Self>> {
         let p = dir.join(MANIFEST_FILE);
         match std::fs::read(&p) {
-            Ok(b) => Self::decode(&b).map(Some),
+            Ok(b) => Self::decode_any(&b, keys).map(Some),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(Error::io(format!("reading {}", p.display()), e)),
         }
     }
 
-    /// Durably and atomically publish this manifest.
-    pub fn commit(&self, dir: &Path) -> Result<()> {
+    /// Decode plain or sealed manifest bytes.
+    pub fn decode_any(bytes: &[u8], keys: Option<&stratadb_crypto::Keyring>) -> Result<Self> {
+        if stratadb_crypto::container::is_sealed(bytes) {
+            let keys = keys.ok_or_else(|| {
+                Error::new(
+                    stratadb_common::ErrorKind::PermissionDenied,
+                    "the MANIFEST is encrypted; configure the data directory's key",
+                )
+            })?;
+            Self::decode(&stratadb_crypto::container::open_bytes(
+                keys,
+                bytes,
+                MANIFEST_FILE,
+            )?)
+        } else {
+            Self::decode(bytes)
+        }
+    }
+
+    /// Durably and atomically publish this manifest (sealed when `keys`).
+    pub fn commit(&self, dir: &Path, keys: Option<&stratadb_crypto::Keyring>) -> Result<()> {
         self.validate()?;
-        fsutil::atomic_write(&dir.join(MANIFEST_FILE), &self.encode()?, "manifest")
+        let mut bytes = self.encode()?;
+        if let Some(k) = keys {
+            bytes = stratadb_crypto::container::seal(
+                k,
+                stratadb_crypto::container::KIND_MANIFEST,
+                &bytes,
+            )?;
+        }
+        fsutil::atomic_write(&dir.join(MANIFEST_FILE), &bytes, "manifest")
     }
 }
 
@@ -282,10 +310,10 @@ mod tests {
     #[test]
     fn roundtrip_and_commit() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(Manifest::load(dir.path()).unwrap().is_none());
+        assert!(Manifest::load(dir.path(), None).unwrap().is_none());
         let m = sample();
-        m.commit(dir.path()).unwrap();
-        assert_eq!(Manifest::load(dir.path()).unwrap().unwrap(), m);
+        m.commit(dir.path(), None).unwrap();
+        assert_eq!(Manifest::load(dir.path(), None).unwrap().unwrap(), m);
     }
 
     #[test]

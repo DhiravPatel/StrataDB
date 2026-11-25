@@ -6,7 +6,7 @@ reserved for features that additionally passed an independent review / release
 gate; **nothing is VERIFIED yet.**
 
 Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
-`-D warnings` ✅, `cargo test --workspace` ✅ (230 tests, 0 failures).
+`-D warnings` ✅, `cargo test --workspace` ✅ (270 tests, 0 failures).
 
 | ID | Feature | State | Evidence | Known limitations |
 |----|---------|-------|----------|-------------------|
@@ -30,11 +30,15 @@ Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
 | E-001..E-009 | Grammar, parser, plan, scan, filter, projection, limit/sort, aggregation, EXPLAIN | TESTED | query crate (27 tests incl. reference-equivalence proptest) | no arithmetic/joins (by design) |
 | E-010 | Query budgets, timeout, cancellation | TESTED | `budgets_and_cancellation_are_enforced` | memory is an estimate |
 | E-012 | Vectorized filter evaluation (typed kernels, selection vectors, compiled `LIKE`; `enable_vectorized` switch) | TESTED | `vector::tests::vectorized_equals_scalar` (2 000 random expr × batch cases, mutation-checked with 7 injected bugs), `like_fast_path_equals_general`, engine equivalence proptest with the switch off; A/B report `benchmarks/reports/2026-11-25-vectorized-ab.md` | projection/grouping still per row; single-threaded |
+| E-013 | Allocation-free grouping (borrowed group-key encoding, slice lookup) | TESTED | `group_key_into_equals_group_key_bytes` proptest (1 000 cases; injected tag bug caught), all query equivalence tests; report `2026-11-25-grouping.md` (1.3–3.0× on group-by queries) | map decoding dominates non-shredded keys |
+| E-014 | Parallel segment scans with partial aggregation (ordered merge, query-wide budgets) | TESTED | `query/tests/parallel.rs` (2), `row_budget_stops_parallel_workers_early`, full query suite under parallelism; 4 injected bugs caught; report `2026-11-25-parallel-ab.md` (2.2–2.6×) | memtable + merge sequential; float sums not bit-identical to sequential |
 | E-011 | Stable keyset pagination (row queries; HTTP `page_size`/`cursor`; Rust/Python/Go SDK helpers) | TESTED | `query/tests/pagination.rs` (9 tests incl. proptest; mutation-checked: removing the tie-break, the `as_of` bound, the strict cursor comparison or loosening either pruning rule each fails tests), `query_pagination_over_http`, SDK conformance (ADR-0023) | aggregates/EXPLAIN not paginated; deep pages of non-time orders rescan |
 | F-001 | Segment statistics | TESTED | footer stats + `verify` | — |
 | F-002 | Timestamp pruning | TESTED | pruning tests + equivalence proptest | segments not time-partitioned |
 | F-003 | Bloom filters (ids + selected attributes) | TESTED | bloom unit tests, `bloom_filters_prune_exact_id_lookups_without_false_negatives`, equivalence proptest, A/B report | rebuild requires compaction |
-| F-004..F-008 | Exact-match postings, inverted index, index manifest/verify/rebuild | NOT_STARTED | — | — |
+| F-005 | Trigram filters for `LIKE`/`ILIKE` segment pruning (body + configured attributes) | TESTED | `ngram` unit tests incl. no-false-negative proptest vs reference LIKE, `ngram_filters_prune_like_scans_without_changing_results`, engine equivalence proptest with LIKE/ILIKE, 2 injected bugs caught; A/B report `2026-11-25-ngram-ab.md` | runs < 3 chars, `NOT LIKE`, `OR` not pruned; rebuild requires compaction |
+| F-004 | Exact-match postings | DESIGN (deferred, ADR-0005) | Bloom + vectorized scan; no row groups yet | revisit with row groups |
+| F-006..F-008 | Index manifest/verify/rebuild | NOT_STARTED | — | — |
 | G-001..G-003 | HTTP server, auth, batch ingest endpoint | TESTED | `apps/stratadb-server/tests/http.rs` (5) + auth unit tests (2) + manual curl smoke | no TLS; token reload needs restart |
 | G-004 | WAL integration of API writes | TESTED | receipts carry commit_seq + durability | — |
 | G-006 | Idempotency keys (bounded, durable) | TESTED | `storage/tests/idempotency.rs`, crash-matrix retries, `idempotent_ingest_over_http` (ADR-0019) | compaction must preserve extension tag 1 |
@@ -49,6 +53,9 @@ Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
 | H-003 | TLS (rustls, ring) | TESTED | `tests/tls.rs`, curl smoke (ADR-0021) | no mTLS / hot reload |
 | H-004 | Audit log (hash-chained) | TESTED | `audit.rs` unit test, `security_events_are_audited_without_secrets` (ADR-0022) | no rotation; tamper-evident only |
 | — | Disk reserve admission control | TESTED | `disk_reserve_pauses_writes_but_not_reads_or_flushes` | reserve measured every 200 ms |
+| — | Export (NDJSON/CSV, checkpoint/resume), idempotent import with report, `strata shell` | TESTED | `apps/stratadb-cli/tests/export_import.rs` (lossless re-import round trip, torn-page resume == one-shot, snapshot excludes later writes, no overwrite, CSV quoting, duplicate import, changed-file conflict, shell script; 2 injected bugs caught), `event_json_round_trips` proptest | CLI needs exclusive data-dir access; no HTTP export endpoint |
+| — | Parquet export/import (CLI, ADR-0025) | TESTED | `parquet_round_trip_is_lossless`, `imports_generic_parquet` (found an inexact timestamp conversion) | events only, uncompressed, no resume; pyarrow/DuckDB interop unverified (script provided) |
+| — | Encryption at rest (KEK provider, wrapped DEKs, sealed segments/manifest, encrypted WAL, rotation, encrypted backups) | TESTED | `stratadb-crypto` (8), WAL encryption tests (2), `storage/tests/encryption.rs` (6 + golden fixture), encrypted power-loss simulation (1 320 states), CLI workflow, server config test (ADR-0024) | file KEK provider only; offline rotation |
 | H-005 | Retention (per tenant, legal hold) | TESTED | `tests/maintenance.rs`, CLI + HTTP endpoints (ADR-0020) | periodic, not instantaneous |
 | H-006, H-007 | Backup, verify, restore + drills | TESTED | `tests/backup.rs`, CLI drill, HTTP backup (ADR-0010) | full backups only; no encryption |
 | H-008 | Metrics | IMPLEMENTED | `/api/v1/metrics` (Prometheus text, cluster.read) | no latency histograms; no query metrics |

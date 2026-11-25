@@ -31,6 +31,7 @@ availability of ingestion and queries.
 | Information leakage via errors | Corruption/I/O/internal errors replaced by a generic message; details logged server-side (implemented) |
 | Request floods | Body cap 8 MiB, ingest/query semaphores → 429 (implemented, tested) |
 | Credential leakage in logs | Tokens are never logged; plaintext printed only once at creation; `AppState` Debug omits token data |
-| Tampering with data files | CRC detects accidents only; tamper evidence (signatures/MAC) **not implemented** |
+| Tampering with data files | Plaintext directories: CRC detects accidents only. Encrypted directories (ADR-0024): AES-GCM authenticates every segment block, manifest and WAL frame (tampering → corruption error, never silent) |
 | Supply chain | Minimal deps, all permissive licenses, lockfile committed; `cargo audit`/`cargo deny` in CI **pending installation** |
-| Data at rest exposure | Files 0600, dirs 0700; encryption at rest **not implemented** |
+| Data at rest exposure | Files 0600, dirs 0700; optional encryption at rest (ADR-0024): segments, manifest, WAL and backups sealed with AES-256-GCM, KEK outside the data directory. Not covered: memory/swap/core dumps, file metadata, token store and audit log (no event data) |
+| Key compromise / loss | KEK file must be 0600 (enforced); KEK rotation without data rewrite; lost KEK = data loss by design (runbook) |

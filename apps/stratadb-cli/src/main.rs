@@ -11,6 +11,10 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod doctor;
+mod export;
+#[cfg(feature = "parquet")]
+mod parquet_io;
+mod shell;
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Map};
@@ -18,13 +22,29 @@ use stratadb_common::{time, Error, Result, TenantId};
 use stratadb_query::{execute, Datum, QueryOptions};
 use stratadb_schema::json::event_from_json;
 use stratadb_schema::{Limits, Value};
-use stratadb_storage::{Durability, Engine, EngineOptions, RetentionPolicy};
+use stratadb_storage::{Durability, Engine, EngineOptions, IdempotencyKey, RetentionPolicy};
 
 #[derive(Parser)]
 #[command(name = "strata", version, about = "StrataDB command-line tool")]
 struct Cli {
+    /// Key-encryption key file of an encrypted data directory (ADR-0024);
+    /// defaults to $STRATADB_KEY_FILE. Giving it for an unencrypted directory
+    /// enables encryption for new files.
+    #[arg(long, global = true)]
+    key_file: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+static KEY_FILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// The configured key provider, if any (`--key-file` or `STRATADB_KEY_FILE`).
+fn key_provider() -> Option<std::sync::Arc<dyn stratadb_crypto::KeyProvider>> {
+    KEY_FILE
+        .get()
+        .cloned()
+        .flatten()
+        .map(|p| std::sync::Arc::new(stratadb_crypto::FileKeyProvider::new(p)) as _)
 }
 
 #[derive(Subcommand)]
@@ -44,6 +64,51 @@ enum Cmd {
         file: PathBuf,
         #[arg(long, default_value_t = 500)]
         batch_size: usize,
+        /// ndjson | parquet (default: parquet for `*.parquet`, else ndjson).
+        #[arg(long)]
+        format: Option<String>,
+        /// Make the import idempotent: batch i is written with idempotency key
+        /// `import:<ID>:<i>`, so re-running an interrupted import of the same
+        /// file skips batches that already committed (within the dedup window).
+        #[arg(long)]
+        import_id: Option<String>,
+        /// Write a JSON validation report (counts and per-line errors) here.
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
+    /// Export events (or a row query) to NDJSON or CSV, with checkpoint/resume.
+    Export {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        tenant: String,
+        /// Output file (must not exist unless --resume).
+        #[arg(long)]
+        output: PathBuf,
+        /// ndjson | csv | parquet (parquet: events only, no resume)
+        #[arg(long, default_value = "ndjson")]
+        format: String,
+        /// Row query to export instead of the tenant's events.
+        #[arg(long)]
+        sql: Option<String>,
+        /// Filter for an events export, e.g. "event_time >= TIMESTAMP '2026-11-01T00:00:00Z'".
+        #[arg(long = "where")]
+        filter: Option<String>,
+        #[arg(long, default_value_t = 10_000)]
+        page_size: usize,
+        /// Continue an interrupted export from `<output>.checkpoint`.
+        #[arg(long)]
+        resume: bool,
+        /// Stop after this many pages (leaves a checkpoint; finish with --resume).
+        #[arg(long)]
+        max_pages: Option<u64>,
+    },
+    /// Interactive StrataQL shell (statements end with `;`, `\help`).
+    Shell {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        tenant: String,
     },
     /// Run a query and print one JSON object per row.
     Query {
@@ -73,7 +138,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SegCmd,
     },
-    /// Print engine status and recovery report as JSON.
     /// Merge small segments (one pass per tenant) and delete obsolete files.
     Compact {
         #[arg(long)]
@@ -109,6 +173,12 @@ enum Cmd {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Manage encryption-at-rest keys (ADR-0024).
+    Keys {
+        #[command(subcommand)]
+        cmd: KeysCmd,
+    },
+    /// Print engine status and recovery report as JSON.
     Status {
         #[arg(long)]
         data_dir: PathBuf,
@@ -168,6 +238,33 @@ enum BackupCmd {
 }
 
 #[derive(Subcommand)]
+enum KeysCmd {
+    /// Create a new random 256-bit key file (mode 0600; never overwrites).
+    Generate {
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Show whether a data directory is encrypted and with which keys.
+    Status {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Re-wrap the data keys with a new key-encryption key (no data rewrite).
+    /// Keep the old key until backups made with it have expired.
+    RotateKek {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        new_key_file: PathBuf,
+    },
+    /// Start a new data key for new files; `strata upgrade` rewrites old ones.
+    RotateDek {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum SegCmd {
     List {
         #[arg(long)]
@@ -187,6 +284,7 @@ fn open(dir: PathBuf, flush_on_close: bool) -> Result<Engine> {
     o.wal.durability = Durability::GroupCommit {
         max_delay: Duration::from_millis(1),
     };
+    o.encryption = key_provider();
     Engine::open(o)
 }
 
@@ -223,66 +321,177 @@ fn row_json(cols: &[String], row: &[Datum]) -> serde_json::Value {
     serde_json::Value::Object(m)
 }
 
-fn ingest(dir: PathBuf, t: &str, file: PathBuf, batch_size: usize) -> Result<bool> {
-    let t = tenant(t)?;
-    let reader: Box<dyn BufRead> = if file.as_os_str() == "-" {
-        Box::new(std::io::stdin().lock())
-    } else {
-        Box::new(std::io::BufReader::new(
-            std::fs::File::open(&file)
-                .map_err(|e| Error::io(format!("opening {}", file.display()), e))?,
-        ))
-    };
-    let engine = open(dir, true)?;
-    let lim = Limits::default();
-    let (mut accepted, mut rejected) = (0usize, 0usize);
-    let (mut first_seq, mut last_seq) = (None, 0u64);
-    let mut batch = Vec::with_capacity(batch_size.max(1));
-    let mut level = "none";
-    let mut flush_batch = |batch: &mut Vec<_>| -> Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-        let n = batch.len();
-        let r = engine.write_batch(&t, std::mem::take(batch))?;
-        accepted += n;
-        first_seq.get_or_insert(r.commit_seq);
-        last_seq = r.commit_seq;
-        level = r.level.as_str();
-        Ok(())
-    };
-    for (lineno, line) in reader.lines().enumerate() {
-        let line = line.map_err(|e| Error::io("reading input", e))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let parsed = serde_json::from_str::<serde_json::Value>(&line)
-            .map_err(|e| Error::invalid_input(format!("invalid JSON: {e}")))
-            .and_then(|v| event_from_json(&v, &t, time::now_unix_nanos(), &lim));
-        match parsed {
+/// Most per-line errors kept in an ingest report.
+const MAX_REPORTED_ERRORS: usize = 10_000;
+
+/// Batching, idempotency keys and error collection shared by NDJSON and
+/// Parquet imports.
+struct Importer<'e> {
+    engine: &'e Engine,
+    tenant: TenantId,
+    lim: Limits,
+    batch_size: usize,
+    import_id: Option<String>,
+    batch: Vec<stratadb_schema::Event>,
+    digest: sha2::Sha256,
+    batch_no: u64,
+    accepted: usize,
+    rejected: usize,
+    duplicate_batches: usize,
+    first_seq: Option<u64>,
+    last_seq: u64,
+    level: &'static str,
+    errors: Vec<serde_json::Value>,
+}
+
+impl Importer<'_> {
+    /// One input record (1-based `line`; `raw` feeds the batch digest).
+    fn add(&mut self, line: usize, parsed: Result<serde_json::Value>, raw: &[u8]) -> Result<()> {
+        use sha2::Digest;
+        let ev = parsed
+            .and_then(|v| event_from_json(&v, &self.tenant, time::now_unix_nanos(), &self.lim));
+        match ev {
             Ok(ev) => {
-                batch.push(ev);
-                if batch.len() >= batch_size.max(1) {
-                    flush_batch(&mut batch)?;
+                self.digest.update(raw);
+                self.digest.update(b"\n");
+                self.batch.push(ev);
+                if self.batch.len() >= self.batch_size.max(1) {
+                    self.flush()?;
                 }
             }
             Err(e) => {
-                rejected += 1;
-                eprintln!(
-                    "{}",
-                    json!({"line": lineno + 1, "error": e.kind().as_str(), "message": e.to_string()})
-                );
+                self.rejected += 1;
+                let err =
+                    json!({"line": line, "error": e.kind().as_str(), "message": e.to_string()});
+                eprintln!("{err}");
+                if self.errors.len() < MAX_REPORTED_ERRORS {
+                    self.errors.push(err);
+                }
             }
         }
+        Ok(())
     }
-    flush_batch(&mut batch)?;
+
+    fn flush(&mut self) -> Result<()> {
+        use sha2::Digest;
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        let n = self.batch.len();
+        let d: [u8; 32] = std::mem::take(&mut self.digest).finalize().into();
+        let key = self
+            .import_id
+            .as_ref()
+            .map(|id| IdempotencyKey::new(format!("import:{id}:{}", self.batch_no), d))
+            .transpose()?;
+        self.batch_no += 1;
+        let r = self.engine.write_batch_idempotent(
+            &self.tenant,
+            std::mem::take(&mut self.batch),
+            key,
+        )?;
+        if r.duplicate {
+            self.duplicate_batches += 1;
+        } else {
+            self.accepted += n;
+        }
+        self.first_seq.get_or_insert(r.commit_seq);
+        self.last_seq = r.commit_seq;
+        self.level = r.level.as_str();
+        Ok(())
+    }
+}
+
+fn ingest(
+    dir: PathBuf,
+    t: &str,
+    file: PathBuf,
+    batch_size: usize,
+    format: Option<String>,
+    import_id: Option<String>,
+    report: Option<PathBuf>,
+) -> Result<bool> {
+    let t = tenant(t)?;
+    if let Some(id) = &import_id {
+        // Keys are `import:<id>:<batch>`; the same rules as idempotency keys.
+        IdempotencyKey::new(format!("import:{id}:0"), [0; 32])?;
+    }
+    if let Some(r) = &report {
+        if r.exists() {
+            return Err(Error::invalid_input(format!(
+                "report {} exists; refusing to overwrite it",
+                r.display()
+            )));
+        }
+    }
+    let parquet = match format.as_deref() {
+        Some("parquet") => true,
+        Some("ndjson" | "jsonl") => false,
+        Some(f) => return Err(Error::invalid_input(format!("unknown --format {f:?}"))),
+        None => file.extension().is_some_and(|e| e == "parquet"),
+    };
+    let engine = open(dir, true)?;
+    let mut imp = Importer {
+        engine: &engine,
+        tenant: t,
+        lim: Limits::default(),
+        batch_size,
+        import_id,
+        batch: Vec::with_capacity(batch_size.max(1)),
+        digest: Default::default(),
+        batch_no: 0,
+        accepted: 0,
+        rejected: 0,
+        duplicate_batches: 0,
+        first_seq: None,
+        last_seq: 0,
+        level: "none",
+        errors: Vec::new(),
+    };
+    if parquet {
+        #[cfg(feature = "parquet")]
+        parquet_io::read_rows(&file, |i, row| {
+            let raw = row.as_ref().map(|v| v.to_string()).unwrap_or_default();
+            imp.add(i + 1, row, raw.as_bytes())
+        })?;
+        #[cfg(not(feature = "parquet"))]
+        return Err(Error::unsupported("this build has no Parquet support"));
+    } else {
+        let reader: Box<dyn BufRead> = if file.as_os_str() == "-" {
+            Box::new(std::io::stdin().lock())
+        } else {
+            Box::new(std::io::BufReader::new(
+                std::fs::File::open(&file)
+                    .map_err(|e| Error::io(format!("opening {}", file.display()), e))?,
+            ))
+        };
+        for (lineno, line) in reader.lines().enumerate() {
+            let line = line.map_err(|e| Error::io("reading input", e))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parsed = serde_json::from_str::<serde_json::Value>(&line)
+                .map_err(|e| Error::invalid_input(format!("invalid JSON: {e}")));
+            imp.add(lineno + 1, parsed, line.as_bytes())?;
+        }
+    }
+    imp.flush()?;
+    let (accepted, rejected) = (imp.accepted, imp.rejected);
+    let summary = json!({"accepted": accepted, "rejected": rejected,
+           "duplicate_batches": imp.duplicate_batches, "batches": imp.batch_no,
+           "first_commit_seq": imp.first_seq, "last_commit_seq": imp.last_seq, "durability": imp.level,
+           "import_id": imp.import_id,
+           "state": "committed to WAL and flushed to segments"});
+    let errors = std::mem::take(&mut imp.errors);
+    drop(imp);
     engine.close()?;
-    println!(
-        "{}",
-        json!({"accepted": accepted, "rejected": rejected, "first_commit_seq": first_seq,
-               "last_commit_seq": last_seq, "durability": level,
-               "state": "committed to WAL and flushed to segments"})
-    );
+    if let Some(r) = &report {
+        let mut full = summary.clone();
+        full["errors"] = serde_json::Value::Array(errors);
+        full["errors_truncated"] = json!(rejected.saturating_sub(MAX_REPORTED_ERRORS));
+        stratadb_common::fsutil::atomic_write(r, full.to_string().as_bytes(), "ingest_report")?;
+    }
+    println!("{summary}");
     Ok(rejected == 0)
 }
 
@@ -303,7 +512,78 @@ fn run(cli: Cli) -> Result<bool> {
             tenant,
             file,
             batch_size,
-        } => return ingest(data_dir, &tenant, file, batch_size),
+            format,
+            import_id,
+            report,
+        } => {
+            return ingest(
+                data_dir, &tenant, file, batch_size, format, import_id, report,
+            )
+        }
+        Cmd::Export {
+            data_dir,
+            tenant: t,
+            output,
+            format,
+            sql,
+            filter,
+            page_size,
+            resume,
+            max_pages,
+        } => {
+            if page_size == 0 || page_size > 100_000 {
+                return Err(Error::invalid_input("--page-size must be 1..=100000"));
+            }
+            if format == "parquet" {
+                if sql.is_some() || resume || max_pages.is_some() {
+                    return Err(Error::invalid_input(
+                        "Parquet export writes events only (use --where to filter) and cannot \
+                         be resumed or split (--sql, --resume, --max-pages)",
+                    ));
+                }
+                #[cfg(feature = "parquet")]
+                {
+                    let engine = open(data_dir, false)?;
+                    let summary = parquet_io::export(
+                        &engine,
+                        &tenant(&t)?,
+                        filter.as_deref(),
+                        &output,
+                        page_size,
+                    )?;
+                    engine.close()?;
+                    println!("{summary}");
+                    return Ok(true);
+                }
+                #[cfg(not(feature = "parquet"))]
+                return Err(Error::unsupported("this build has no Parquet support"));
+            }
+            let args = export::Args {
+                tenant: tenant(&t)?,
+                sql,
+                filter,
+                format: export::Format::parse(&format)?,
+                output,
+                page_size,
+                resume,
+                max_pages,
+            };
+            let engine = open(data_dir, false)?;
+            let summary = export::run(&engine, &args)?;
+            engine.close()?;
+            println!("{summary}");
+        }
+        Cmd::Shell {
+            data_dir,
+            tenant: t,
+        } => {
+            let t = tenant(&t)?;
+            let engine = open(data_dir, true)?;
+            let stdout = std::io::stdout();
+            let ok = shell::run(&engine, &t, std::io::stdin().lock(), &mut stdout.lock())?;
+            engine.close()?;
+            return Ok(ok);
+        }
         Cmd::Query {
             data_dir,
             tenant: t,
@@ -357,7 +637,7 @@ fn run(cli: Cli) -> Result<bool> {
         Cmd::Segments {
             cmd: SegCmd::List { data_dir },
         } => {
-            let m = stratadb_storage::Manifest::load(&data_dir)?
+            let m = stratadb_storage::Manifest::load(&data_dir, None)?
                 .ok_or_else(|| Error::not_found("no MANIFEST in data directory"))?;
             for s in &m.segments {
                 println!(
@@ -433,7 +713,7 @@ fn run(cli: Cli) -> Result<bool> {
                 e.close()?;
             }
             RetCmd::Inspect { data_dir } => {
-                let m = stratadb_storage::Manifest::load(&data_dir)?
+                let m = stratadb_storage::Manifest::load(&data_dir, None)?
                     .ok_or_else(|| Error::not_found("no MANIFEST in data directory"))?;
                 for (t, p) in &m.retention {
                     println!(
@@ -467,7 +747,7 @@ fn run(cli: Cli) -> Result<bool> {
                 e.close()?;
             }
             BackupCmd::Verify { path } => {
-                let m = stratadb_storage::verify_backup(&path)?;
+                let m = stratadb_storage::verify_backup(&path, key_provider().as_deref())?;
                 println!(
                     "{}",
                     json!({"result": "ok", "manifest_version": m.manifest_version,
@@ -476,7 +756,7 @@ fn run(cli: Cli) -> Result<bool> {
                 );
             }
             BackupCmd::Restore { path, data_dir } => {
-                let r = stratadb_storage::restore_backup(&path, &data_dir)?;
+                let r = stratadb_storage::restore_backup(&path, &data_dir, key_provider())?;
                 println!(
                     "{}",
                     json!({"data_dir": r.data_dir, "restored_manifest_version": r.manifest_version,
@@ -504,7 +784,7 @@ fn run(cli: Cli) -> Result<bool> {
             if !dry_run {
                 if let Some(dir) = &backup_to {
                     let r = e.backup(dir)?;
-                    stratadb_storage::verify_backup(dir)?;
+                    stratadb_storage::verify_backup(dir, None)?;
                     backup =
                         Some(json!({"path": r.path, "segments": r.segments, "verified": true}));
                 }
@@ -536,8 +816,9 @@ fn run(cli: Cli) -> Result<bool> {
             );
             e.close()?;
         }
+        Cmd::Keys { cmd } => return keys(cmd),
         Cmd::Doctor { data_dir } => {
-            let r = doctor::run(&data_dir);
+            let r = doctor::run(&data_dir, key_provider().as_deref());
             let worst = r.worst();
             println!(
                 "{}",
@@ -571,8 +852,89 @@ fn run(cli: Cli) -> Result<bool> {
     Ok(true)
 }
 
+fn keys(cmd: KeysCmd) -> Result<bool> {
+    use stratadb_crypto::{FileKeyProvider, Keyring};
+    let need_key = || {
+        key_provider().ok_or_else(|| {
+            Error::invalid_input("this command needs the current key: pass --key-file")
+        })
+    };
+    let require_encrypted = |dir: &std::path::Path| {
+        if Keyring::exists(dir) {
+            Ok(())
+        } else {
+            Err(Error::invalid_input(
+                "the data directory is not encrypted (no KEYRING); open it once with --key-file to enable encryption",
+            ))
+        }
+    };
+    match cmd {
+        KeysCmd::Generate { output } => {
+            let k = stratadb_crypto::generate_key_file(&output)?;
+            println!(
+                "{}",
+                json!({"key_file": output, "key_id": k.fingerprint(),
+                       "note": "store this file outside the data directory and back it up separately; without it encrypted data and backups cannot be read"})
+            );
+        }
+        KeysCmd::Status { data_dir } => {
+            if !Keyring::exists(&data_dir) {
+                println!("{}", json!({"encrypted": false}));
+                return Ok(true);
+            }
+            let p = need_key()?;
+            let k = Keyring::load(&data_dir, p.as_ref())?
+                .ok_or_else(|| Error::internal("KEYRING disappeared"))?;
+            println!(
+                "{}",
+                json!({"encrypted": true, "key_id": k.kek_id(), "data_keys": k.dek_ids(),
+                       "active_data_key": k.active().0})
+            );
+        }
+        KeysCmd::RotateKek {
+            data_dir,
+            new_key_file,
+        } => {
+            require_encrypted(&data_dir)?;
+            let p = need_key()?;
+            // Opening proves exclusive access and the current key.
+            let e = open(data_dir.clone(), false)?;
+            let mut k = Keyring::load(&data_dir, p.as_ref())?
+                .ok_or_else(|| Error::internal("KEYRING disappeared"))?;
+            k.rotate_kek(&data_dir, &FileKeyProvider::new(&new_key_file))?;
+            e.close()?;
+            println!(
+                "{}",
+                json!({"rotated": "key-encryption key", "key_id": k.kek_id(),
+                       "note": "use the new key file from now on; keep the old one for older backups"})
+            );
+        }
+        KeysCmd::RotateDek { data_dir } => {
+            require_encrypted(&data_dir)?;
+            let p = need_key()?;
+            let e = open(data_dir.clone(), false)?;
+            let mut k = Keyring::load(&data_dir, p.as_ref())?
+                .ok_or_else(|| Error::internal("KEYRING disappeared"))?;
+            let id = k.rotate_dek(&data_dir)?;
+            e.close()?;
+            println!(
+                "{}",
+                json!({"rotated": "data key", "active_data_key": id,
+                       "note": "new files use the new data key; run `strata upgrade` to rewrite older segments"})
+            );
+        }
+    }
+    Ok(true)
+}
+
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    let key = cli
+        .key_file
+        .clone()
+        .or_else(|| std::env::var_os("STRATADB_KEY_FILE").map(PathBuf::from));
+    let _ = KEY_FILE.set(key);
+    match run(cli) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(3),
         Err(e) => {

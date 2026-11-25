@@ -17,6 +17,7 @@
 
 pub mod bloom;
 mod columns;
+pub mod ngram;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -544,6 +545,24 @@ pub fn write_segment_opts(
     extensions: Vec<Extension>,
     opts: &WriteOptions,
 ) -> Result<WrittenSegment> {
+    write_segment_sealed(
+        path, segment_id, tenant, rows, created_ms, extensions, opts, None,
+    )
+}
+
+/// Like [`write_segment_opts`]; with `keys`, the file is written as a sealed
+/// container (encryption at rest, ADR-0024) of the same segment bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn write_segment_sealed(
+    path: &Path,
+    segment_id: u64,
+    tenant: &TenantId,
+    rows: &mut [RowRef<'_>],
+    created_ms: i64,
+    extensions: Vec<Extension>,
+    opts: &WriteOptions,
+    keys: Option<&stratadb_crypto::Keyring>,
+) -> Result<WrittenSegment> {
     if rows.is_empty() {
         return Err(Error::internal("refusing to write an empty segment"));
     }
@@ -697,7 +716,11 @@ pub fn write_segment_opts(
     body.put_u32(u32::try_from(fbytes.len()).map_err(|_| Error::internal("footer too large"))?);
     body.put_u32(footer_crc);
     body.put_raw(&MAGIC);
-    let bytes = body.into_inner();
+    let mut bytes = body.into_inner();
+    if let Some(k) = keys {
+        bytes =
+            stratadb_crypto::container::seal(k, stratadb_crypto::container::KIND_SEGMENT, &bytes)?;
+    }
 
     let tmp = fsutil::tmp_path(path);
     fsutil::remove_if_exists(&tmp)?;
@@ -724,28 +747,71 @@ pub fn write_segment_opts(
     })
 }
 
+/// Plain file or sealed (encrypted) container.
+#[derive(Debug)]
+enum Source {
+    Plain(File),
+    Sealed(Box<stratadb_crypto::container::SealedFile>),
+}
+
+impl Source {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64, loc: &str) -> Result<()> {
+        match self {
+            Source::Plain(f) => f
+                .read_exact_at(buf, offset)
+                .ctx(|| format!("reading {loc}")),
+            Source::Sealed(s) => s.read_exact_at(buf, offset),
+        }
+    }
+}
+
 /// Read access to one segment file. Opening validates header, trailer and
 /// footer checksum; column chunks are checksummed when read.
 #[derive(Debug)]
 pub struct SegmentReader {
     path: PathBuf,
-    file: File,
+    file: Source,
+    /// Logical (plaintext) segment length.
     file_len: u64,
     footer: Footer,
     footer_crc: u32,
 }
 
 impl SegmentReader {
+    /// Open a plaintext segment (a sealed one needs [`SegmentReader::open_with`]).
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, None)
+    }
+
+    /// Open a segment; sealed (encrypted) segments are decrypted with `keys`.
+    pub fn open_with(path: &Path, keys: Option<&stratadb_crypto::Keyring>) -> Result<Self> {
         let loc = path.display().to_string();
-        let file = File::open(path).ctx(|| format!("opening segment {loc}"))?;
-        let file_len = file.metadata().ctx(|| format!("stat {loc}"))?.len();
+        let raw = File::open(path).ctx(|| format!("opening segment {loc}"))?;
+        let mut magic = [0u8; 8];
+        let sealed = raw.read_exact_at(&mut magic, 0).is_ok()
+            && stratadb_crypto::container::is_sealed(&magic);
+        let file = if sealed {
+            let keys = keys.ok_or_else(|| {
+                Error::new(
+                    stratadb_common::ErrorKind::PermissionDenied,
+                    format!("{loc} is encrypted; configure the data directory's key"),
+                )
+            })?;
+            Source::Sealed(Box::new(stratadb_crypto::container::SealedFile::open(
+                raw, keys, path,
+            )?))
+        } else {
+            Source::Plain(raw)
+        };
+        let file_len = match &file {
+            Source::Plain(f) => f.metadata().ctx(|| format!("stat {loc}"))?.len(),
+            Source::Sealed(s) => s.len(),
+        };
         if file_len < (HEADER_LEN + TRAILER_LEN) as u64 {
             return Err(Error::corruption(&loc, "file too short to be a segment"));
         }
         let mut header = [0u8; HEADER_LEN];
-        file.read_exact_at(&mut header, 0)
-            .ctx(|| format!("reading header of {loc}"))?;
+        file.read_exact_at(&mut header, 0, &loc)?;
         if header[0..8] != MAGIC {
             return Err(Error::corruption(&loc, "bad segment header magic"));
         }
@@ -763,8 +829,7 @@ impl SegmentReader {
             )));
         }
         let mut trailer = [0u8; TRAILER_LEN];
-        file.read_exact_at(&mut trailer, file_len - TRAILER_LEN as u64)
-            .ctx(|| format!("reading trailer of {loc}"))?;
+        file.read_exact_at(&mut trailer, file_len - TRAILER_LEN as u64, &loc)?;
         if trailer[8..16] != MAGIC {
             return Err(Error::corruption(
                 &loc,
@@ -783,8 +848,7 @@ impl SegmentReader {
         }
         let footer_off = file_len - (TRAILER_LEN + footer_len) as u64;
         let mut fb = vec![0u8; footer_len];
-        file.read_exact_at(&mut fb, footer_off)
-            .ctx(|| format!("reading footer of {loc}"))?;
+        file.read_exact_at(&mut fb, footer_off, &loc)?;
         if crc32c(&fb) != footer_crc {
             return Err(Error::corruption(&loc, "footer checksum mismatch"));
         }
@@ -828,8 +892,14 @@ impl SegmentReader {
         self.footer_crc
     }
 
+    /// Logical (plaintext) segment length.
     pub fn file_len(&self) -> u64 {
         self.file_len
+    }
+
+    /// Whether the file is a sealed (encrypted) container.
+    pub fn is_sealed(&self) -> bool {
+        matches!(self.file, Source::Sealed(_))
     }
 
     /// Read one stored chunk, verify its CRC, and decompress it (bounded).
@@ -845,9 +915,7 @@ impl SegmentReader {
         let loc = self.path.display().to_string();
         let len = usize::try_from(len).map_err(|_| Error::corruption(&loc, "chunk too big"))?;
         let mut buf = vec![0u8; len];
-        self.file
-            .read_exact_at(&mut buf, offset)
-            .ctx(|| format!("reading {what} of {loc}"))?;
+        self.file.read_exact_at(&mut buf, offset, &loc)?;
         if crc32c(&buf) != crc {
             return Err(Error::corruption(&loc, format!("{what} checksum mismatch")));
         }

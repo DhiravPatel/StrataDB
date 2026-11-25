@@ -114,6 +114,27 @@ impl Bloom {
     pub fn size_bytes(&self) -> usize {
         self.bits.len()
     }
+
+    /// `u8 k | uvarint nbits | bytes bitset`.
+    pub fn encode_into(&self, e: &mut Encoder) {
+        e.put_u8(self.k);
+        e.put_uvarint(self.nbits);
+        e.put_bytes(&self.bits);
+    }
+
+    /// Inverse of [`Bloom::encode_into`], validating parameters.
+    pub fn decode_from(d: &mut Decoder<'_>, max_bytes: usize) -> Result<Self> {
+        let k = d.get_u8()?;
+        let nbits = d.get_uvarint()?;
+        let bits = d.get_bytes(max_bytes)?.to_vec();
+        if k == 0 || k > 32 || nbits == 0 || bits.len() as u64 != nbits.div_ceil(8) {
+            return Err(Error::corruption(
+                "bloom filter",
+                "inconsistent filter parameters",
+            ));
+        }
+        Ok(Self { k, nbits, bits })
+    }
 }
 
 /// All filters of one segment.
@@ -208,9 +229,7 @@ impl BloomSet {
                     e.put_str(k);
                 }
             }
-            e.put_u8(b.k);
-            e.put_uvarint(b.nbits);
-            e.put_bytes(&b.bits);
+            b.encode_into(&mut e);
         }
         Extension {
             tag: EXT_BLOOM,
@@ -237,13 +256,7 @@ impl BloomSet {
                 5 => BloomField::Resource(d.get_string(1024)?),
                 _ => return Err(bad("unknown field kind")),
             };
-            let k = d.get_u8()?;
-            let nbits = d.get_uvarint()?;
-            let bits = d.get_bytes(data.len())?.to_vec();
-            if k == 0 || k > 32 || nbits == 0 || bits.len() as u64 != nbits.div_ceil(8) {
-                return Err(bad("inconsistent filter parameters"));
-            }
-            filters.insert(f, Bloom { k, nbits, bits });
+            filters.insert(f, Bloom::decode_from(&mut d, data.len())?);
         }
         d.expect_end()?;
         Ok(Self { filters })

@@ -52,10 +52,10 @@ Maps spec requirements → tasks → acceptance tests. Status: ✅ tested ·
 | §17 | Caching | — | OS page cache only | ☐ |
 | §18.2–18.4 | API tokens, RBAC, tenant from principal | H-001, H-002 | auth unit tests, `authentication_and_authorization_are_enforced`, `tenant_isolation_across_the_api` | ◐ (no rotation without restart, no OIDC/mTLS) |
 | §18.5 | TLS | H-003 | `tests/tls.rs` | ◐ (no mTLS for cluster links yet) |
-| §18.6 | Encryption at rest | — | — | ☐ |
+| §18.6 | Encryption at rest | — | `stratadb-crypto` tests, `stratadb-storage/tests/encryption.rs`, encrypted power-loss simulation, CLI `tests/encryption.rs`, fixture `encrypted-v1` (ADR-0024) | ✅ (file KEK provider; no KMS) |
 | §18.7 | Audit log | H-004 | audit tests | ✅ |
 | §28.4 | Disk safety (reserve, refuse before exhaustion) | — | `disk_reserve_pauses_writes_but_not_reads_or_flushes` | ◐ (no read-only emergency mode switch) |
-| §19 | Backup/verify/restore + drills | H-006, H-007 | `tests/backup.rs`, CLI drill, runbook | ◐ (no incremental, no encryption, no old-version backup yet) |
+| §19 | Backup/verify/restore + drills | H-006, H-007 | `tests/backup.rs`, CLI drill, runbook | ◐ (no incremental, no old-version backup yet; encrypted backups ✅) |
 | §20 | Distributed | I-* | — | ⏸ |
 | §21 | HTTP API incl. query status/cancel, OpenAPI | G-001 | `docs/api/openapi.json`, http tests | ✅ |
 | §22 | CLI incl. `doctor` (§22.3) | H-009 | `apps/stratadb-cli/tests/{cli,doctor}.rs` | ◐ (no `shell`, no fd/TLS-expiry checks in doctor) |

@@ -30,12 +30,17 @@
 //! disk_reserve_ratio = 0.02
 //! default_retention_days = 30          # omit to keep data indefinitely
 //! bloom_attribute_keys = ["request_id", "user_id", "session_id", "correlation_id"]
+//! ngram_index = true                   # trigram filters on body for LIKE/ILIKE
+//! ngram_attribute_keys = []            # string attributes to index the same way
 //!
 //! [backup]
 //! dir = "/var/backups/stratadb"        # enables POST /api/v1/admin/backup
 //!
 //! [security]
 //! insecure_allow_remote_without_tls = false
+//!
+//! [encryption]
+//! key_file = "/etc/stratadb/kek.hex"    # enables encryption at rest (ADR-0024)
 //! ```
 
 use std::net::SocketAddr;
@@ -68,6 +73,17 @@ pub struct FileConfig {
     pub security: SecuritySection,
     #[serde(default)]
     pub quotas: QuotasSection,
+    #[serde(default)]
+    pub encryption: EncryptionSection,
+}
+
+/// `[encryption]` — encryption at rest (ADR-0024).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EncryptionSection {
+    /// File holding the 256-bit key-encryption key as 64 hex characters
+    /// (mode 0600; create with `strata keys generate`).
+    pub key_file: Option<PathBuf>,
 }
 
 /// `[quotas]` defaults plus `[quotas.tenants.<id>]` overrides.
@@ -116,6 +132,8 @@ pub struct StorageSection {
     pub disk_reserve_ratio: Option<f64>,
     pub default_retention_days: Option<u64>,
     pub bloom_attribute_keys: Option<Vec<String>>,
+    pub ngram_index: Option<bool>,
+    pub ngram_attribute_keys: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -175,6 +193,7 @@ pub struct Overrides {
     pub backup_dir: Option<PathBuf>,
     pub default_retention_days: Option<u64>,
     pub insecure_allow_remote_without_tls: bool,
+    pub key_file: Option<PathBuf>,
 }
 
 pub fn parse_durability(s: &str) -> Result<Durability> {
@@ -325,6 +344,21 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
     let s = &file.storage;
     let mut engine = EngineOptions::new(&data_dir);
     engine.wal.durability = durability;
+    if let Some(k) = o
+        .key_file
+        .clone()
+        .or_else(|| file.encryption.key_file.clone())
+    {
+        if !k.is_file() {
+            return Err(Error::invalid_input(format!(
+                "encryption key file {} does not exist",
+                k.display()
+            )));
+        }
+        engine.encryption = Some(std::sync::Arc::new(stratadb_crypto::FileKeyProvider::new(
+            k,
+        )));
+    }
     if let Some(v) = positive("storage.memtable_max_bytes", s.memtable_max_bytes)? {
         engine.memtable_max_bytes = v;
     }
@@ -354,6 +388,17 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
             ));
         }
         engine.bloom_attribute_keys = k.clone();
+    }
+    if let Some(b) = s.ngram_index {
+        engine.ngram_enabled = b;
+    }
+    if let Some(k) = &s.ngram_attribute_keys {
+        if k.iter().any(String::is_empty) {
+            return Err(Error::invalid_input(
+                "storage.ngram_attribute_keys must not contain empty keys",
+            ));
+        }
+        engine.ngram_attribute_keys = k.clone();
     }
     Ok(Resolved {
         data_dir,
@@ -390,8 +435,11 @@ impl Resolved {
                 "disk_reserve_ratio": self.engine.disk_reserve_ratio,
                 "default_retention_days": self.engine.default_retention.map(|d| d.as_secs() / 86_400),
                 "bloom_attribute_keys": self.engine.bloom_attribute_keys,
+                "ngram_index": self.engine.ngram_enabled,
+                "ngram_attribute_keys": self.engine.ngram_attribute_keys,
             },
             "backup_dir": self.server.backup_root,
+            "encryption": self.engine.encryption.as_ref().map(|p| p.describe()),
             "quotas": {
                 "default": format!("{:?}", self.server.quotas.default),
                 "tenants": self.server.quotas.tenants.iter().map(|(k, v)| (k.clone(), format!("{v:?}"))).collect::<std::collections::BTreeMap<_, _>>(),
@@ -416,7 +464,7 @@ mod tests {
     fn full_file_and_precedence() {
         let f = parse(
             "config_version = 1\ndata_dir = \"/d\"\nlisten = \"127.0.0.1:9000\"\ndurability = \"sync\"\n\
-             [limits]\nmax_query_rows = 5\n[storage]\ndefault_retention_days = 7\nbloom_attribute_keys = [\"k\"]\n",
+             [limits]\nmax_query_rows = 5\n[storage]\ndefault_retention_days = 7\nbloom_attribute_keys = [\"k\"]\nngram_index = false\nngram_attribute_keys = [\"msg\"]\n",
         )
         .unwrap();
         let r = resolve(&f, &Overrides::default()).unwrap();
@@ -428,6 +476,8 @@ mod tests {
             Some(Duration::from_secs(7 * 86_400))
         );
         assert_eq!(r.engine.bloom_attribute_keys, vec!["k"]);
+        assert!(!r.engine.ngram_enabled);
+        assert_eq!(r.engine.ngram_attribute_keys, vec!["msg"]);
         // Flags beat the file.
         let o = Overrides {
             listen: Some("127.0.0.1:1".parse().unwrap()),
@@ -437,6 +487,31 @@ mod tests {
         let r = resolve(&f, &o).unwrap();
         assert_eq!((r.listen.port(), r.durability), (1, Durability::Async));
         assert!(r.display().to_string().contains("\"max_query_rows\":5"));
+    }
+
+    #[test]
+    fn encryption_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("kek.hex");
+        let f = parse(&format!(
+            "config_version = 1\ndata_dir = \"/d\"\n[encryption]\nkey_file = \"{}\"\n",
+            key.display()
+        ))
+        .unwrap();
+        assert!(
+            resolve(&f, &Overrides::default()).is_err(),
+            "missing key file"
+        );
+        stratadb_crypto::generate_key_file(&key).unwrap();
+        let r = resolve(&f, &Overrides::default()).unwrap();
+        assert!(r.engine.encryption.is_some());
+        let shown = r.display().to_string();
+        assert!(shown.contains("kek.hex"), "{shown}");
+        let secret = std::fs::read_to_string(&key).unwrap();
+        assert!(
+            !shown.contains(secret.trim()),
+            "key material must never be displayed"
+        );
     }
 
     #[test]

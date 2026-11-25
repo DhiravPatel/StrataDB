@@ -11,6 +11,7 @@ stratadb-common.workspace = true
 stratadb-schema.workspace = true
 stratadb-wal.workspace = true
 stratadb-segment.workspace = true
+stratadb-crypto.workspace = true
 stratadb-storage.workspace = true
 stratadb-query.workspace = true
 stratadb-server = { path = "../../apps/stratadb-server" }

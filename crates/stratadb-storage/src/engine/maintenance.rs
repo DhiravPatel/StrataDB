@@ -64,6 +64,7 @@ pub struct CompactionReport {
 pub struct UpgradeReport {
     /// Segments per on-disk format version before the run.
     pub versions_before: BTreeMap<u16, usize>,
+    /// Segments rewritten (older format, or plaintext while encryption is on).
     pub segments_upgraded: usize,
     pub bytes_before: u64,
     pub bytes_after: u64,
@@ -139,7 +140,7 @@ impl Shared {
                 .collect();
             let extensions = self.segment_extensions(&refs, &metas);
             let created_ms = now_ms;
-            let ws = stratadb_segment::write_segment_opts(
+            let ws = stratadb_segment::write_segment_sealed(
                 &path,
                 id,
                 tenant,
@@ -147,6 +148,7 @@ impl Shared {
                 created_ms,
                 extensions,
                 &self.segment_write_options(),
+                self.keys.as_deref(),
             )?;
             failpoint::hit("compaction::after_output_write")?;
             let f = &ws.footer;
@@ -167,7 +169,7 @@ impl Shared {
                 state: SegmentState::Committed,
                 lineage: input_ids.iter().copied().collect(),
             };
-            let handle = match open_segment(&self.dir, &entry, true) {
+            let handle = match open_segment(&self.dir, &entry, true, self.keys.as_deref()) {
                 Ok(h) => h,
                 Err(e) => {
                     let _ = fsutil::remove_if_exists(&path);
@@ -184,7 +186,7 @@ impl Shared {
                 id: h.entry.id,
                 tenant: tenant.clone(),
             }));
-        if let Err(e) = next.commit(&self.dir) {
+        if let Err(e) = next.commit(&self.dir, self.keys.as_deref()) {
             let e = Error::indeterminate(format!("manifest commit failed during rewrite: {e}"));
             self.fail(&e);
             return Err(e);
@@ -246,7 +248,7 @@ impl Shared {
         let mut next = man.clone();
         next.version += 1;
         next.obsolete_segments.retain(|o| !gone.contains(&o.id));
-        if let Err(e) = next.commit(&self.dir) {
+        if let Err(e) = next.commit(&self.dir, self.keys.as_deref()) {
             let e = Error::indeterminate(format!("manifest commit failed after deletion: {e}"));
             self.fail(&e);
             return Err(e);
@@ -404,8 +406,13 @@ impl Shared {
                     .entry(s.entry.segment_format_version)
                     .or_insert(0) += 1;
             }
+            // Older formats, and plaintext segments once encryption is on.
+            let encrypt = self.keys.is_some();
             segs.iter()
-                .filter(|s| s.entry.segment_format_version < stratadb_segment::FORMAT_VERSION)
+                .filter(|s| {
+                    s.entry.segment_format_version < stratadb_segment::FORMAT_VERSION
+                        || (encrypt && !s.reader.is_sealed())
+                })
                 .cloned()
                 .collect()
         };
@@ -447,7 +454,7 @@ impl Shared {
                 next.retention.remove(tenant);
             }
         }
-        if let Err(e) = next.commit(&self.dir) {
+        if let Err(e) = next.commit(&self.dir, self.keys.as_deref()) {
             let e = Error::indeterminate(format!("manifest commit failed: {e}"));
             self.fail(&e);
             return Err(e);

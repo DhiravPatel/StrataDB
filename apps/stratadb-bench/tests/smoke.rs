@@ -28,7 +28,15 @@ fn bench_smoke() {
         String::from_utf8_lossy(&out.stderr)
     );
     let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(j["queries"].as_array().unwrap().len(), 11);
+    assert_eq!(j["queries"].as_array().unwrap().len(), 12);
+    // The absent-substring query is answered by trigram pruning alone.
+    let q13 = &j["queries"][11];
+    assert_eq!(q13["name"], "13_absent_substring_search");
+    assert_eq!(q13["result_rows"], 1);
+    assert!(
+        q13["indexes_used"].to_string().contains("ngram(body)"),
+        "{q13}"
+    );
     assert!(j["ingest"]["events_per_s_wall"].as_f64().unwrap() > 0.0);
     // The sampled trace id must be found by the exact-lookup query.
     assert!(

@@ -4,7 +4,7 @@ Legend: ✅ done (tested) · ▶ next · ☐ pending. IDs follow spec §35.
 
 ## Done
 ✅ A-001 A-002 A-005 · ✅ B-001..B-005 · ✅ C-001..C-008 · ✅ D-001..D-008 ·
-✅ E-001..E-012 (E-011 stable pagination, ADR-0023; E-012 vectorized filters) · ✅ F-001 F-002 · ✅ H-009 (local CLI) · ✅ engine backpressure
+✅ E-001..E-012 (E-011 stable pagination, ADR-0023; E-012 vectorized filters; E-013 allocation-free grouping; E-014 parallel scans) · ✅ F-001 F-002 · ✅ H-009 (local CLI incl. export/import/shell) · ✅ engine backpressure
 
 ## Next (in order)
 1. ✅ **T-P1-PL** Power-loss simulation (`simfs` recorder + `power_loss_sim.rs`);
@@ -22,7 +22,7 @@ Legend: ✅ done (tested) · ▶ next · ☐ pending. IDs follow spec §35.
 8. ✅ Compaction (merge small segments; manifest lineage; delete inputs only
    after commit and when no snapshot holds them).
 9. ✅ **H-005** retention; **H-006/H-007** backup/restore + drills.
-10. ✅ F-003 bloom filters (A/B evidence). ☐ F-004 exact-match postings; + exact-match postings with benchmark evidence.
+10. ✅ F-003 bloom filters (A/B evidence). ✅ F-005 trigram filters for LIKE (A/B evidence). ⏸ F-004 postings deferred (ADR-0005: needs row groups).
 11. ✅ **G-007** OTLP/HTTP JSON. ✅ **G-008** Rust, Python, Go SDKs; ☐ OTLP protobuf; ☐ real-Collector interop test.
 12. ✅ **H-011** fuzz targets (WAL parser, segment reader, manifest, query parser).
 13. ✅ Disk high-watermark admission control (spec §28.4).

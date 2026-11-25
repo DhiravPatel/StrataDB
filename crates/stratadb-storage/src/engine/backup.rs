@@ -5,7 +5,13 @@
 //! BACKUP                       envelope: "STRATADB-BACKUP v1 sha256=<hex> len=<n>\n" + JSON
 //! MANIFEST                     the data-directory manifest at the backup point
 //! segments/<tenant>/seg-*.sseg byte-for-byte copies of committed segments
+//! KEYRING                      encrypted databases only: the wrapped data keys
 //! ```
+//! # Encryption (ADR-0024)
+//! A backup of an encrypted database stays encrypted: segments and MANIFEST
+//! are copied as sealed files and the KEYRING (data keys wrapped by the KEK)
+//! is included. Verifying or restoring it requires the KEK that wrapped that
+//! KEYRING — keep retired KEKs until backups made with them have expired.
 //! # Consistency
 //! The engine flushes, then captures the manifest and pins every committed
 //! segment under the manifest lock. The backup point is that manifest's
@@ -201,13 +207,15 @@ impl BackupManifest {
         }
         // Paths must be exactly the derived segment paths (no traversal).
         for f in &m.files {
-            let ok = f.path == crate::manifest::MANIFEST_FILE || {
-                let parts: Vec<&str> = f.path.split('/').collect();
-                parts.len() == 3
-                    && parts[0] == "segments"
-                    && TenantId::new(parts[1]).is_ok()
-                    && stratadb_segment::parse_segment_file_name(parts[2]).is_some()
-            };
+            let ok = f.path == crate::manifest::MANIFEST_FILE
+                || f.path == stratadb_crypto::KEYRING_FILE
+                || {
+                    let parts: Vec<&str> = f.path.split('/').collect();
+                    parts.len() == 3
+                        && parts[0] == "segments"
+                        && TenantId::new(parts[1]).is_ok()
+                        && stratadb_segment::parse_segment_file_name(parts[2]).is_some()
+                };
             if !ok {
                 return Err(Error::corruption(
                     loc,
@@ -221,7 +229,11 @@ impl BackupManifest {
 
 /// Verify a backup without modifying it: envelope checksum, every file's
 /// size and SHA-256, the data manifest, and full verification of every segment.
-pub fn verify_backup(dir: &Path) -> Result<BackupManifest> {
+/// An encrypted backup needs the KEK that wrapped its KEYRING.
+pub fn verify_backup(
+    dir: &Path,
+    key: Option<&dyn stratadb_crypto::KeyProvider>,
+) -> Result<BackupManifest> {
     let raw =
         fs::read(dir.join(BACKUP_FILE)).ctx(|| format!("reading backup in {}", dir.display()))?;
     let bm = BackupManifest::decode(&raw)?;
@@ -235,7 +247,29 @@ pub fn verify_backup(dir: &Path) -> Result<BackupManifest> {
             ));
         }
     }
-    let man = Manifest::load(dir)?
+    let keys = match (stratadb_crypto::Keyring::exists(dir), key) {
+        (false, _) => None,
+        (true, None) => {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "this backup is encrypted; its key-encryption key is required",
+            ))
+        }
+        (true, Some(p)) => stratadb_crypto::Keyring::load(dir, p)?,
+    };
+    let k = keys.as_ref();
+    if k.is_some()
+        && !bm
+            .files
+            .iter()
+            .any(|f| f.path == stratadb_crypto::KEYRING_FILE)
+    {
+        return Err(Error::corruption(
+            dir.display().to_string(),
+            "KEYRING is not listed in BACKUP",
+        ));
+    }
+    let man = Manifest::load(dir, k)?
         .ok_or_else(|| Error::corruption(dir.display().to_string(), "backup has no MANIFEST"))?;
     if man.version != bm.manifest_version || man.segments.len() != bm.segments {
         return Err(Error::corruption(
@@ -256,17 +290,21 @@ pub fn verify_backup(dir: &Path) -> Result<BackupManifest> {
                 "segment referenced by MANIFEST is missing from the backup",
             ));
         }
-        open_segment(dir, e, true)?;
+        open_segment(dir, e, true, k)?;
     }
     Ok(bm)
 }
 
 /// Restore `backup` into `target` (must be absent or empty), then open it
 /// with full verification. The engine at `target` is closed before returning.
-pub fn restore_backup(backup: &Path, target: &Path) -> Result<RestoreReport> {
+pub fn restore_backup(
+    backup: &Path,
+    target: &Path,
+    key: Option<Arc<dyn stratadb_crypto::KeyProvider>>,
+) -> Result<RestoreReport> {
     let started = Instant::now();
     ensure_absent_or_empty(target, "restore target")?;
-    let bm = verify_backup(backup)?;
+    let bm = verify_backup(backup, key.as_deref())?;
     let tmp = fsutil::tmp_path(target);
     if tmp.exists() {
         fs::remove_dir_all(&tmp).ctx(|| format!("removing stale {}", tmp.display()))?;
@@ -295,6 +333,7 @@ pub fn restore_backup(backup: &Path, target: &Path) -> Result<RestoreReport> {
     o.background = false;
     o.verify_segments_on_open = true;
     o.flush_on_close = false;
+    o.encryption = key;
     let e = Engine::open(o)?;
     let st = e.stats();
     e.close()?;
@@ -344,7 +383,7 @@ impl Shared {
             let (bytes, sha256) = copy_hashed(h.reader.path(), &tmp.join(&rel))?;
             failpoint::hit("backup::after_segment_copy")?;
             // Verify the copy, not just the source.
-            open_segment(&tmp, &h.entry, true)?;
+            open_segment(&tmp, &h.entry, true, self.keys.as_deref())?;
             bytes_total += bytes;
             files.push(BackupFile {
                 path: rel,
@@ -356,13 +395,25 @@ impl Shared {
         bman.obsolete_segments.clear();
         bman.segments
             .retain(|s| pinned.iter().any(|h| h.entry.id == s.id));
-        bman.commit(&tmp)?;
+        bman.commit(&tmp, self.keys.as_deref())?;
         let (mbytes, msha) = hash_file(&tmp.join(crate::manifest::MANIFEST_FILE))?;
         files.push(BackupFile {
             path: crate::manifest::MANIFEST_FILE.into(),
             bytes: mbytes,
             sha256: msha,
         });
+        if self.keys.is_some() {
+            // The wrapped data keys; useless without the KEK.
+            let (kbytes, ksha) = copy_hashed(
+                &stratadb_crypto::Keyring::path(&self.dir),
+                &tmp.join(stratadb_crypto::KEYRING_FILE),
+            )?;
+            files.push(BackupFile {
+                path: stratadb_crypto::KEYRING_FILE.into(),
+                bytes: kbytes,
+                sha256: ksha,
+            });
+        }
         let rows = bman.segments.iter().map(|s| s.row_count).sum();
         let bm = BackupManifest {
             format_version: BACKUP_FORMAT_VERSION,

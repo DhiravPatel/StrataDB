@@ -70,6 +70,12 @@ pub fn fuzz_segment(data: &[u8]) {
                 }
             }
         }
+        if let Some(x) = r.footer().extension(stratadb_segment::ngram::EXT_NGRAM) {
+            if let Ok(n) = stratadb_segment::ngram::NgramSet::decode(&x.data) {
+                let probes = stratadb_segment::ngram::probes("%abc%");
+                let _ = n.may_match(&stratadb_segment::ngram::NgramField::Body, &probes);
+            }
+        }
     }
 }
 
@@ -103,6 +109,12 @@ pub fn fuzz_event_codec(data: &[u8]) {
     let _ = stratadb_storage::idempotency::decode_record(data);
     let _ = stratadb_storage::idempotency::decode_extension(data);
     let _ = stratadb_segment::bloom::BloomSet::decode(data);
+    let _ = stratadb_segment::ngram::NgramSet::decode(data);
+    let _ = stratadb_crypto::container::Header::decode(data, "fuzz");
+    let _ = stratadb_crypto::Keyring::check_format(data);
+    if let Ok(s) = std::str::from_utf8(data) {
+        let _ = stratadb_segment::ngram::probes(s);
+    }
 }
 
 /// A small fixed dataset so fuzzed queries reach the executor.

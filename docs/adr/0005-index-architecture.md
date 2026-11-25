@@ -26,3 +26,30 @@ top-level string `=` / `IN` conjuncts only. Evidence: no-false-negative test,
 optimizer-equivalence property test with id predicates, A/B report
 `benchmarks/reports/2026-11-21-bloom-ab.md` (exact-id lookups 2.6–2.8× faster,
 +1 % storage).
+
+## Implemented (2026-11-25): trigram filters for substring search (F-005)
+A token (word) inverted index cannot prune `LIKE '%x%'` soundly (`'%TIMEOUT%'`
+must match inside `TIMEOUTS`), and StrataQL exposes substring semantics, not
+token search. Instead each segment stores, per indexed field (`body` by
+default; `storage.ngram_attribute_keys` optional), a Bloom filter of every
+3-character window of its string values, characters folded with the `ILIKE`
+rule so one index serves `LIKE` and `ILIKE`. A top-level `LIKE`/`ILIKE`
+conjunct contributes every folded trigram of every literal run of ≥ 3
+characters; a segment lacking any of them is pruned (`ngram(body)` in
+`indexes_used`, `segments_pruned_ngram`). Footer extension tag 3 (optional).
+Evidence: no-false-negative property test against an independent LIKE
+reference (segment crate), engine equivalence property test with `LIKE`/`ILIKE`
+predicates, pruning test, mutation checks (2 injected bugs caught), A/B report
+`benchmarks/reports/2026-11-25-ngram-ab.md`: absent substring 3.0 ms → 3 µs
+(all segments pruned); common substrings unchanged; +0.17 % segment bytes;
+final flush +11 %. Limits: no pruning for literal runs < 3 characters, for
+`NOT LIKE`, or under `OR`; no phrase/token/prefix operators (spec §14.1 modes
+other than substring and equality are not exposed).
+
+## Decision (2026-11-25): exact-match postings (F-004) deferred
+Segments are read as whole column chunks (no row groups), so a postings list
+inside a segment would only skip per-row filter evaluation (vectorized, µs per
+segment), not I/O or decode. Exact-id lookups already read one of three
+segments thanks to Bloom pruning (queries 01/02: ~1.5 ms). Revisit when
+segments gain row groups / page-level reads, or when profiles show filter
+evaluation dominating id lookups.
