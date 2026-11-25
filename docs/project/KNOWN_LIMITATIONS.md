@@ -35,7 +35,9 @@
 - Only one internal developer-laptop baseline exists (`benchmarks/reports/`). **No performance claims are made**; no competitor comparisons.
 - Segments use LZ4 chunk compression (v2); no zstd cold tier yet. Hot attribute keys (≥ 10 % of
   rows) are shredded into columns (v3); rarer keys stay in per-row maps.
-- Query execution is row-at-a-time over columnar batches; memtable
+- `WHERE` filters are vectorized (typed kernels, ADR-0006 update); projection,
+  grouping and sort keys are still evaluated per matched row, and scans are
+  single-threaded. Whole-map predicates (`attributes = …`) use the scalar path. Memtable
   snapshots copy `Arc` handles of the tenant's rows (O(memtable rows) per query).
 - Every committed segment keeps an open file descriptor.
 - Manifest is rewritten in full on every flush.

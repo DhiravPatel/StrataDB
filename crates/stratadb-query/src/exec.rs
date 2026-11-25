@@ -32,6 +32,9 @@ pub struct QueryOptions {
     pub cancel: Option<Arc<AtomicBool>>,
     /// Segment pruning by statistics. Disabling it must never change results.
     pub enable_pruning: bool,
+    /// Vectorized filter evaluation (typed kernels, selection vectors).
+    /// Disabling it must never change results.
+    pub enable_vectorized: bool,
     pub parse_limits: crate::parser::ParseLimits,
 }
 
@@ -44,6 +47,7 @@ impl Default for QueryOptions {
             max_memory_bytes: 256 * 1024 * 1024,
             cancel: None,
             enable_pruning: true,
+            enable_vectorized: true,
             parse_limits: Default::default(),
         }
     }
@@ -268,12 +272,12 @@ struct RunResult {
 // ---------------------------------------------------------------------------
 // Batches
 
-struct Batch<'a> {
-    len: usize,
-    tenant: &'a TenantId,
-    cols: HashMap<ColumnId, ColumnData>,
+pub(crate) struct Batch<'a> {
+    pub(crate) len: usize,
+    pub(crate) tenant: &'a TenantId,
+    pub(crate) cols: HashMap<ColumnId, ColumnData>,
     /// Shredded attribute columns read instead of whole maps (RFC-0002).
-    shredded: HashMap<(Scope, String), Vec<Datum>>,
+    pub(crate) shredded: HashMap<(Scope, String), Vec<Datum>>,
 }
 
 fn opt_str(e: &Event, id: ColumnId) -> Option<String> {
@@ -320,7 +324,7 @@ fn memory_column(id: ColumnId, rows: &[stratadb_storage::MemRow], evs: &[&Event]
 }
 
 impl Batch<'_> {
-    fn col(&self, id: ColumnId) -> Result<&ColumnData> {
+    pub(crate) fn col(&self, id: ColumnId) -> Result<&ColumnData> {
         self.cols
             .get(&id)
             .ok_or_else(|| Error::internal(format!("column {id:?} not loaded")))
@@ -415,7 +419,7 @@ fn eval_expr(e: &Expr, b: &Batch<'_>, i: usize) -> Result<Datum> {
     })
 }
 
-fn eval_truth(e: &Expr, b: &Batch<'_>, i: usize) -> Result<Truth> {
+pub(crate) fn eval_truth(e: &Expr, b: &Batch<'_>, i: usize) -> Result<Truth> {
     Ok(match e {
         Expr::Cmp(l, op, r) => {
             let ord = eval::compare(&eval_expr(l, b, i)?, &eval_expr(r, b, i)?);
@@ -644,6 +648,8 @@ struct Ctx<'a> {
     groups: HashMap<Vec<u8>, usize>,
     group_vals: Vec<(Vec<Datum>, Vec<AggState>)>,
     page: Option<PageCtx>,
+    /// Compiled vectorized filter (`None`: no filter or vectorization off).
+    vfilter: Option<crate::vector::Filter>,
     /// Rows to keep after sorting (top-k): the page size + 1 when paginating,
     /// else the query's LIMIT.
     keep: Option<usize>,
@@ -709,6 +715,9 @@ impl Ctx<'_> {
     }
 
     fn process(&mut self, b: &Batch<'_>) -> Result<()> {
+        // Vectorized filter results for rows chunk_start..chunk_end.
+        let (mut chunk_start, mut chunk_end) = (0usize, 0usize);
+        let mut truth: Vec<Truth> = Vec::new();
         for i in 0..b.len {
             if i % 1024 == 0 {
                 self.check_budget()?;
@@ -729,7 +738,18 @@ impl Ctx<'_> {
                 None => (0, 0),
             };
             if let Some(f) = &self.plan.filter {
-                if eval_truth(f, b, i)? != Some(true) {
+                let t = match &self.vfilter {
+                    Some(vf) => {
+                        if i >= chunk_end {
+                            chunk_start = i;
+                            chunk_end = (i + crate::vector::CHUNK).min(b.len);
+                            truth = vf.eval(b, chunk_start, chunk_end)?;
+                        }
+                        truth[i - chunk_start]
+                    }
+                    None => eval_truth(f, b, i)?,
+                };
+                if t != Some(true) {
                     continue;
                 }
             }
@@ -921,6 +941,11 @@ fn run(
         group_vals: Vec::new(),
         page,
         keep,
+        vfilter: plan
+            .filter
+            .as_ref()
+            .filter(|_| opts.enable_vectorized)
+            .map(crate::vector::Filter::new),
     };
     let tenant = snapshot.tenant();
     let mut to_scan = Vec::new();

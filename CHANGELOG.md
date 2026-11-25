@@ -2,6 +2,11 @@
 
 ## Unreleased (0.0.1)
 ### Added
+- Vectorized `WHERE` evaluation: typed column kernels over selection vectors,
+  `LIKE` compiled once, severity predicates via lookup table; scalar fallback
+  for other shapes; `QueryOptions::enable_vectorized` and `strata-bench
+  --no-vectorize`. A/B: 1.2–3.5× on filtered suite queries
+  (`benchmarks/reports/2026-11-25-vectorized-ab.md`).
 - Stable keyset pagination for row queries (ADR-0023): `execute_page`, HTTP
   `page_size` / `cursor` request fields and `next_cursor` in responses, SDK
   helpers (`query_page`/`query_pages`, Python `query_pages`, Go `QueryPage` /

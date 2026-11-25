@@ -558,6 +558,7 @@ proptest! {
         let text = format!("SELECT event_id FROM logs WHERE {}", sql(&p));
         let on = execute(&snap, &text, &QueryOptions::default()).unwrap();
         let off = execute(&snap, &text, &QueryOptions { enable_pruning: false, ..Default::default() }).unwrap();
+        let scalar = execute(&snap, &text, &QueryOptions { enable_vectorized: false, ..Default::default() }).unwrap();
         let set = |o: &QueryOutput| ids(o).into_iter().collect::<BTreeSet<_>>();
         let want: BTreeSet<String> = (0..100)
             .map(|i| mk(&tenant("a"), i))
@@ -565,6 +566,8 @@ proptest! {
             .map(|ev| ev.event_id.unwrap())
             .collect();
         prop_assert_eq!(set(&on), set(&off), "pruning changed results for {}", text);
+        prop_assert_eq!(ids(&on), ids(&scalar), "vectorization changed results for {}", text);
+        prop_assert_eq!(on.stats.rows_matched, scalar.stats.rows_matched);
         prop_assert_eq!(set(&on), want, "engine disagrees with reference for {}", text);
         prop_assert!(on.stats.rows_scanned <= off.stats.rows_scanned);
     }

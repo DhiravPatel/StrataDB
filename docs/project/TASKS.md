@@ -4,7 +4,7 @@ Legend: ✅ done (tested) · ▶ next · ☐ pending. IDs follow spec §35.
 
 ## Done
 ✅ A-001 A-002 A-005 · ✅ B-001..B-005 · ✅ C-001..C-008 · ✅ D-001..D-008 ·
-✅ E-001..E-011 (E-011 stable pagination, ADR-0023) · ✅ F-001 F-002 · ✅ H-009 (local CLI) · ✅ engine backpressure
+✅ E-001..E-012 (E-011 stable pagination, ADR-0023; E-012 vectorized filters) · ✅ F-001 F-002 · ✅ H-009 (local CLI) · ✅ engine backpressure
 
 ## Next (in order)
 1. ◐ **T-P1-PL** Power-loss: WAL-tail-loss model done (`power_loss.rs`).

@@ -39,6 +39,11 @@ fn is_num(v: &Value) -> bool {
 
 /// Predicate comparison. `None` = unknown.
 pub fn compare(a: &Datum, b: &Datum) -> Option<Ordering> {
+    compare_ref(a.as_ref(), b.as_ref())
+}
+
+/// [`compare`] over borrowed values (`None` = missing); avoids cloning.
+pub fn compare_ref(a: Option<&Value>, b: Option<&Value>) -> Option<Ordering> {
     let (Some(a), Some(b)) = (a, b) else {
         return None;
     };
@@ -83,67 +88,118 @@ pub fn truth_of(d: &Datum) -> Truth {
 }
 
 /// SQL LIKE with `%` (any run) and `_` (one character); `\` escapes the next
-/// character. Linear-memory greedy matcher with single backtrack point
-/// (O(n·m) worst case; inputs are bounded by validation limits).
+/// character. See [`LikePattern`].
 pub fn like(text: &str, pattern: &str, case_insensitive: bool) -> bool {
-    #[derive(Clone, Copy, PartialEq)]
-    enum P {
-        Any,
-        One,
-        Lit(char),
+    LikePattern::new(pattern, case_insensitive).matches(text, &mut Vec::new())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LikeTok {
+    Any,
+    One,
+    Lit(char),
+}
+
+/// A compiled LIKE pattern. Matching is a linear-memory greedy matcher with
+/// a single backtrack point (O(n·m) worst case; inputs are bounded by
+/// validation limits). Case folding maps each character to the first char of
+/// its Unicode lowercase mapping. Patterns made only of literal characters
+/// and `%` at the ends use `str` searches (same result, no per-row buffer).
+#[derive(Debug, Clone)]
+pub struct LikePattern {
+    toks: Vec<LikeTok>,
+    case_insensitive: bool,
+    fast: Option<(bool, String, bool)>,
+}
+
+impl LikePattern {
+    pub fn new(pattern: &str, case_insensitive: bool) -> Self {
+        let fold = |c: char| {
+            if case_insensitive {
+                c.to_lowercase().next().unwrap_or(c)
+            } else {
+                c
+            }
+        };
+        let mut toks = Vec::new();
+        let mut it = pattern.chars();
+        while let Some(c) = it.next() {
+            toks.push(match c {
+                '%' => LikeTok::Any,
+                '_' => LikeTok::One,
+                '\\' => LikeTok::Lit(fold(it.next().unwrap_or('\\'))),
+                c => LikeTok::Lit(fold(c)),
+            });
+        }
+        // Fast path: [%] literal* [%], case-sensitive only (folding is
+        // per-character and would need the general matcher's buffer anyway).
+        let fast = (!case_insensitive)
+            .then(|| {
+                let lead = toks.first() == Some(&LikeTok::Any);
+                let trail = toks.len() > usize::from(lead) && toks.last() == Some(&LikeTok::Any);
+                let inner = &toks[usize::from(lead)..toks.len() - usize::from(trail)];
+                let lit: Option<String> = inner
+                    .iter()
+                    .map(|t| match t {
+                        LikeTok::Lit(c) => Some(*c),
+                        _ => None,
+                    })
+                    .collect();
+                lit.map(|l| (lead, l, trail))
+            })
+            .flatten();
+        Self {
+            toks,
+            case_insensitive,
+            fast,
+        }
     }
-    let mut pat = Vec::new();
-    let mut it = pattern.chars();
-    while let Some(c) = it.next() {
-        pat.push(match c {
-            '%' => P::Any,
-            '_' => P::One,
-            '\\' => P::Lit(it.next().unwrap_or('\\')),
-            c => P::Lit(c),
-        });
-    }
-    let fold = |c: char| {
-        if case_insensitive {
-            c.to_lowercase().next().unwrap_or(c)
+
+    /// Whether `text` matches. `buf` is scratch space reused across rows.
+    pub fn matches(&self, text: &str, buf: &mut Vec<char>) -> bool {
+        if let Some((lead, lit, trail)) = &self.fast {
+            return match (lead, trail) {
+                (false, false) => text == lit,
+                (true, false) => text.ends_with(lit.as_str()),
+                (false, true) => text.starts_with(lit.as_str()),
+                (true, true) => text.contains(lit.as_str()),
+            };
+        }
+        buf.clear();
+        if self.case_insensitive {
+            buf.extend(text.chars().map(|c| c.to_lowercase().next().unwrap_or(c)));
         } else {
-            c
+            buf.extend(text.chars());
         }
-    };
-    let t: Vec<char> = text.chars().map(fold).collect();
-    let pat: Vec<P> = pat
-        .into_iter()
-        .map(|p| match p {
-            P::Lit(c) => P::Lit(fold(c)),
-            p => p,
-        })
-        .collect();
-    let (mut ti, mut pi) = (0usize, 0usize);
-    let mut star: Option<(usize, usize)> = None;
-    while ti < t.len() {
-        match pat.get(pi) {
-            Some(P::Any) => {
-                star = Some((pi, ti));
-                pi += 1;
-            }
-            Some(P::One) => {
-                ti += 1;
-                pi += 1;
-            }
-            Some(P::Lit(c)) if *c == t[ti] => {
-                ti += 1;
-                pi += 1;
-            }
-            _ => match star {
-                Some((sp, st)) => {
-                    pi = sp + 1;
-                    ti = st + 1;
-                    star = Some((sp, st + 1));
+        let (t, pat) = (&buf[..], &self.toks[..]);
+        let (mut ti, mut pi) = (0usize, 0usize);
+        let mut star: Option<(usize, usize)> = None;
+        while ti < t.len() {
+            match pat.get(pi) {
+                Some(LikeTok::Any) => {
+                    star = Some((pi, ti));
+                    pi += 1;
                 }
-                None => return false,
-            },
+                Some(LikeTok::One) => {
+                    ti += 1;
+                    pi += 1;
+                }
+                Some(LikeTok::Lit(c)) if *c == t[ti] => {
+                    ti += 1;
+                    pi += 1;
+                }
+                _ => match star {
+                    Some((sp, st)) => {
+                        pi = sp + 1;
+                        ti = st + 1;
+                        star = Some((sp, st + 1));
+                    }
+                    None => return false,
+                },
+            }
         }
+        pat[pi..].iter().all(|p| *p == LikeTok::Any)
     }
-    pat[pi..].iter().all(|p| *p == P::Any)
 }
 
 fn type_rank(v: &Value) -> u8 {
@@ -223,6 +279,22 @@ mod tests {
         assert_eq!(compare(&i(1), &None), None);
         assert_eq!(compare(&i(1), &Some(Value::Null)), None);
         assert_eq!(compare(&Some(Value::Timestamp(5)), &i(5)), None);
+    }
+
+    proptest::proptest! {
+        /// The `str`-search fast path agrees with the general matcher.
+        #[test]
+        fn like_fast_path_equals_general(
+            text in "[ab%_\\\\é]{0,8}",
+            pattern in "[ab%_\\\\é]{0,6}",
+            ci in proptest::bool::ANY,
+        ) {
+            let p = LikePattern::new(&pattern, ci);
+            let mut general = p.clone();
+            general.fast = None;
+            let mut buf = Vec::new();
+            proptest::prop_assert_eq!(p.matches(&text, &mut buf), general.matches(&text, &mut buf));
+        }
     }
 
     #[test]

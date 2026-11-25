@@ -6,7 +6,7 @@ reserved for features that additionally passed an independent review / release
 gate; **nothing is VERIFIED yet.**
 
 Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
-`-D warnings` ✅, `cargo test --workspace` ✅ (219 tests, 0 failures).
+`-D warnings` ✅, `cargo test --workspace` ✅ (222 tests, 0 failures).
 
 | ID | Feature | State | Evidence | Known limitations |
 |----|---------|-------|----------|-------------------|
@@ -29,6 +29,7 @@ Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
 | D-008 | Corruption tests | TESTED | engine tests (segment corrupt/missing, manifest missing) | — |
 | E-001..E-009 | Grammar, parser, plan, scan, filter, projection, limit/sort, aggregation, EXPLAIN | TESTED | query crate (27 tests incl. reference-equivalence proptest) | no arithmetic/joins (by design) |
 | E-010 | Query budgets, timeout, cancellation | TESTED | `budgets_and_cancellation_are_enforced` | memory is an estimate |
+| E-012 | Vectorized filter evaluation (typed kernels, selection vectors, compiled `LIKE`; `enable_vectorized` switch) | TESTED | `vector::tests::vectorized_equals_scalar` (2 000 random expr × batch cases, mutation-checked with 7 injected bugs), `like_fast_path_equals_general`, engine equivalence proptest with the switch off; A/B report `benchmarks/reports/2026-11-25-vectorized-ab.md` | projection/grouping still per row; single-threaded |
 | E-011 | Stable keyset pagination (row queries; HTTP `page_size`/`cursor`; Rust/Python/Go SDK helpers) | TESTED | `query/tests/pagination.rs` (9 tests incl. proptest; mutation-checked: removing the tie-break, the `as_of` bound, the strict cursor comparison or loosening either pruning rule each fails tests), `query_pagination_over_http`, SDK conformance (ADR-0023) | aggregates/EXPLAIN not paginated; deep pages of non-time orders rescan |
 | F-001 | Segment statistics | TESTED | footer stats + `verify` | — |
 | F-002 | Timestamp pruning | TESTED | pruning tests + equivalence proptest | segments not time-partitioned |
