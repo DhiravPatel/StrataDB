@@ -8,8 +8,9 @@ pub mod ast;
 pub mod eval;
 pub mod exec;
 pub mod lexer;
+pub mod page;
 pub mod parser;
 pub mod plan;
 
 pub use eval::Datum;
-pub use exec::{execute, QueryOptions, QueryOutput, QueryStats};
+pub use exec::{execute, execute_page, Page, PageRequest, QueryOptions, QueryOutput, QueryStats};

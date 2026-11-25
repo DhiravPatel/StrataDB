@@ -1220,3 +1220,134 @@ async fn request_ids_are_propagated_or_generated_safely() {
     assert!(!line.contains("bad"), "{line}");
     assert!(line.len() > "x-request-id: r".len());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_pagination_over_http() {
+    let s = start(ServerConfig::default()).await;
+    // 45 events in three requests; several share a timestamp.
+    for chunk in 0..3 {
+        let body: String = (0..15)
+            .map(|i| {
+                let n = chunk * 15 + i;
+                format!(
+                    "{}\n",
+                    json!({"event_time": format!("2026-11-20T10:00:{:02}Z", n % 10),
+                           "service": "pg", "body": format!("m{n:03}")})
+                )
+            })
+            .collect();
+        let (st, _) = req(
+            &s,
+            "POST",
+            "/api/v1/ingest",
+            Some(&s.a_rw),
+            "application/x-ndjson",
+            &body,
+        )
+        .await;
+        assert_eq!(st, 200);
+    }
+    let sql = "SELECT body FROM logs ORDER BY event_time DESC";
+    let page = |cursor: Option<String>, size: usize| {
+        let mut b = json!({"query": sql, "page_size": size});
+        if let Some(c) = cursor {
+            b["cursor"] = json!(c);
+        }
+        b.to_string()
+    };
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    let mut pages = 0;
+    loop {
+        let (st, b) = req(
+            &s,
+            "POST",
+            "/api/v1/query",
+            Some(&s.a_rw),
+            "application/json",
+            &page(cursor.clone(), 10),
+        )
+        .await;
+        assert_eq!(st, 200, "{b}");
+        let b = j(&b);
+        pages += 1;
+        for r in b["rows"].as_array().unwrap() {
+            seen.push(r["body"].as_str().unwrap().to_owned());
+        }
+        if pages == 1 {
+            // Written after the first page: must not appear in later pages.
+            req(
+                &s,
+                "POST",
+                "/api/v1/ingest",
+                Some(&s.a_rw),
+                "application/json",
+                r#"{"event_time":"2026-11-20T10:00:05Z","body":"late"}"#,
+            )
+            .await;
+        }
+        match b["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_owned()),
+            None => break,
+        }
+    }
+    assert_eq!(pages, 5);
+    assert_eq!(seen.len(), 45);
+    let uniq: std::collections::BTreeSet<_> = seen.iter().collect();
+    assert_eq!(uniq.len(), 45);
+    assert!(!seen.iter().any(|b| b == "late"));
+    // Unpaginated responses carry next_cursor: null.
+    let (_, b) = query(&s, &s.a_rw, sql).await;
+    assert!(b["next_cursor"].is_null());
+    assert_eq!(b["rows"].as_array().unwrap().len(), 46);
+    // A cursor is bound to its tenant and query.
+    let (_, b) = req(
+        &s,
+        "POST",
+        "/api/v1/query",
+        Some(&s.a_rw),
+        "application/json",
+        &page(None, 5),
+    )
+    .await;
+    let c = j(&b)["next_cursor"].as_str().unwrap().to_owned();
+    let other = json!({"query": sql, "page_size": 5, "cursor": c}).to_string();
+    let (st, b) = req(
+        &s,
+        "POST",
+        "/api/v1/query",
+        Some(&s.b_rw),
+        "application/json",
+        &other,
+    )
+    .await;
+    assert_eq!(st, 400, "{b}");
+    assert_eq!(j(&b)["error"], "invalid_input");
+    let wrong = json!({"query": "SELECT body FROM logs", "cursor": c}).to_string();
+    let (st, _) = req(
+        &s,
+        "POST",
+        "/api/v1/query",
+        Some(&s.a_rw),
+        "application/json",
+        &wrong,
+    )
+    .await;
+    assert_eq!(st, 400);
+    // Aggregates cannot be paginated; page_size 0 is invalid.
+    for body in [
+        json!({"query": "SELECT count(*) FROM logs", "page_size": 5}),
+        json!({"query": sql, "page_size": 0}),
+    ] {
+        let (st, _) = req(
+            &s,
+            "POST",
+            "/api/v1/query",
+            Some(&s.a_rw),
+            "application/json",
+            &body.to_string(),
+        )
+        .await;
+        assert_eq!(st, 400, "{body}");
+    }
+}

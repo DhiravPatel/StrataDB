@@ -291,6 +291,16 @@ impl Snapshot {
         &self.memory
     }
 
+    /// Largest WAL sequence number of any row this snapshot can see (0 when
+    /// empty). Every write acknowledged before the snapshot was taken has a
+    /// sequence number `<=` this value; rows with a larger sequence number
+    /// were committed after it.
+    pub fn max_visible_seq(&self) -> u64 {
+        let seg = self.segments.iter().map(|s| s.entry.max_seq).max();
+        let mem = self.memory.iter().map(|r| r.seq).max();
+        seg.max(mem).unwrap_or(0)
+    }
+
     /// Materialize every row, ordered by `(event_time, seq, idx)`.
     pub fn scan_all(&self) -> Result<Vec<(u64, u32, Event)>> {
         let mut out: Vec<(u64, u32, Event)> = Vec::new();

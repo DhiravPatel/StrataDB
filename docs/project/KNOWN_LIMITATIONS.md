@@ -41,7 +41,12 @@
 - Manifest is rewritten in full on every flush.
 
 ## Semantics
-- Without `ORDER BY`, result order is unspecified.
+- Without `ORDER BY`, unpaginated result order is unspecified (paginated
+  queries use commit order).
+- Pagination (ADR-0023) is keyset-based: each page rescans candidate segments
+  (pruned by commit sequence, and by time when ordered by `event_time`), so deep
+  pages of other orders cost about as much as the first. Aggregates and EXPLAIN
+  cannot be paginated. Rows removed by retention between pages are skipped.
 - Query memory budget is an estimate, not exact accounting.
 - `strata` CLI requires exclusive access to the data directory (no server
   must be running) and trusts the operator-supplied `--tenant`.

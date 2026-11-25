@@ -52,6 +52,15 @@ bytes < list < map < null), then value; **null and missing sort last in ASC
 and first in DESC**. Sorting is stable. Without `ORDER BY`, row order is
 unspecified (currently source order) and `LIMIT` may stop scanning early.
 
+## Pagination
+Row queries can be paginated (`execute_page`; HTTP `page_size` / `cursor`;
+ADR-0023). Pages follow the total order `ORDER BY keys…, then commit order
+(seq, idx)`; without `ORDER BY`, commit order. Pages never overlap; every row
+visible to the first page is returned exactly once (unless retention removes it
+meanwhile); rows committed after the first page are excluded; `LIMIT` caps the
+total across pages. Aggregates and `EXPLAIN` cannot be paginated. A cursor is
+valid only with the same tenant and query text (surrounding whitespace ignored).
+
 ## Budgets (QueryOptions)
 Timeout (default 30 s) → `timeout`; cancellation → `cancelled`; rows scanned
 (100 M), result rows (100 k; add `LIMIT`), approximate memory (256 MiB) →

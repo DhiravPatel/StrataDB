@@ -23,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 __all__ = ["Client", "StrataError", "ServerError", "TransportError", "Cancelled",
            "RetriesExhausted", "IngestReceipt", "QueryResult"]
@@ -76,6 +76,7 @@ class QueryResult:
     explain: Optional[str] = None
     stats: dict = field(default_factory=dict)
     query_id: Optional[str] = None
+    next_cursor: Optional[str] = None  # set while more pages remain
 
 
 class Client:
@@ -174,15 +175,32 @@ class Client:
                              v.get("durability", ""), bool(v.get("duplicate", False)), key, attempts)
 
     def query(self, sql: str, *, timeout_ms: Optional[int] = None, max_rows: Optional[int] = None,
-              query_id: Optional[str] = None) -> QueryResult:
+              query_id: Optional[str] = None, page_size: Optional[int] = None,
+              cursor: Optional[str] = None) -> QueryResult:
+        """Run a query. With ``page_size`` (and later ``cursor`` = the previous
+        result's ``next_cursor`` plus the *same* ``sql``) rows are returned page
+        by page with keyset semantics: no row twice, rows committed after the
+        first page excluded (ADR-0023)."""
         req: dict[str, Any] = {"query": sql}
-        for k, val in (("timeout_ms", timeout_ms), ("max_rows", max_rows), ("query_id", query_id)):
+        for k, val in (("timeout_ms", timeout_ms), ("max_rows", max_rows), ("query_id", query_id),
+                       ("page_size", page_size), ("cursor", cursor)):
             if val is not None:
                 req[k] = val
         body = json.dumps(req).encode()
         raw, _ = self._with_retries("query", lambda: self._send("POST", "/api/v1/query", body, "application/json", None))
         v = json.loads(raw)
-        return QueryResult(v.get("columns", []), v.get("rows", []), v.get("explain"), v.get("stats", {}), v.get("query_id"))
+        return QueryResult(v.get("columns", []), v.get("rows", []), v.get("explain"), v.get("stats", {}),
+                           v.get("query_id"), v.get("next_cursor"))
+
+    def query_pages(self, sql: str, page_size: int, **kw: Any) -> Iterator[QueryResult]:
+        """Yield every page of a row query."""
+        cursor: Optional[str] = None
+        while True:
+            page = self.query(sql, page_size=page_size, cursor=cursor, **kw)
+            yield page
+            if page.next_cursor is None:
+                return
+            cursor = page.next_cursor
 
     def cancel_query(self, query_id: str) -> bool:
         """Request cancellation of a running query; False if it is not running."""

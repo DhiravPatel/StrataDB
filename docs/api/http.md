@@ -13,7 +13,7 @@ OpenAPI 3.1 document: [openapi.json](openapi.json) (a test asserts every documen
 | GET | `/ready` | none | 200 when the engine is healthy, 503 in failed state |
 | GET | `/version` | none | server, API and format versions |
 | POST | `/ingest/batch`, `/ingest` | `ingest` | NDJSON (default) or `application/json` object/array |
-| POST | `/query` | `query` | `{"query", "timeout_ms"?, "max_rows"?, "query_id"?, "database"?: "default"}`; unknown fields → 400; response includes `query_id` |
+| POST | `/query` | `query` | `{"query", "timeout_ms"?, "max_rows"?, "query_id"?, "database"?: "default", "page_size"?, "cursor"?}`; unknown fields → 400; response includes `query_id` |
 | GET / DELETE | `/query/{id}` | `query` | status / cancel a **running** query of the caller's tenant (others' ids → 404); a cancelled query fails with `cancelled` |
 | GET | `/metrics` | `cluster.read` | Prometheus text format |
 | POST | `/admin/compaction` | `cluster.admin` | runs compaction passes until nothing is left to merge |
@@ -42,9 +42,24 @@ while the first attempt is still committing → `503` (retry). Survives restarts
 and flushes. Beyond the window/capacity, delivery is at-least-once (ADR-0019).
 
 ## Query response
-`{"columns": [...], "rows": [{col: value}], "explain": null|text, "partial": false, "stats": {...}}`.
+`{"columns": [...], "rows": [{col: value}], "explain": null|text, "partial": false, "next_cursor": null|string, "stats": {...}}`.
 Missing values are **omitted** from row objects; null is JSON `null`.
 Duplicate column names get `#2`, `#3` suffixes. Timestamps are RFC 3339 strings.
+
+## Pagination
+Row queries can be read page by page (ADR-0023). Send `page_size` (capped at
+`max_rows`) on the first request; while the response carries a non-null
+`next_cursor`, send the **same `query` text** again with `"cursor": next_cursor`.
+
+- Rows are ordered by the query's `ORDER BY`, then by commit order; without
+  `ORDER BY` the order is commit (ingest) order.
+- Pages never overlap. Every row acknowledged before the first page (and not
+  since removed by retention) is returned exactly once; rows committed after
+  the first page never appear. Flushes and compaction between pages are safe.
+- `LIMIT` bounds the total across pages.
+- Cursors are opaque, bound to the tenant and query text, and do not expire;
+  a cursor for another query or tenant, or an edited cursor, → `400`.
+- Aggregate and `EXPLAIN` queries cannot be paginated (`400`).
 
 ## Errors
 `{"error": "<kind>", "message": "...", "retryable": bool}`; retryable errors

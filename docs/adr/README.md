@@ -34,3 +34,4 @@ its decision; it is superseded by a new ADR. Status meanings:
 | [0020](0020-compaction-retention.md) | Compaction and retention | Accepted |
 | [0021](0021-tls.md) | TLS for the HTTP listener | Accepted |
 | [0022](0022-audit-log.md) | Tamper-evident audit log | Accepted |
+| [0023](0023-pagination.md) | Stable keyset pagination for row queries | Accepted |

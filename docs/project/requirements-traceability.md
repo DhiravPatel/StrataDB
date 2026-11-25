@@ -20,7 +20,7 @@ Maps spec requirements → tasks → acceptance tests. Status: ✅ tested ·
 | §2.2, §6.1 | Canonical event model; tenant from auth | B-001 | `maps_spec_example`, `payload_cannot_override_tenant` | ✅ |
 | §2.2, §6.4 | No silent coercion; type-conflict policy | B-002, ADR-0008 | schema json tests; planner `validation_errors` | ✅ |
 | §2.3 | Projection, time filters, =/!=, numeric cmp, AND/OR/NOT, IN, IS NULL/MISSING, LIKE, ORDER BY, LIMIT, GROUP BY, COUNT/MIN/MAX/SUM/AVG, time bucket, map access, timeout/cancel, EXPLAIN [ANALYZE] | E-001..E-010 | `stratadb-query/tests/query.rs` | ✅ |
-| §2.3 | Pagination with stable semantics | E-011 | — | ☐ |
+| §2.3 | Pagination with stable semantics | E-011 | `stratadb-query/tests/pagination.rs` (incl. proptest), server `http.rs::query_pagination_over_http`, Rust/Python/Go SDK conformance (ADR-0023) | ✅ |
 | §2.4 | Administration (segments, verify, WAL state) | H-009 | `strata segments`, `strata status` | ◐ |
 | §2.5, §25 | Prometheus, OTel traces, health endpoints | H-008 | `/metrics`, `/health`, `/ready` | ◐ (no traces, no histograms) |
 | §3.1 | No silent corruption; deterministic recovery; checksums | C-003, C-006, D-005 | bit-flip/truncation tests, `crash.rs` idempotency | ✅ |

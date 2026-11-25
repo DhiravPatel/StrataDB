@@ -2,6 +2,10 @@
 
 ## Unreleased (0.0.1)
 ### Added
+- Stable keyset pagination for row queries (ADR-0023): `execute_page`, HTTP
+  `page_size` / `cursor` request fields and `next_cursor` in responses, SDK
+  helpers (`query_page`/`query_pages`, Python `query_pages`, Go `QueryPage` /
+  `QueryAllPages`). Cursor-based segment pruning (`segments_pruned_cursor`).
 - Workspace, toolchain pin, lint policy (`unsafe` forbidden).
 - `stratadb-common`: error model with kinds/retryability, CRC-32C, bounded
   binary codec, durable filesystem helpers, tenant IDs, RFC 3339 time, failpoints.

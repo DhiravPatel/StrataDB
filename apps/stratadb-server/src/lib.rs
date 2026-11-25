@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value as J};
 use stratadb_common::TenantId;
 use stratadb_common::{time, Error, ErrorKind};
-use stratadb_query::{execute, Datum, QueryOptions};
+use stratadb_query::{execute, execute_page, Datum, PageRequest, QueryOptions};
 use stratadb_schema::json::event_from_json;
 use stratadb_schema::{Limits, Value};
 use stratadb_storage::RetentionPolicy;
@@ -777,6 +777,10 @@ struct QueryRequest {
     /// Optional client-chosen id (tenant-id alphabet) so the query can be
     /// cancelled with `DELETE /api/v1/query/{id}` while it runs.
     query_id: Option<String>,
+    /// Paginate a row query (ADR-0023): at most this many rows per page.
+    page_size: Option<usize>,
+    /// `next_cursor` from the previous page (requires the same query text).
+    cursor: Option<String>,
 }
 
 /// A running query in the registry.
@@ -918,11 +922,20 @@ async fn query(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> R
             cancel: Some(cancel),
             ..QueryOptions::default()
         };
-        execute(&engine.snapshot(&tenant), &req.query, &opts)
+        let snap = engine.snapshot(&tenant);
+        if req.page_size.is_some() || req.cursor.is_some() {
+            let page = PageRequest {
+                page_size: req.page_size.unwrap_or(max_rows).min(max_rows),
+                cursor: req.cursor,
+            };
+            execute_page(&snap, &req.query, &opts, &page).map(|p| (p.output, p.next_cursor))
+        } else {
+            execute(&snap, &req.query, &opts).map(|o| (o, None))
+        }
     })
     .await;
     match res {
-        Ok(out) => {
+        Ok((out, next_cursor)) => {
             let names = unique_names(&out.columns);
             let rows: Vec<J> = out.rows.iter().map(|r| row_object(&names, r)).collect();
             let s = &out.stats;
@@ -932,12 +945,13 @@ async fn query(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> R
                 "rows": rows,
                 "explain": out.explain,
                 "partial": false,
+                "next_cursor": next_cursor,
                 "stats": {
                     "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
                     "rows_scanned": s.rows_scanned, "rows_matched": s.rows_matched,
                     "segment_bytes_read": s.bytes_read, "segments_total": s.segments_total,
                     "segments_scanned": s.segments_scanned,
-                    "segments_pruned": s.segments_pruned_time + s.segments_pruned_keys + s.segments_pruned_severity + s.segments_pruned_bloom,
+                    "segments_pruned": s.segments_pruned_time + s.segments_pruned_keys + s.segments_pruned_severity + s.segments_pruned_bloom + s.segments_pruned_cursor,
                     "indexes_used": s.indexes_used,
                 },
             }))

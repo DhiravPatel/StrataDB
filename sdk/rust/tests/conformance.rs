@@ -110,6 +110,38 @@ fn ingest_query_dedup_and_errors_against_real_server() {
     assert_eq!(q.rows[0]["n"], 500);
     let total: u64 = q.rows.iter().map(|r| r["n"].as_u64().unwrap()).sum();
     assert_eq!(total, 502);
+    assert_eq!(q.next_cursor, None);
+    // Pagination: every row exactly once, pages bounded by page_size.
+    let pages: Vec<_> = c
+        .query_pages("SELECT body FROM logs ORDER BY event_time DESC", 120)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(pages.len(), 5);
+    assert!(pages.iter().all(|p| p.rows.len() <= 120));
+    let bodies: std::collections::BTreeSet<String> = pages
+        .iter()
+        .flat_map(|p| {
+            p.rows
+                .iter()
+                .map(|r| r["body"].as_str().unwrap().to_owned())
+        })
+        .collect();
+    assert_eq!(bodies.len(), 502);
+    assert!(pages.last().unwrap().next_cursor.is_none());
+    let first = c.query_page("SELECT body FROM logs", 2, None).unwrap();
+    let cur = first.next_cursor.unwrap();
+    assert_eq!(
+        c.query_page("SELECT body FROM logs", 2, Some(&cur))
+            .unwrap()
+            .rows
+            .len(),
+        2
+    );
+    assert!(matches!(
+        c.query_page("SELECT event_time FROM logs", 2, Some(&cur))
+            .unwrap_err(),
+        ClientError::Server { status: 400, .. }
+    ));
     // Server errors are structured and non-retryable ones are not retried.
     match c.query("SELECT * FROM nowhere").unwrap_err() {
         ClientError::Server {

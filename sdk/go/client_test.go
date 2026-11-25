@@ -129,4 +129,22 @@ func TestConformanceAgainstServer(t *testing.T) {
 	if _, err := bad.Query(ctx, "SELECT 1 FROM logs"); !errors.As(err, &se) || se.Status != 401 {
 		t.Fatalf("want 401, got %v", err)
 	}
+	// Pagination: 302 'go' rows in pages of 100, each exactly once.
+	var sizes []int
+	total := 0
+	err = c.QueryAllPages(ctx, "SELECT body FROM logs WHERE service = 'go' ORDER BY event_time DESC", 100, func(p *QueryResult) error {
+		sizes = append(sizes, len(p.Rows))
+		total += len(p.Rows)
+		return nil
+	})
+	if err != nil || total != 302 || len(sizes) != 4 || sizes[3] != 2 {
+		t.Fatalf("pages %v total %d err %v", sizes, total, err)
+	}
+	first, err := c.QueryPage(ctx, "SELECT body FROM logs", 1, "")
+	if err != nil || first.NextCursor == nil {
+		t.Fatalf("first page %+v %v", first, err)
+	}
+	if _, err := c.QueryPage(ctx, "SELECT service FROM logs", 1, *first.NextCursor); !errors.As(err, &se) || se.Status != 400 {
+		t.Fatalf("foreign cursor: want 400, got %v", err)
+	}
 }

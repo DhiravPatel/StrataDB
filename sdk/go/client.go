@@ -94,6 +94,8 @@ type QueryResult struct {
 	Rows    []map[string]interface{} `json:"rows"`
 	Explain *string                  `json:"explain"`
 	Stats   map[string]interface{}   `json:"stats"`
+	// NextCursor is set while more pages of a paginated query remain.
+	NextCursor *string `json:"next_cursor"`
 }
 
 // Client is safe for concurrent use; connections are pooled.
@@ -287,7 +289,42 @@ func (c *Client) IngestWithKey(ctx context.Context, events []map[string]interfac
 
 // Query runs a StrataQL query (read-only; retried on retryable errors).
 func (c *Client) Query(ctx context.Context, sql string) (*QueryResult, error) {
-	body, _ := json.Marshal(map[string]string{"query": sql})
+	return c.runQuery(ctx, map[string]interface{}{"query": sql})
+}
+
+// QueryPage returns one page of a row query (keyset pagination, ADR-0023).
+// Pass the previous page's NextCursor (empty for the first page) together
+// with the same sql. Pages never overlap; rows committed after the first
+// page are excluded.
+func (c *Client) QueryPage(ctx context.Context, sql string, pageSize int, cursor string) (*QueryResult, error) {
+	req := map[string]interface{}{"query": sql, "page_size": pageSize}
+	if cursor != "" {
+		req["cursor"] = cursor
+	}
+	return c.runQuery(ctx, req)
+}
+
+// QueryAllPages calls fn for every page of a row query, stopping at the
+// first error (from the server or returned by fn).
+func (c *Client) QueryAllPages(ctx context.Context, sql string, pageSize int, fn func(*QueryResult) error) error {
+	cursor := ""
+	for {
+		page, err := c.QueryPage(ctx, sql, pageSize, cursor)
+		if err != nil {
+			return err
+		}
+		if err := fn(page); err != nil {
+			return err
+		}
+		if page.NextCursor == nil {
+			return nil
+		}
+		cursor = *page.NextCursor
+	}
+}
+
+func (c *Client) runQuery(ctx context.Context, req map[string]interface{}) (*QueryResult, error) {
+	body, _ := json.Marshal(req)
 	raw, _, err := c.withRetries(ctx, "query", func() (int, time.Duration, []byte, error) {
 		return c.send(ctx, http.MethodPost, "/api/v1/query", body, "")
 	})

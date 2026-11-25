@@ -161,6 +161,41 @@ pub struct QueryResult {
     pub rows: Vec<Map<String, Value>>,
     pub explain: Option<String>,
     pub stats: Value,
+    /// Cursor for the next page of a paginated query; `None` on the last page
+    /// and for unpaginated queries.
+    pub next_cursor: Option<String>,
+}
+
+/// Iterator over the pages of a row query; see [`Client::query_pages`].
+#[derive(Debug)]
+pub struct Pages<'c> {
+    client: &'c Client,
+    sql: String,
+    page_size: usize,
+    cursor: Option<String>,
+    done: bool,
+}
+
+impl Iterator for Pages<'_> {
+    type Item = Result<QueryResult>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let r = self
+            .client
+            .query_page(&self.sql, self.page_size, self.cursor.as_deref());
+        match &r {
+            Ok(p) => {
+                self.cursor = p.next_cursor.clone();
+                self.done = self.cursor.is_none();
+            }
+            // Stop after an error; the caller can resume with `query_page`.
+            Err(_) => self.done = true,
+        }
+        Some(r)
+    }
 }
 
 /// The client. Cheap to clone; connections are pooled.
@@ -375,7 +410,38 @@ impl Client {
 
     /// Run a query. Queries are read-only and retried on retryable errors.
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
-        let body = json!({"query": sql}).to_string();
+        self.run_query(json!({"query": sql}))
+    }
+
+    /// One page of a row query (server-side keyset pagination, ADR-0023).
+    /// Pass the previous page's `next_cursor` with the *same* `sql`. Pages
+    /// never overlap; rows committed after the first page are excluded.
+    pub fn query_page(
+        &self,
+        sql: &str,
+        page_size: usize,
+        cursor: Option<&str>,
+    ) -> Result<QueryResult> {
+        let mut body = json!({"query": sql, "page_size": page_size});
+        if let Some(c) = cursor {
+            body["cursor"] = json!(c);
+        }
+        self.run_query(body)
+    }
+
+    /// Iterate over every page of a row query.
+    pub fn query_pages(&self, sql: &str, page_size: usize) -> Pages<'_> {
+        Pages {
+            client: self,
+            sql: sql.to_owned(),
+            page_size,
+            cursor: None,
+            done: false,
+        }
+    }
+
+    fn run_query(&self, body: Value) -> Result<QueryResult> {
+        let body = body.to_string();
         let (text, _) = self.with_retries("query", || {
             self.post("/api/v1/query", "application/json", body.as_bytes(), None)
         })?;
@@ -396,6 +462,7 @@ impl Client {
                 .unwrap_or_default(),
             explain: v["explain"].as_str().map(str::to_owned),
             stats: v["stats"].clone(),
+            next_cursor: v["next_cursor"].as_str().map(str::to_owned),
         })
     }
 

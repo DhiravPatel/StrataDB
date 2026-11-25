@@ -35,6 +35,17 @@ class Conformance(unittest.TestCase):
         self.assertEqual(q.rows, [{"n": 302}])
         self.assertTrue(q.query_id)
 
+    def test_pagination(self):
+        self.c.ingest([{"service": "pages", "body": f"p{i:03}"} for i in range(95)])
+        sql = "SELECT body FROM logs WHERE service = 'pages' ORDER BY body"
+        pages = list(self.c.query_pages(sql, 20))
+        self.assertEqual([len(p.rows) for p in pages], [20, 20, 20, 20, 15])
+        self.assertEqual([r["body"] for p in pages for r in p.rows], [f"p{i:03}" for i in range(95)])
+        self.assertIsNone(pages[-1].next_cursor)
+        with self.assertRaises(ServerError) as e:
+            self.c.query("SELECT service FROM logs", page_size=5, cursor=pages[0].next_cursor)
+        self.assertEqual(e.exception.status, 400)
+
     def test_errors(self):
         with self.assertRaises(ServerError) as e:
             self.c.query("SELECT * FROM nowhere")

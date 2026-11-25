@@ -124,6 +124,16 @@
           "query_id": {
             "type": "string",
             "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$"
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Paginate a row query: at most this many rows per page (capped at max_rows). See ADR-0023."
+          },
+          "cursor": {
+            "type": "string",
+            "maxLength": 65536,
+            "description": "next_cursor from the previous page; the query text must be identical."
           }
         }
       }

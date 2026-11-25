@@ -17,7 +17,7 @@ SDKs, `strata doctor` are done this session. Distributed mode (Phases 7–8) has
   sdk/rust (`stratadb-client`); `fuzz/` (cargo-fuzz, not a workspace member).
 - Golden fixture `tests/fixtures/storage-v1/` (never regenerate).
 
-## Last validation (2026-11-21)
+## Last validation (2026-11-25)
 `scripts/check.sh` → fmt ✅ clippy `-D warnings` ✅ tests ✅ (see
 docs/project/IMPLEMENTATION_STATUS.md for the count). Stable mutation fuzzing runs in the
 default suite.
@@ -32,21 +32,23 @@ hash-chained audit log (admin actions fail closed); Bloom filters ext tag 2
 (string values only) with A/B evidence; TOML config with flag > env > file precedence.
 
 ## Exact next tasks (priority order)
-1. Stable pagination for row queries (keyset cursor on (event_time, seq, idx);
-   spec §2.3) and `next_cursor` in the HTTP API + SDKs.
-2. Vectorized predicate evaluation over typed columns (avoid per-row `Value` clones).
-3. Fault-injecting filesystem shim for full power-loss simulation (reordering,
+1. Vectorized predicate evaluation over typed columns (avoid per-row `Value` clones).
+2. Fault-injecting filesystem shim for full power-loss simulation (reordering,
    lost un-fsynced renames).
-4. Token inverted index for `body` (F-005) and exact-match postings (F-004).
-5. CSV / Parquet export (§30.3), `strata shell` REPL (§22.1).
-6. Encryption at rest (§18.6) behind a pluggable key provider.
-7. Run the Docker image build + an OpenTelemetry Collector binary (needs Docker).
-8. Longer seeded libFuzzer campaigns (≥ 30 min/target).
+3. Token inverted index for `body` (F-005) and exact-match postings (F-004).
+4. CSV / Parquet export (§30.3), `strata shell` REPL (§22.1) — export can
+   stream via `execute_page` cursors.
+5. Encryption at rest (§18.6) behind a pluggable key provider.
+6. Run the Docker image build + an OpenTelemetry Collector binary (needs Docker).
+7. Longer seeded libFuzzer campaigns (≥ 30 min/target); add a `cursor` fuzz
+   target (decoder is proptested but not yet in `stratadb-fuzz::TARGETS`).
 
 Done since the last handoff: segment v3 attribute shredding (2.6–4.5× on attribute
 queries), OTLP/HTTP protobuf + official OTel Go exporter interop, token hot reload,
 per-tenant rate/storage quotas, JSON structured logs with request ids,
-`strata upgrade` with verified backup gate. Gate: 204 tests passing.
+`strata upgrade` with verified backup gate; **stable keyset pagination**
+(E-011, ADR-0023: `execute_page`, HTTP `page_size`/`cursor`/`next_cursor`,
+SDK `query_pages`/`QueryAllPages`). Gate: 219 tests passing.
 
 ## Owner actions required
 1. Confirm license (ADR-0016) and add LICENSE.
