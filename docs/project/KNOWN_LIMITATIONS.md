@@ -46,14 +46,20 @@
 - Segments use LZ4 chunk compression (v2); no zstd cold tier yet. Hot attribute keys (≥ 10 % of
   rows) are shredded into columns (v3); rarer keys stay in per-row maps.
 - `WHERE` filters are vectorized and group keys are encoded without copies
-  (ADR-0006 updates); projection and sort keys are still materialized per
-  matched row. Queries naming specific attribute keys decode only those keys;
+  (ADR-0006 updates); shredded keys used only as `GROUP BY` keys are not
+  decoded at all, but other group keys from per-row maps still are.
+  Projection and sort keys are still materialized per matched row (top-k
+  `ORDER BY … LIMIT` bounds how many are kept). Queries naming specific attribute keys decode only those keys;
   queries using whole maps (`attributes`, `SELECT *`) decode every row's map. Segment scans of sorted and
   aggregate queries are parallel (ADR-0006); unsorted `LIMIT` scans, the
   memtable and the final merge are sequential; float `sum`/`avg` may differ in
   the last bits from a sequential scan. Whole-map predicates (`attributes = …`) use the scalar path. Memtable
   snapshots copy `Arc` handles of the tenant's rows (O(memtable rows) per query).
-- Every committed segment keeps an open file descriptor.
+- Every committed segment keeps an open file descriptor (`strata doctor`
+  checks the open-file limit against segment + WAL count).
+- `strata doctor` has no cluster connectivity or peer clock-skew checks
+  (single node); its memory check is an upper bound on engine budgets, not a
+  measurement; `--deep` costs a full scan.
 - Manifest is rewritten in full on every flush.
 
 ## Semantics

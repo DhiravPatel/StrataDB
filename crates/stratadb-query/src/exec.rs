@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use stratadb_common::codec::Encoder;
 use stratadb_common::{Error, ErrorKind, Result, TenantId};
 use stratadb_schema::{Event, Severity, Value};
-use stratadb_segment::{ColumnData, ColumnId, Scope};
+use stratadb_segment::{ColumnData, ColumnId, RawValues, Scope};
 use stratadb_storage::{SegmentHandle, Snapshot};
 
 use crate::ast::{AggFunc, CmpOp, ColumnRef, ExplainMode, Expr};
@@ -279,6 +279,43 @@ fn cmp_position(
     a.1.cmp(&b.1)
 }
 
+/// Sort `rows` by `order` and keep the first `keep`. With a bound smaller
+/// than the row count this selects the top `k` (O(n + k log k)) instead of
+/// sorting everything; ties are broken by the rows' current positions, so the
+/// result equals a stable sort followed by truncation exactly.
+fn sort_keep(rows: &mut Vec<Row>, order: &[(SortSource, bool)], keep: Option<usize>) {
+    let k = match keep {
+        Some(k) if k < rows.len() => k,
+        _ => {
+            rows.sort_by(|a, b| cmp_position(order, (&a.keys, a.id), (&b.keys, b.id)));
+            return;
+        }
+    };
+    let all = std::mem::take(rows);
+    rows.extend(top_k(all, k, |a, b| {
+        cmp_position(order, (&a.keys, a.id), (&b.keys, b.id))
+    }));
+}
+
+/// The first `k` items of `items` stably sorted by `cmp`, in that order,
+/// without sorting the rest: select by (`cmp`, position), then sort the `k`.
+fn top_k<T>(
+    items: Vec<T>,
+    k: usize,
+    cmp: impl Fn(&T, &T) -> std::cmp::Ordering,
+) -> impl Iterator<Item = T> {
+    let mut t: Vec<(usize, T)> = items.into_iter().enumerate().collect();
+    let total = |a: &(usize, T), b: &(usize, T)| cmp(&a.1, &b.1).then(a.0.cmp(&b.0));
+    if k == 0 {
+        t.clear();
+    } else if k < t.len() {
+        t.select_nth_unstable_by(k - 1, total);
+        t.truncate(k);
+    }
+    t.sort_unstable_by(total);
+    t.into_iter().map(|(_, x)| x)
+}
+
 /// Raw result of [`run`] before rows are reduced to output values.
 struct RunResult {
     output: QueryOutput,
@@ -294,6 +331,45 @@ pub(crate) struct Batch<'a> {
     pub(crate) cols: HashMap<ColumnId, ColumnData>,
     /// Shredded attribute columns read instead of whole maps (RFC-0002).
     pub(crate) shredded: HashMap<(Scope, String), Vec<Datum>>,
+    /// Shredded attribute columns kept encoded (keys used only as group
+    /// keys, `Plan::raw_group_attr_keys`).
+    pub(crate) raw: HashMap<(Scope, String), RawValues>,
+}
+
+/// Where one group key's values come from in a batch — resolved once per
+/// batch, so per-row encoding does no map lookups or key clones.
+enum KeySrc<'b> {
+    Strs(&'b [Option<String>]),
+    Values(&'b [Datum]),
+    /// Already encoded: copied verbatim (no decode, no allocation).
+    Raw(&'b RawValues),
+    Map(&'b [BTreeMap<String, Value>], &'b str),
+    Eval(&'b Expr),
+}
+
+impl KeySrc<'_> {
+    /// Append the `eval::group_key_bytes` encoding of row `i`.
+    fn encode(&self, b: &Batch<'_>, i: usize, enc: &mut Encoder) -> Result<()> {
+        use stratadb_schema::codec::{encode_string_value, encode_value};
+        let val = |enc: &mut Encoder, v: Option<&Value>| match v {
+            Some(v) => encode_value(enc, v),
+            None => enc.put_u8(eval::MISSING_KEY_TAG),
+        };
+        match self {
+            KeySrc::Strs(v) => match &v[i] {
+                Some(s) => encode_string_value(enc, s),
+                None => enc.put_u8(eval::MISSING_KEY_TAG),
+            },
+            KeySrc::Values(v) => val(enc, v[i].as_ref()),
+            KeySrc::Raw(r) => match r.bytes(i) {
+                Some(bytes) => enc.put_raw(bytes),
+                None => enc.put_u8(eval::MISSING_KEY_TAG),
+            },
+            KeySrc::Map(m, k) => val(enc, m[i].get(*k)),
+            KeySrc::Eval(e) => val(enc, eval_expr(e, b, i)?.as_ref()),
+        }
+        Ok(())
+    }
 }
 
 fn opt_str(e: &Event, id: ColumnId) -> Option<String> {
@@ -349,59 +425,59 @@ impl Batch<'_> {
     /// Append the group-key encoding of `e` at row `i` to `enc`: identical to
     /// `eval::group_key_bytes(&eval_expr(e, self, i)?)`, but column
     /// references are encoded from the batch by reference (no value clone).
+    #[cfg(test)]
     pub(crate) fn group_key_into(&self, e: &Expr, i: usize, enc: &mut Encoder) -> Result<()> {
-        use stratadb_schema::codec::{encode_string_value, encode_value};
-        let missing = |enc: &mut Encoder| enc.put_u8(eval::MISSING_KEY_TAG);
-        let val = |enc: &mut Encoder, v: Option<&Value>| match v {
-            Some(v) => encode_value(enc, v),
-            None => missing(enc),
+        self.key_source(e)?.encode(self, i, enc)
+    }
+
+    /// Resolve where the values of group key `e` come from in this batch.
+    fn key_source<'b>(&'b self, e: &'b Expr) -> Result<KeySrc<'b>> {
+        let Expr::Column(c) = e else {
+            return Ok(KeySrc::Eval(e));
         };
-        match e {
-            Expr::Column(c) => match c {
-                ColumnRef::Service
-                | ColumnRef::SeverityText
-                | ColumnRef::TraceId
-                | ColumnRef::SpanId
-                | ColumnRef::EventId => {
-                    let id = match c {
-                        ColumnRef::Service => ColumnId::Service,
-                        ColumnRef::SeverityText => ColumnId::SeverityText,
-                        ColumnRef::TraceId => ColumnId::TraceId,
-                        ColumnRef::SpanId => ColumnId::SpanId,
-                        _ => ColumnId::EventId,
-                    };
+        Ok(match c {
+            ColumnRef::Service
+            | ColumnRef::SeverityText
+            | ColumnRef::TraceId
+            | ColumnRef::SpanId
+            | ColumnRef::EventId => {
+                let id = match c {
+                    ColumnRef::Service => ColumnId::Service,
+                    ColumnRef::SeverityText => ColumnId::SeverityText,
+                    ColumnRef::TraceId => ColumnId::TraceId,
+                    ColumnRef::SpanId => ColumnId::SpanId,
+                    _ => ColumnId::EventId,
+                };
+                match self.col(id)? {
+                    ColumnData::Strs(v) => KeySrc::Strs(v),
+                    _ => return Err(Error::internal("expected string column")),
+                }
+            }
+            ColumnRef::Attr(k) | ColumnRef::Resource(k) => {
+                let (scope, id) = if matches!(c, ColumnRef::Attr(_)) {
+                    (Scope::Attributes, ColumnId::Attributes)
+                } else {
+                    (Scope::Resource, ColumnId::ResourceAttributes)
+                };
+                let key = (scope, k.clone());
+                if let Some(col) = self.shredded.get(&key) {
+                    KeySrc::Values(col)
+                } else if let Some(r) = self.raw.get(&key) {
+                    KeySrc::Raw(r)
+                } else {
                     match self.col(id)? {
-                        ColumnData::Strs(v) => match &v[i] {
-                            Some(s) => encode_string_value(enc, s),
-                            None => missing(enc),
-                        },
-                        _ => return Err(Error::internal("expected string column")),
+                        ColumnData::Maps(v) => KeySrc::Map(v, k),
+                        _ => return Err(Error::internal("expected map column")),
                     }
                 }
-                ColumnRef::Attr(k) | ColumnRef::Resource(k) => {
-                    let (scope, id) = if matches!(c, ColumnRef::Attr(_)) {
-                        (Scope::Attributes, ColumnId::Attributes)
-                    } else {
-                        (Scope::Resource, ColumnId::ResourceAttributes)
-                    };
-                    match self.shredded.get(&(scope, k.clone())) {
-                        Some(col) => val(enc, col[i].as_ref()),
-                        None => match self.col(id)? {
-                            ColumnData::Maps(v) => val(enc, v[i].get(k)),
-                            _ => return Err(Error::internal("expected map column")),
-                        },
-                    }
-                }
-                ColumnRef::Body => match self.col(ColumnId::Body)? {
-                    ColumnData::Values(v) => val(enc, v[i].as_ref()),
-                    _ => return Err(Error::internal("expected value column")),
-                },
-                // Cheap scalars (no heap) and whole maps: evaluate normally.
-                _ => val(enc, self.datum(c, i)?.as_ref()),
+            }
+            ColumnRef::Body => match self.col(ColumnId::Body)? {
+                ColumnData::Values(v) => KeySrc::Values(v),
+                _ => return Err(Error::internal("expected value column")),
             },
-            _ => val(enc, eval_expr(e, self, i)?.as_ref()),
-        }
-        Ok(())
+            // Cheap scalars (no heap) and whole maps: evaluate normally.
+            _ => KeySrc::Eval(e),
+        })
     }
 
     /// Row identity `(seq, idx)`; requires the Seq and Idx columns.
@@ -463,14 +539,19 @@ impl Batch<'_> {
             ColumnRef::ResourceAttributes => {
                 Some(Value::Map(maps(ColumnId::ResourceAttributes)?.clone()))
             }
-            ColumnRef::Attr(k) => match self.shredded.get(&(Scope::Attributes, k.clone())) {
-                Some(col) => col[i].clone(),
-                None => maps(ColumnId::Attributes)?.get(k).cloned(),
-            },
-            ColumnRef::Resource(k) => match self.shredded.get(&(Scope::Resource, k.clone())) {
-                Some(col) => col[i].clone(),
-                None => maps(ColumnId::ResourceAttributes)?.get(k).cloned(),
-            },
+            ColumnRef::Attr(k) | ColumnRef::Resource(k) => {
+                let (scope, id) = if matches!(c, ColumnRef::Attr(_)) {
+                    (Scope::Attributes, ColumnId::Attributes)
+                } else {
+                    (Scope::Resource, ColumnId::ResourceAttributes)
+                };
+                let key = (scope, k.clone());
+                match (self.shredded.get(&key), self.raw.get(&key)) {
+                    (Some(col), _) => col[i].clone(),
+                    (None, Some(r)) => r.value(i)?,
+                    (None, None) => maps(id)?.get(k).cloned(),
+                }
+            }
         })
     }
 }
@@ -805,7 +886,7 @@ impl<'a> Ctx<'a> {
             stats: QueryStats::default(),
             mem: 0,
             rows: Vec::new(),
-            groups: crate::groups::GroupTable::new(plan.group_by.len(), plan.aggregates.len()),
+            groups: crate::groups::GroupTable::new(plan.aggregates.len()),
             page,
             keep,
             key_buf: Vec::new(),
@@ -817,8 +898,11 @@ impl<'a> Ctx<'a> {
     }
 
     /// A fresh context for one parallel work item (same plan and budget).
+    /// A context for one parallel work item. Its groups hash with this
+    /// context's seed so [`crate::groups::GroupTable::merge_into`] can reuse
+    /// the hashes.
     fn partial(&self) -> Self {
-        Self::new(
+        let mut p = Self::new(
             self.plan,
             self.opts,
             self.deadline,
@@ -826,7 +910,12 @@ impl<'a> Ctx<'a> {
             self.keep,
             self.vfilter.clone(),
             Arc::clone(&self.budget),
-        )
+        );
+        p.groups = crate::groups::GroupTable::with_hasher(
+            self.plan.aggregates.len(),
+            self.groups.hasher(),
+        );
+        p
     }
 }
 
@@ -886,25 +975,34 @@ impl Ctx<'_> {
         !self.plan.aggregate && !self.sorted() && self.keep.is_some_and(|l| self.rows.len() >= l)
     }
 
-    fn sort_rows(&mut self) {
-        let order = &self.plan.order;
-        // Stable sort: unpaginated rows (identity (0, 0)) keep scan order on ties.
-        self.rows
-            .sort_by(|a, b| cmp_position(order, (&a.keys, a.id), (&b.keys, b.id)));
+    /// Sort and keep the first `keep` rows. With a bound smaller than the
+    /// row count this selects the top `k` (O(n + k log k)) instead of sorting
+    /// everything; ties are broken by the rows' current positions, so the
+    /// result equals the stable sort followed by truncation exactly.
+    fn sort_keep(&mut self) {
+        sort_keep(&mut self.rows, &self.plan.order, self.keep);
     }
 
     /// Keep memory bounded for sorted queries with a row bound (top-k).
     fn maybe_compact(&mut self) {
         if let (true, Some(k)) = (self.sorted(), self.keep) {
             if self.rows.len() > k.saturating_mul(2).max(1024) {
-                self.sort_rows();
-                self.rows.truncate(k);
+                self.sort_keep();
                 self.mem = self.rows.iter().map(row_size).sum();
             }
         }
     }
 
     fn process(&mut self, b: &Batch<'_>) -> Result<()> {
+        let plan = self.plan;
+        let key_srcs: Vec<KeySrc<'_>> = if plan.aggregate {
+            plan.group_by
+                .iter()
+                .map(|g| b.key_source(g))
+                .collect::<Result<_>>()?
+        } else {
+            Vec::new()
+        };
         // Vectorized filter results for rows chunk_start..chunk_end.
         let (mut chunk_start, mut chunk_end) = (0usize, 0usize);
         let mut truth: Vec<Truth> = Vec::new();
@@ -948,10 +1046,10 @@ impl Ctx<'_> {
                 // Group key: per key a u32 length then its group_key_bytes,
                 // built in a reused buffer straight from the batch.
                 let mut enc = Encoder::from_vec(std::mem::take(&mut self.key_buf));
-                for g in &self.plan.group_by {
+                for src in &key_srcs {
                     let at = enc.len();
                     enc.put_u32(0);
-                    b.group_key_into(g, i, &mut enc)?;
+                    src.encode(b, i, &mut enc)?;
                     let n = (enc.len() - at - 4) as u32;
                     let mut buf = enc.into_inner();
                     buf[at..at + 4].copy_from_slice(&n.to_le_bytes());
@@ -962,19 +1060,11 @@ impl Ctx<'_> {
                 let idx = match self.groups.find(h, &kb) {
                     Some(g) => g,
                     None => {
-                        // First row of a new group: materialize its key values.
-                        let keys: Vec<Datum> = self
-                            .plan
-                            .group_by
-                            .iter()
-                            .map(|g| eval_expr(g, b, i))
-                            .collect::<Result<_>>()?;
-                        self.mem += kb.len() * 2
-                            + 64
-                            + keys.iter().map(datum_size).sum::<usize>()
-                            + 48 * self.plan.aggregates.len();
+                        // New group: only its key bytes are stored; key
+                        // values are decoded from them once, at output.
+                        self.mem += kb.len() * 3 + 64 + 48 * self.plan.aggregates.len();
                         let states = self.plan.aggregates.iter().map(|(f, _)| AggState::new(*f));
-                        self.groups.insert(h, &kb, keys, states)
+                        self.groups.insert(h, &kb, states)
                     }
                 };
                 kb.clear();
@@ -1135,6 +1225,7 @@ fn load_batch<'t>(
 ) -> Result<Batch<'t>> {
     let mut cols = HashMap::new();
     let mut shredded = HashMap::new();
+    let mut raw = HashMap::new();
     let footer = seg.reader.footer();
     // When a scope is referenced only through specific keys, read just those
     // keys (shredded chunks, or a projection of the residual map chunk that
@@ -1178,9 +1269,31 @@ fn load_batch<'t>(
         if !on {
             continue;
         }
-        let keys: Vec<String> = keys.iter().cloned().collect();
         if keys.iter().all(|k| footer.shredded(scope, k).is_some()) {
             stats.shredded_reads += 1;
+        }
+        // Shredded keys needed only as group keys stay encoded.
+        let raw_keys = match scope {
+            Scope::Attributes => &plan.raw_group_attr_keys,
+            Scope::Resource => &plan.raw_group_resource_keys,
+        };
+        let mut decode: Vec<String> = Vec::with_capacity(keys.len());
+        for k in keys {
+            match footer.shredded(scope, k) {
+                Some(c) if raw_keys.contains(k) => {
+                    if let Some(r) = seg.reader.read_shredded_raw(scope, k)? {
+                        stats.bytes_read += c.len;
+                        raw.insert((scope, k.clone()), r);
+                        continue;
+                    }
+                    decode.push(k.clone());
+                }
+                _ => decode.push(k.clone()),
+            }
+        }
+        let keys = decode;
+        if keys.is_empty() {
+            continue;
         }
         let (vals, bytes) = seg.reader.read_map_keys(scope, &keys)?;
         stats.bytes_read += bytes;
@@ -1193,6 +1306,7 @@ fn load_batch<'t>(
         tenant,
         cols,
         shredded,
+        raw,
     })
 }
 
@@ -1242,10 +1356,7 @@ fn scan_parallel(
                     )?;
                     p.process(&batch)?;
                     p.check_budget()?;
-                    let empty = crate::groups::GroupTable::new(
-                        template.plan.group_by.len(),
-                        template.plan.aggregates.len(),
-                    );
+                    let empty = crate::groups::GroupTable::new(0);
                     Ok(Partial {
                         stats: std::mem::take(&mut p.stats),
                         rows: std::mem::take(&mut p.rows),
@@ -1297,21 +1408,7 @@ fn scan_parallel(
         ctx.rows.extend(p.rows);
         ctx.maybe_compact();
         // Partial groups in their first-seen order → global first-seen order.
-        for g in 0..p.groups.len() {
-            let (kb, keys, states) = p.groups.group(g);
-            let h = ctx.groups.hash(kb);
-            match ctx.groups.find(h, kb) {
-                Some(idx) => {
-                    for (a, b) in ctx.groups.states_mut(idx).iter_mut().zip(states) {
-                        a.merge(b)?;
-                    }
-                }
-                None => {
-                    ctx.groups
-                        .insert(h, kb, keys.iter().cloned(), states.iter().cloned());
-                }
-            }
-        }
+        p.groups.merge_into(&mut ctx.groups, |a, b| a.merge(&b))?;
     }
     // The merged context now owns the workers' rows/groups: rebase the
     // shared accounting on it before the memtable is processed.
@@ -1456,6 +1553,7 @@ fn run(
             tenant,
             cols,
             shredded: HashMap::new(),
+            raw: HashMap::new(),
         })?;
     }
     ctx.check_budget()?;
@@ -1464,32 +1562,55 @@ fn run(
         if ctx.groups.is_empty() && plan.group_by.is_empty() {
             let states = plan.aggregates.iter().map(|(f, _)| AggState::new(*f));
             let h = ctx.groups.hash(&[]);
-            ctx.groups.insert(h, &[], std::iter::empty(), states);
+            ctx.groups.insert(h, &[], states);
         }
-        let groups = std::mem::replace(
-            &mut ctx.groups,
-            crate::groups::GroupTable::new(plan.group_by.len(), plan.aggregates.len()),
-        );
-        for g in 0..groups.len() {
-            let (_, keys, states) = groups.group(g);
-            let out = plan
-                .outputs
-                .iter()
-                .map(|o| match o {
-                    OutputSource::Group(i) => keys[*i].clone(),
-                    OutputSource::Agg(i) => states[*i].finish(),
-                    OutputSource::Row(_) => None,
-                })
-                .collect::<Vec<Datum>>();
-            let keys = plan
-                .order
+        let groups = std::mem::replace(&mut ctx.groups, crate::groups::GroupTable::new(0));
+        let sort_keys = |out: &[Datum]| -> Vec<Datum> {
+            plan.order
                 .iter()
                 .map(|(s, _)| match s {
                     SortSource::Output(j) => out[*j].clone(),
                     // The planner rejects hidden sort keys in aggregate queries.
                     SortSource::Hidden(_) => None,
                 })
-                .collect();
+                .collect()
+        };
+        let output = |g: usize, keys: Option<&[Datum]>| -> Vec<Datum> {
+            let states = groups.group(g).1;
+            plan.outputs
+                .iter()
+                .map(|o| match o {
+                    OutputSource::Group(i) => keys.and_then(|k| k[*i].clone()),
+                    OutputSource::Agg(i) => states[*i].finish(),
+                    OutputSource::Row(_) => None,
+                })
+                .collect()
+        };
+        // Top-k by aggregate values only (e.g. `ORDER BY count(*) DESC LIMIT
+        // 10`): rank groups on their states, then decode keys and build rows
+        // only for the k selected — not for every group.
+        let by_aggs_only = plan.order.iter().all(|(s, _)| match s {
+            SortSource::Output(j) => !matches!(plan.outputs[*j], OutputSource::Group(_)),
+            SortSource::Hidden(_) => true,
+        });
+        let selected: Vec<usize> = match ctx.keep {
+            Some(k) if ctx.sorted() && by_aggs_only && k < groups.len() => {
+                let ranked: Vec<(usize, Vec<Datum>)> = (0..groups.len())
+                    .map(|g| (g, sort_keys(&output(g, None))))
+                    .collect();
+                let order = &plan.order;
+                top_k(ranked, k, |a, b| {
+                    cmp_position(order, (&a.1, (0, 0)), (&b.1, (0, 0)))
+                })
+                .map(|(g, _)| g)
+                .collect()
+            }
+            _ => (0..groups.len()).collect(),
+        };
+        for g in selected {
+            let keys = crate::groups::decode_keys(groups.group(g).0, plan.group_by.len())?;
+            let out = output(g, Some(&keys));
+            let keys = sort_keys(&out);
             ctx.rows.push(Row {
                 out,
                 keys,
@@ -1498,7 +1619,7 @@ fn run(
         }
     }
     if ctx.sorted() {
-        ctx.sort_rows();
+        ctx.sort_keep();
     }
     if let Some(k) = ctx.keep {
         ctx.rows.truncate(k);
@@ -1713,5 +1834,48 @@ mod parallel_budget_tests {
             scanned <= 1000 + 4 * 150 + 150,
             "scanned {scanned} of 6000 rows"
         );
+    }
+}
+
+#[cfg(test)]
+mod sort_keep_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Top-k selection equals a stable full sort followed by truncation,
+        /// including the order of ties (small key domains force many ties)
+        /// and mixed ASC/DESC keys with missing values.
+        #[test]
+        fn top_k_equals_stable_sort_then_truncate(
+            rows in proptest::collection::vec(
+                (proptest::collection::vec(proptest::option::of(0i64..4), 2), 0u64..3),
+                0..80),
+            desc in proptest::collection::vec(any::<bool>(), 2),
+            keep in proptest::option::of(0usize..90),
+        ) {
+            let order: Vec<(SortSource, bool)> =
+                desc.iter().enumerate().map(|(j, d)| (SortSource::Output(j), *d)).collect();
+            let make = || -> Vec<Row> {
+                rows.iter()
+                    .enumerate()
+                    .map(|(n, (k, id))| Row {
+                        out: vec![Some(Value::UInt(n as u64))],
+                        keys: k.iter().map(|x| x.map(Value::Int)).collect(),
+                        id: (*id, 0),
+                    })
+                    .collect()
+            };
+            let mut want = make();
+            want.sort_by(|a, b| cmp_position(&order, (&a.keys, a.id), (&b.keys, b.id)));
+            if let Some(k) = keep {
+                want.truncate(k);
+            }
+            let mut got = make();
+            sort_keep(&mut got, &order, keep);
+            let ids = |v: &[Row]| v.iter().map(|r| r.out.clone()).collect::<Vec<_>>();
+            prop_assert_eq!(ids(&got), ids(&want));
+        }
     }
 }

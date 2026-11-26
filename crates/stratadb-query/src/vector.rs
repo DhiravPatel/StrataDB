@@ -568,6 +568,7 @@ mod tests {
             tenant: t,
             cols,
             shredded,
+            raw: HashMap::new(),
         }
     }
 

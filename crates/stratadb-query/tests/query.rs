@@ -709,6 +709,14 @@ fn shredded_attribute_columns_give_identical_results_with_less_io() {
         // Mixed: late_key is not shredded in the flushed segments → full-map fallback.
         "SELECT count(*) FROM logs WHERE attributes['late_key'] > 0 OR attributes['region'] = 'ap-south-1'",
         "SELECT event_id, attributes FROM logs WHERE event_id = 'e42'",
+        // Group keys read undecoded from shredded chunks (raw path) vs maps:
+        // top-k by aggregate with ties, null vs missing groups, first-seen
+        // order across segments and memtable, mixed shredded/unshredded keys.
+        "SELECT attributes['region'] AS r, count(*) AS n FROM logs GROUP BY attributes['region'] ORDER BY n DESC LIMIT 1",
+        "SELECT attributes['request_id'] AS r, count(*) AS n, min(event_time) AS t FROM logs GROUP BY attributes['request_id'] ORDER BY n DESC, t LIMIT 3",
+        "SELECT attributes['maybe'] AS m, attributes['late_key'] AS l, count(*) AS n FROM logs GROUP BY attributes['maybe'], attributes['late_key']",
+        "SELECT count(*) AS n FROM logs GROUP BY attributes['http.status_code'] ORDER BY n LIMIT 1",
+        "SELECT count(*) AS n FROM logs WHERE service = 'auth' GROUP BY attributes['region'], service",
     ];
     let mut io = (0u64, 0u64);
     for sql in queries {

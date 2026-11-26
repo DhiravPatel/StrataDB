@@ -2,6 +2,18 @@
 
 ## Unreleased (0.0.1)
 ### Added
+- High-cardinality `GROUP BY` of shredded attributes uses 2.95× less CPU
+  (query 08, `benchmarks/reports/2026-11-25-raw-group-keys.md`): group-only
+  keys are read as validated raw bytes, without per-row allocation; group
+  tables keep key bytes only, and keys are decoded once per output group;
+  `ORDER BY … LIMIT k` selects the top k instead of sorting every row (and
+  ranks aggregate groups before building rows).
+- `strata doctor` completes spec §22.3 for a single node. New checks:
+  open-file limit vs segment and WAL count, worst-case memory budget vs RAM,
+  `--config` validation, TLS certificate expiry (fail when expired, warn
+  under 30 days) and key mode, backup age (`--max-backup-age-hours`), and
+  `--deep` Bloom/n-gram false-negative verification
+  (docs/operations/doctor.md).
 - Index lifecycle: `Engine::indexes`/`rebuild_indexes` and `strata indexes
   list|verify|rebuild` — verification checks filters against the rows (no
   false negatives; current vs stale settings), rebuild rewrites stale or

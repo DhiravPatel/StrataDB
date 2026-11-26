@@ -6,7 +6,9 @@ Recovery runs automatically on every open (`strata status --data-dir D` shows th
 recovery, never modifies files, prints no secrets). It checks formats, permissions,
 lock, disk reserve, manifest, every segment (full verify + Bloom decode), WAL
 (torn tail vs mid-log corruption), unreferenced/quarantined files, clock skew,
-token-store mode and the audit chain; non-zero exit if any check fails.
+token-store mode and the audit chain; with `--config` also TLS expiry and
+backup age, with `--deep` index false negatives; plus the open-file limit and
+memory budget. Non-zero exit if any check fails. See docs/operations/doctor.md.
 
 | Symptom (error) | Meaning | Action |
 |-----------------|---------|--------|

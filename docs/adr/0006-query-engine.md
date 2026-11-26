@@ -61,6 +61,23 @@ High-cardinality `GROUP BY` uses 2.2× less CPU; low-cardinality unchanged
 (`benchmarks/reports/2026-11-25-grouping-flat.md`). The remaining dominant cost
 for high-cardinality string keys is decoding each value into an owned string.
 
+### Update 2026-11-25: undecoded group keys and top-k
+- **Raw group keys.** A shredded attribute key that the query uses only as a
+  whole `GROUP BY` key (`Plan::raw_group_attr_keys`) is read as `RawValues`:
+  encoded bytes plus spans, validated with `skip_value` so a chunk is accepted
+  or rejected exactly as decoding would. Its bytes are copied into the group
+  key.
+- **Key bytes only.** Group tables store only key bytes. The key encoding is
+  bit-exact, so values are decoded once per output group.
+- **Shared hash seed.** Partials share the query's hash seed, so the merge
+  reuses hashes and moves states.
+- **Top-k selection.** `ORDER BY … LIMIT k` uses top-k selection, which is
+  exactly equal to a stable sort followed by truncation. Aggregate queries
+  ordered only by aggregates are ranked before any rows are built.
+- **Result.** Query 08 uses 2.95× less CPU
+  (`benchmarks/reports/2026-11-25-raw-group-keys.md`). No persistent format
+  changed.
+
 ## Revisit conditions
 If the supported SQL surface grows to joins/window functions, or benchmarks
 show vectorized Arrow execution is materially faster on Class B/C workloads.

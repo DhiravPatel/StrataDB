@@ -384,6 +384,24 @@ fn v3_shredding_preserves_rows_null_vs_missing_and_detects_corruption() {
         assert_eq!(r.event.attributes.get("maybe").cloned(), v.clone());
     }
     assert!(maybe.contains(&Some(Value::Null)) && maybe.iter().any(Option::is_none));
+    // Raw (undecoded) reads of every shredded key agree with decoded reads.
+    for c in &a.footer().shredded {
+        let dec = a.read_shredded(c.scope, &c.key).unwrap().unwrap();
+        let raw = a.read_shredded_raw(c.scope, &c.key).unwrap().unwrap();
+        assert_eq!(raw.len(), dec.len());
+        for (i, v) in dec.iter().enumerate() {
+            assert_eq!(&raw.value(i).unwrap(), v);
+            let mut e = stratadb_common::codec::Encoder::new();
+            if let Some(v) = v {
+                stratadb_schema::codec::encode_value(&mut e, v);
+            }
+            assert_eq!(raw.bytes(i), v.as_ref().map(|_| e.as_slice()));
+        }
+    }
+    assert!(a
+        .read_shredded_raw(Scope::Attributes, "rare")
+        .unwrap()
+        .is_none());
     assert!(a
         .read_shredded(Scope::Attributes, "rare")
         .unwrap()
@@ -400,6 +418,62 @@ fn v3_shredding_preserves_rows_null_vs_missing_and_detects_corruption() {
     let p = dir.path().join("bad.sseg");
     std::fs::write(&p, &bytes).unwrap();
     assert!(SegmentReader::open(&p).unwrap().verify().is_err());
+    assert!(SegmentReader::open(&p)
+        .unwrap()
+        .read_shredded_raw(c.scope, &c.key)
+        .is_err());
+}
+
+proptest! {
+    /// Raw indexing of an `OptValue` chunk accepts exactly what decoding
+    /// accepts (valid encodings and arbitrary corruptions of them) and yields
+    /// the same values.
+    #[test]
+    fn raw_values_agree_with_decoding(
+        vals in prop::collection::vec(prop::option::of(arb_attr_value()), 0..12),
+        flip in prop::option::of((any::<prop::sample::Index>(), 1u8..=255)),
+        cut in prop::option::of(any::<prop::sample::Index>()),
+    ) {
+        let mut e = stratadb_common::codec::Encoder::new();
+        for v in &vals {
+            match v {
+                None => e.put_u8(0),
+                Some(v) => {
+                    e.put_u8(1);
+                    stratadb_schema::codec::encode_value(&mut e, v);
+                }
+            }
+        }
+        let mut bytes = e.into_inner();
+        if let (Some((i, x)), false) = (flip, bytes.is_empty()) {
+            let i = i.index(bytes.len());
+            bytes[i] ^= x;
+        }
+        if let (Some(c), false) = (cut, bytes.is_empty()) {
+            bytes.truncate(c.index(bytes.len()));
+        }
+        let raw = columns::index_opt_values(bytes.clone(), vals.len());
+        let dec = columns::decode_column(ColumnId::Body, Encoding::OptValue, &bytes, vals.len());
+        match (raw, dec) {
+            (Ok(r), Ok(ColumnData::Values(v))) => {
+                prop_assert_eq!(r.len(), v.len());
+                // Compare encodings (a flipped byte can make a NaN float).
+                let enc = |v: &Option<Value>| {
+                    v.as_ref().map(|v| {
+                        let mut e = stratadb_common::codec::Encoder::new();
+                        stratadb_schema::codec::encode_value(&mut e, v);
+                        e.into_inner()
+                    })
+                };
+                for (i, want) in v.iter().enumerate() {
+                    prop_assert_eq!(enc(&r.value(i).unwrap()), enc(want));
+                    prop_assert_eq!(r.bytes(i).map(<[u8]>::to_vec), enc(want));
+                }
+            }
+            (Err(_), Err(_)) => {}
+            (r, d) => prop_assert!(false, "raw ok={} decoded ok={}", r.is_ok(), d.is_ok()),
+        }
+    }
 }
 
 fn arb_attr_value() -> impl Strategy<Value = Value> {

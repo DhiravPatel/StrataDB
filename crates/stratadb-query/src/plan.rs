@@ -73,6 +73,12 @@ pub struct Plan {
     pub whole_attributes: bool,
     pub resource_keys: BTreeSet<String>,
     pub whole_resource: bool,
+    /// Attribute (resp. resource) keys referenced only as whole `GROUP BY`
+    /// keys (`GROUP BY attributes['k']` and nowhere else, except as that
+    /// group's output column): scans need only their encoded bytes, so they
+    /// may be read undecoded (`SegmentReader::read_shredded_raw`).
+    pub raw_group_attr_keys: BTreeSet<String>,
+    pub raw_group_resource_keys: BTreeSet<String>,
 }
 
 fn column_id(c: &ColumnRef) -> Option<ColumnId> {
@@ -455,6 +461,8 @@ impl Plan {
                 add(e);
             }
         }
+        let (raw_group_attr_keys, raw_group_resource_keys) =
+            raw_group_keys(aggregate, &items, &outputs, q.filter.as_ref(), &q.group_by);
         let pruning = q.filter.as_ref().map(extract_pruning).unwrap_or_default();
         Ok(Plan {
             explain: stmt.explain,
@@ -472,8 +480,59 @@ impl Plan {
             whole_attributes,
             resource_keys,
             whole_resource,
+            raw_group_attr_keys,
+            raw_group_resource_keys,
         })
     }
+}
+
+/// Keys of `GROUP BY attributes['k']` / `resource['k']` entries that no other
+/// part of the query evaluates per row (see `Plan::raw_group_attr_keys`).
+fn raw_group_keys(
+    aggregate: bool,
+    items: &[SelectItem],
+    outputs: &[OutputSource],
+    filter: Option<&Expr>,
+    group_by: &[Expr],
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let (mut attr, mut res) = (BTreeSet::new(), BTreeSet::new());
+    if !aggregate {
+        return (attr, res);
+    }
+    // Every other per-row use: filters, aggregate arguments and non-group
+    // outputs, and group keys that are expressions over the attribute.
+    let mut other: BTreeSet<(bool, String)> = BTreeSet::new();
+    let mut note = |e: &Expr| {
+        e.walk(&mut |x| match x {
+            Expr::Column(ColumnRef::Attr(k)) => {
+                other.insert((false, k.clone()));
+            }
+            Expr::Column(ColumnRef::Resource(k)) => {
+                other.insert((true, k.clone()));
+            }
+            _ => {}
+        })
+    };
+    for (it, src) in items.iter().zip(outputs) {
+        if !matches!(src, OutputSource::Group(_)) {
+            note(&it.expr);
+        }
+    }
+    filter.into_iter().for_each(&mut note);
+    for g in group_by {
+        match g {
+            Expr::Column(ColumnRef::Attr(k)) => {
+                attr.insert(k.clone());
+            }
+            Expr::Column(ColumnRef::Resource(k)) => {
+                res.insert(k.clone());
+            }
+            e => note(e),
+        }
+    }
+    attr.retain(|k| !other.contains(&(false, k.clone())));
+    res.retain(|k| !other.contains(&(true, k.clone())));
+    (attr, res)
 }
 
 #[cfg(test)]
@@ -483,6 +542,32 @@ mod tests {
 
     fn plan(s: &str) -> Result<Plan> {
         Plan::new(parse(s, &ParseLimits::default())?)
+    }
+
+    #[test]
+    fn raw_group_keys_only_when_used_solely_as_group_keys() {
+        let raw = |q: &str| {
+            let p = plan(q).unwrap();
+            (p.raw_group_attr_keys, p.raw_group_resource_keys)
+        };
+        let set = |ks: &[&str]| ks.iter().map(|k| (*k).to_owned()).collect::<BTreeSet<_>>();
+        assert_eq!(
+            raw("SELECT attributes['u'] AS u, count(*) FROM logs GROUP BY attributes['u']"),
+            (set(&["u"]), set(&[]))
+        );
+        assert_eq!(
+            raw("SELECT count(*) FROM logs GROUP BY attributes['u'], resource['h']"),
+            (set(&["u"]), set(&["h"]))
+        );
+        // Also filtered on, aggregated, or grouped by an expression: decoded.
+        for q in [
+            "SELECT count(*) FROM logs WHERE attributes['u'] = 'a' GROUP BY attributes['u']",
+            "SELECT count(attributes['u']) FROM logs GROUP BY attributes['u']",
+            "SELECT count(*) FROM logs GROUP BY attributes['u'], attributes['u'] = 'x'",
+            "SELECT attributes['u'] FROM logs",
+        ] {
+            assert_eq!(raw(q), (set(&[]), set(&[])), "{q}");
+        }
     }
 
     #[test]

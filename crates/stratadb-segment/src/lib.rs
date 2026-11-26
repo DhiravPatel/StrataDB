@@ -30,7 +30,7 @@ use stratadb_common::codec::{Decoder, Encoder};
 use stratadb_common::{failpoint, fsutil, Error, IoResultExt, Result, TenantId};
 use stratadb_schema::{Event, Severity};
 
-pub use columns::{ColumnData, ColumnId, Encoding};
+pub use columns::{ColumnData, ColumnId, Encoding, RawValues};
 
 pub const MAGIC: [u8; 8] = *b"STRSEG\r\n";
 /// Segment format written by this build (RFC-0001 v2 compression, RFC-0002 v3
@@ -485,6 +485,10 @@ pub mod fuzz_hooks {
         columns::project_map_keys(bytes, rows, keys)
     }
 
+    /// Index an `OptValue` chunk without decoding it (no CRC check).
+    pub fn index_opt_values(bytes: &[u8], rows: usize) -> Result<RawValues> {
+        columns::index_opt_values(bytes.to_vec(), rows)
+    }
     /// LZ4 block decompression with the reader's bound (no CRC check).
     pub fn decompress(bytes: &[u8], raw_len: usize) -> Result<Vec<u8>> {
         if raw_len as u64 > MAX_CHUNK_RAW_BYTES {
@@ -965,6 +969,21 @@ impl SegmentReader {
         .and_then(ColumnData::into_values)
         .map(Some)
         .map_err(|e| Error::corruption(self.path.display().to_string(), format!("{what}: {e}")))
+    }
+
+    /// Like [`Self::read_shredded`], but the values stay encoded
+    /// ([`RawValues`]): validated exactly as decoding would, without
+    /// allocating a `Value` per row. For consumers that only need the
+    /// encoded bytes (group keys).
+    pub fn read_shredded_raw(&self, scope: Scope, key: &str) -> Result<Option<RawValues>> {
+        let Some(c) = self.footer.shredded(scope, key) else {
+            return Ok(None);
+        };
+        let what = format!("shredded {key:?}");
+        let buf = self.read_chunk(&what, c.offset, c.len, c.crc, c.compression, c.raw_len)?;
+        columns::index_opt_values(buf, self.footer.row_count as usize)
+            .map(Some)
+            .map_err(|e| Error::corruption(self.path.display().to_string(), format!("{what}: {e}")))
     }
 
     /// Values of `keys` (sorted, deduplicated) of one attribute scope, one

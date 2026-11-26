@@ -169,7 +169,247 @@ fn check_wal(dir: &Path, flushed: u64, r: &mut Report) {
     r.add("wal", status, d);
 }
 
-pub fn run(dir: &Path, key: Option<&dyn stratadb_crypto::KeyProvider>) -> Report {
+/// Optional inputs of `strata doctor`.
+#[derive(Debug, Default)]
+pub struct Options {
+    /// Server configuration file: enables TLS, backup and memory checks.
+    pub config: Option<std::path::PathBuf>,
+    /// Read every segment and check index filters against the rows.
+    pub deep: bool,
+    /// A backup older than this is reported as a warning.
+    pub max_backup_age: std::time::Duration,
+}
+
+const DAY_MS: i64 = 86_400_000;
+/// Per-query memory budget used by the server (QueryOptions default).
+const QUERY_MEMORY: u64 = 256 << 20;
+
+fn check_fd(segments: usize, wal_segments: usize, r: &mut Report) {
+    // One descriptor per committed segment and WAL segment, plus sockets,
+    // the lock file, logs and headroom.
+    let need = (segments + wal_segments + 256) as u64;
+    match crate::hostcheck::open_file_limit() {
+        None => r.add(
+            "fd_limit",
+            "warn",
+            "could not determine the open-file limit",
+        ),
+        Some(l) => {
+            let shown = if l == u64::MAX {
+                "unlimited".to_owned()
+            } else {
+                l.to_string()
+            };
+            let status = if l < need {
+                "fail"
+            } else if l < need.saturating_mul(4) {
+                "warn"
+            } else {
+                "ok"
+            };
+            r.add(
+                "fd_limit",
+                status,
+                format!(
+                    "soft limit {shown} for processes started from this environment; {segments} segments + {wal_segments} WAL files keep one descriptor each (need ≥ {need}). The service manager may set its own limit (systemd unit: LimitNOFILE=65536)"
+                ),
+            );
+        }
+    }
+}
+
+fn check_memory(cfg: Option<&stratadb_server::config::Resolved>, r: &mut Report) {
+    let Some(total) = crate::hostcheck::total_memory() else {
+        return r.add("memory", "warn", "could not determine physical memory");
+    };
+    let (memtable, queries) = cfg.map_or((64u64 << 20, 16u64), |c| {
+        (
+            c.engine.memtable_max_bytes as u64,
+            c.server.max_concurrent_queries as u64,
+        )
+    });
+    // Active + one frozen memtable, plus every concurrent query at its budget.
+    let worst = memtable * 2 + queries * QUERY_MEMORY;
+    let status = if worst > total { "warn" } else { "ok" };
+    r.add(
+        "memory",
+        status,
+        format!(
+            "{} MiB physical; worst case {} MiB ({} MiB memtables + {queries} concurrent queries × {} MiB budget){}",
+            total >> 20,
+            worst >> 20,
+            (memtable * 2) >> 20,
+            QUERY_MEMORY >> 20,
+            if worst > total { " — lower limits.max_concurrent_queries" } else { "" }
+        ),
+    );
+}
+
+fn check_tls(cfg: &stratadb_server::config::Resolved, r: &mut Report) {
+    let Some(tls) = &cfg.tls else {
+        return r.add(
+            "tls",
+            "ok",
+            "TLS not configured (loopback or behind a TLS proxy)",
+        );
+    };
+    if let Err(e) = stratadb_server::tls::load_server_config(&tls.cert, &tls.key) {
+        return r.add("tls", "fail", e.to_string());
+    }
+    let key_mode = mode(&tls.key);
+    let leaf = stratadb_server::tls::read_leaf_certificate(&tls.cert).ok();
+    let Some(not_after) = leaf.as_deref().and_then(crate::hostcheck::cert_not_after) else {
+        return r.add(
+            "tls",
+            "warn",
+            "certificate loads, but its expiry date could not be read",
+        );
+    };
+    let days = (not_after * 1000 - time::now_unix_millis()).div_euclid(DAY_MS);
+    let expiry = stratadb_common::time::format_rfc3339(not_after * 1_000_000_000);
+    let (status, what) = if days < 0 {
+        ("fail", format!("certificate EXPIRED on {expiry}"))
+    } else if days < 30 {
+        (
+            "warn",
+            format!("certificate expires in {days} days ({expiry}); renew it"),
+        )
+    } else {
+        (
+            "ok",
+            format!("certificate valid for {days} more days ({expiry})"),
+        )
+    };
+    let key_note = match key_mode {
+        Some(m) if m & 0o077 != 0 => {
+            format!("; private key mode {m:o} is group/other accessible (chmod 600)")
+        }
+        _ => String::new(),
+    };
+    let status = if !key_note.is_empty() && status == "ok" {
+        "warn"
+    } else {
+        status
+    };
+    r.add("tls", status, format!("{what}{key_note}"));
+}
+
+fn check_backups(
+    cfg: &stratadb_server::config::Resolved,
+    max_age: std::time::Duration,
+    r: &mut Report,
+) {
+    let Some(root) = &cfg.server.backup_root else {
+        return r.add(
+            "backups",
+            "warn",
+            "no backup directory configured ([backup] dir); a single node cannot survive loss of its disk without backups",
+        );
+    };
+    let mut newest: Option<(i64, String)> = None;
+    let mut bad = Vec::new();
+    for e in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let p = e.path().join("BACKUP");
+        let Ok(raw) = std::fs::read(&p) else { continue };
+        match stratadb_storage::BackupManifest::decode(&raw) {
+            Ok(m) => {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if newest.as_ref().is_none_or(|(t, _)| m.created_ms > *t) {
+                    newest = Some((m.created_ms, name));
+                }
+            }
+            Err(err) => bad.push(format!("{}: {err}", e.path().display())),
+        }
+    }
+    let Some((t, name)) = newest else {
+        return r.add(
+            "backups",
+            "warn",
+            format!("no backups in {}", root.display()),
+        );
+    };
+    let age_ms = time::now_unix_millis() - t;
+    let max_ms = i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
+    let status = if !bad.is_empty() || age_ms > max_ms {
+        "warn"
+    } else {
+        "ok"
+    };
+    r.add(
+        "backups",
+        status,
+        format!(
+            "newest backup `{name}` is {:.1} days old (warn after {:.1}){}; verify restores with `strata backup verify`",
+            age_ms as f64 / DAY_MS as f64,
+            max_ms as f64 / DAY_MS as f64,
+            if bad.is_empty() { String::new() } else { format!("; unreadable: {}", bad.join("; ")) }
+        ),
+    );
+}
+
+/// Read every segment and check its filters for false negatives.
+fn check_indexes_deep(
+    dir: &Path,
+    man: &Manifest,
+    keys: Option<&stratadb_crypto::Keyring>,
+    r: &mut Report,
+) {
+    let mut bad = Vec::new();
+    let mut checked = 0;
+    for e in &man.segments {
+        let p = stratadb_storage::manifest::segment_path(dir, &e.tenant, e.id);
+        let res = (|| -> stratadb_common::Result<Vec<String>> {
+            let rd = stratadb_segment::SegmentReader::open_with(&p, keys)?;
+            let rows = rd.read_rows()?;
+            let refs: Vec<stratadb_segment::RowRef<'_>> = rows
+                .iter()
+                .map(|x| stratadb_segment::RowRef {
+                    seq: x.seq,
+                    idx: x.idx,
+                    event: &x.event,
+                })
+                .collect();
+            let mut fns = Vec::new();
+            let f = rd.footer();
+            if let Some(x) = f.extension(stratadb_segment::bloom::EXT_BLOOM) {
+                fns.extend(
+                    stratadb_segment::bloom::BloomSet::decode(&x.data)?.false_negatives(&refs),
+                );
+            }
+            if let Some(x) = f.extension(stratadb_segment::ngram::EXT_NGRAM) {
+                fns.extend(
+                    stratadb_segment::ngram::NgramSet::decode(&x.data)?.false_negatives(&refs),
+                );
+            }
+            Ok(fns)
+        })();
+        checked += 1;
+        match res {
+            Ok(f) if f.is_empty() => {}
+            Ok(f) => bad.push(format!(
+                "segment {}: {} miss stored values",
+                e.id,
+                f.join(", ")
+            )),
+            Err(err) => bad.push(format!("segment {}: {err}", e.id)),
+        }
+    }
+    if bad.is_empty() {
+        r.add(
+            "indexes",
+            "ok",
+            format!("{checked} segments: no filter misses a stored value"),
+        );
+    } else {
+        r.add(
+            "indexes",
+            "fail",
+            format!("{}; run `strata indexes rebuild`", bad.join("; ")),
+        );
+    }
+}
+
+pub fn run(dir: &Path, key: Option<&dyn stratadb_crypto::KeyProvider>, opts: &Options) -> Report {
     let mut r = Report { checks: Vec::new() };
     r.add(
         "version",
@@ -208,6 +448,34 @@ pub fn run(dir: &Path, key: Option<&dyn stratadb_crypto::KeyProvider>) -> Report
         r.add("permissions", "ok", "all files owner-only, no symlinks");
     } else {
         r.add("permissions", "warn", bad.join("; "));
+    }
+
+    // Server configuration (optional): validated with the server's own resolver.
+    let cfg = match &opts.config {
+        None => None,
+        Some(path) => match stratadb_server::config::FileConfig::load(path).and_then(|f| {
+            stratadb_server::config::resolve(
+                &f,
+                &stratadb_server::config::Overrides {
+                    data_dir: Some(dir.to_path_buf()),
+                    ..Default::default()
+                },
+            )
+        }) {
+            Ok(c) => {
+                r.add("config", "ok", format!("{} is valid", path.display()));
+                Some(c)
+            }
+            Err(e) => {
+                r.add("config", "fail", format!("{}: {e}", path.display()));
+                None
+            }
+        },
+    };
+    check_memory(cfg.as_ref(), &mut r);
+    if let Some(c) = &cfg {
+        check_tls(c, &mut r);
+        check_backups(c, opts.max_backup_age, &mut r);
     }
 
     // Lock: is a server/CLI using the directory right now?
@@ -342,6 +610,14 @@ pub fn run(dir: &Path, key: Option<&dyn stratadb_crypto::KeyProvider>) -> Report
                         }
                     }
                 }
+                if let Some(x) = rd.footer().extension(stratadb_segment::ngram::EXT_NGRAM) {
+                    if let Err(err) = stratadb_segment::ngram::NgramSet::decode(&x.data) {
+                        fails.push(format!(
+                            "segment {} trigram filters undecodable: {err}",
+                            e.id
+                        ));
+                    }
+                }
             }
             Ok(_) => fails.push(format!(
                 "segment {} does not match its manifest entry",
@@ -408,6 +684,13 @@ pub fn run(dir: &Path, key: Option<&dyn stratadb_crypto::KeyProvider>) -> Report
     ));
 
     check_wal(dir, man.flushed_through_seq, &mut r);
+    let wal_segments = std::fs::read_dir(dir.join("wal"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    check_fd(man.segments.len(), wal_segments, &mut r);
+    if opts.deep {
+        check_indexes_deep(dir, &man, keys.as_ref(), &mut r);
+    }
 
     let now = time::now_unix_millis();
     match man.segments.iter().map(|s| s.created_ms).max() {

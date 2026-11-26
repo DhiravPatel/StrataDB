@@ -58,7 +58,7 @@ Maps spec requirements → tasks → acceptance tests. Status: ✅ tested ·
 | §19 | Backup/verify/restore + drills | H-006, H-007 | `tests/backup.rs`, CLI drill, runbook | ◐ (no incremental, no old-version backup yet; encrypted backups ✅) |
 | §20 | Distributed | I-* | — | ⏸ |
 | §21 | HTTP API incl. query status/cancel, OpenAPI | G-001 | `docs/api/openapi.json`, http tests | ✅ |
-| §22 | CLI incl. `doctor` (§22.3), `shell`, `indexes`, `keys`, export/import | H-009 | `apps/stratadb-cli/tests/{cli,doctor,export_import,encryption}.rs` | ◐ (no fd/TLS-expiry checks in doctor) |
+| §22 | CLI incl. `doctor` (§22.3), `shell`, `indexes`, `keys`, export/import | H-009 | `apps/stratadb-cli/tests/{cli,doctor,export_import,encryption}.rs`, docs/operations/doctor.md | ◐ (doctor covers all §22.3 items except cluster connectivity / peer clock skew — no cluster yet) |
 | §26.2 | Property tests (codec, segment, WAL, query) | — | proptest in common/schema/wal/segment/query | ✅ |
 | §26.3 | Fuzzing (WAL, segment, footer, manifest, backup, query+eval, JSON, OTLP, config, tokens, audit) | H-011 | `crates/stratadb-fuzz`, `fuzz/` | ✅ |
 | §26.5 | Crash points incl. compaction/retention/backup | C-008 | `docs/testing/crash-matrix.md` | ◐ |

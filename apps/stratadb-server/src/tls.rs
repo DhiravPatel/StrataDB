@@ -55,6 +55,20 @@ pub fn load_server_config(cert: &Path, key: &Path) -> Result<Arc<rustls::ServerC
     Ok(Arc::new(cfg))
 }
 
+/// DER bytes of the first (leaf) certificate in a PEM file (diagnostics).
+pub fn read_leaf_certificate(cert: &Path) -> Result<Vec<u8>> {
+    CertificateDer::pem_file_iter(cert)
+        .map_err(|e| {
+            Error::invalid_input(format!("reading TLS certificate {}: {e}", cert.display()))
+        })?
+        .next()
+        .ok_or_else(|| Error::invalid_input(format!("no certificates in {}", cert.display())))?
+        .map(|c| c.to_vec())
+        .map_err(|e| {
+            Error::invalid_input(format!("parsing TLS certificate {}: {e}", cert.display()))
+        })
+}
+
 /// An `axum::serve::Listener` yielding completed TLS connections.
 #[derive(Debug)]
 pub struct TlsListener {

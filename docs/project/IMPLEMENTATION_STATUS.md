@@ -6,7 +6,7 @@ reserved for features that additionally passed an independent review / release
 gate; **nothing is VERIFIED yet.**
 
 Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
-`-D warnings` ✅, `cargo test --workspace` ✅ (280 tests, 0 failures).
+`-D warnings` ✅, `cargo test --workspace` ✅ (290 tests, 0 failures).
 
 | ID | Feature | State | Evidence | Known limitations |
 |----|---------|-------|----------|-------------------|
@@ -33,7 +33,8 @@ Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
 | E-013 | Allocation-free grouping (borrowed group-key encoding, slice lookup) | TESTED | `group_key_into_equals_group_key_bytes` proptest (1 000 cases; injected tag bug caught), all query equivalence tests; report `2026-11-25-grouping.md` (1.3–3.0× on group-by queries) | map decoding dominates non-shredded keys |
 | E-014 | Parallel segment scans with partial aggregation (ordered merge, query-wide budgets) | TESTED | `query/tests/parallel.rs` (2), `row_budget_stops_parallel_workers_early`, full query suite under parallelism; 4 injected bugs caught; report `2026-11-25-parallel-ab.md` (2.2–2.6×) | memtable + merge sequential; float sums not bit-identical to sequential |
 | E-015 | Attribute key projection (no whole-map decode for key references) | TESTED | `read_map_keys_equals_full_maps`, `skip_value_validates_like_decode`, engine equivalence proptest with the switch off; report `2026-11-25-map-projection-ab.md` (22× on query 10) | whole-map references still decode every row |
-| E-016 | Flat aggregation groups (HashTable + arena, aHash) | TESTED | `groups::tests`, full query suite (equivalence, parallel group order); report `2026-11-25-grouping-flat.md` (2.2× less CPU on high-cardinality GROUP BY) | string keys still decoded into owned strings |
+| E-016 | Flat aggregation groups (HashTable + arena, aHash) | TESTED | `groups::tests`, full query suite (equivalence, parallel group order); report `2026-11-25-grouping-flat.md` (2.2× less CPU on high-cardinality GROUP BY) | — |
+| E-017 | Undecoded group keys + top-k (shredded keys used only as `GROUP BY` keys read as validated raw bytes; group tables hold key bytes only, keys decoded once per output group; top-k selection for `ORDER BY … LIMIT`) | TESTED | `raw_values_agree_with_decoding` (proptest incl. corruptions) + fuzz differential in `map_projection`, `decode_keys_inverts_encoding`, `top_k_equals_stable_sort_then_truncate`, `merge_keeps_order_and_combines_states`, `raw_group_keys_only_when_used_solely_as_group_keys`, shredded-vs-plain engine equivalence; report `2026-11-25-raw-group-keys.md` (2.95× less CPU on query 08) | unshredded keys still decoded from maps; group keys computed by expressions still evaluated per row |
 | E-011 | Stable keyset pagination (row queries; HTTP `page_size`/`cursor`; Rust/Python/Go SDK helpers) | TESTED | `query/tests/pagination.rs` (9 tests incl. proptest; mutation-checked: removing the tie-break, the `as_of` bound, the strict cursor comparison or loosening either pruning rule each fails tests), `query_pagination_over_http`, SDK conformance (ADR-0023) | aggregates/EXPLAIN not paginated; deep pages of non-time orders rescan |
 | F-001 | Segment statistics | TESTED | footer stats + `verify` | — |
 | F-002 | Timestamp pruning | TESTED | pruning tests + equivalence proptest | segments not time-partitioned |
@@ -61,7 +62,7 @@ Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
 | H-005 | Retention (per tenant, legal hold) | TESTED | `tests/maintenance.rs`, CLI + HTTP endpoints (ADR-0020) | periodic, not instantaneous |
 | H-006, H-007 | Backup, verify, restore + drills | TESTED | `tests/backup.rs`, CLI drill, HTTP backup (ADR-0010) | full backups only; no encryption |
 | H-008 | Metrics | TESTED | `/api/v1/metrics`: engine counters, latency histograms (ingest ack, query, WAL fsync, flush), group-commit size, query outcomes and work; `metrics_histograms_and_query_outcomes` (exposition validity, cumulative buckets, counts), histogram unit tests; docs/operations/metrics.md | no OTel trace export; no per-tenant series (by design) |
-| H-009 | CLI incl. `doctor` (read-only diagnostics) | TESTED | `apps/stratadb-cli/tests/cli.rs`, `tests/doctor.rs` (detects corruption, provably read-only) | local admin only |
+| H-009 | CLI incl. `doctor` (read-only diagnostics: formats, permissions, disk, WAL, segments, deep index verification, fd limit, memory budget, config, TLS expiry, backup age, audit chain) | TESTED | `apps/stratadb-cli/tests/cli.rs`, `tests/doctor.rs` (detects corruption, provably read-only; real certificates via rcgen, `ulimit -n 40`), `src/hostcheck.rs` unit tests; docs/operations/doctor.md | local admin only; no cluster checks |
 | H-010 | Docker/compose/systemd + healthcheck | IMPLEMENTED | `deployments/`, `strata-server healthcheck` smoke | **image build not verified** (no Docker daemon) |
 | H-011 | Fuzzing (14 targets) | TESTED | stable mutation test in default suite; 30k-iteration campaign; cargo-fuzz targets in `fuzz/` (docs/testing/fuzzing.md) | |
 | — | Query status/cancel endpoints | TESTED | `running_queries_can_be_inspected_and_cancelled_by_their_tenant_only` | cancellation checked at batch boundaries |

@@ -12,6 +12,7 @@ use std::time::Duration;
 
 mod doctor;
 mod export;
+mod hostcheck;
 #[cfg(feature = "parquet")]
 mod parquet_io;
 mod shell;
@@ -172,6 +173,15 @@ enum Cmd {
     Doctor {
         #[arg(long)]
         data_dir: PathBuf,
+        /// Server configuration file: also check TLS, backups and memory sizing.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Also read every segment and verify index filters against the rows.
+        #[arg(long)]
+        deep: bool,
+        /// Warn when the newest backup is older than this many hours.
+        #[arg(long, default_value_t = 168)]
+        max_backup_age_hours: u64,
     },
     /// List, verify or rebuild per-segment index filters (Bloom, trigram).
     Indexes {
@@ -845,8 +855,18 @@ fn run(cli: Cli) -> Result<bool> {
         }
         Cmd::Keys { cmd } => return keys(cmd),
         Cmd::Indexes { cmd } => return indexes(cmd),
-        Cmd::Doctor { data_dir } => {
-            let r = doctor::run(&data_dir, key_provider().as_deref());
+        Cmd::Doctor {
+            data_dir,
+            config,
+            deep,
+            max_backup_age_hours,
+        } => {
+            let opts = doctor::Options {
+                config,
+                deep,
+                max_backup_age: Duration::from_secs(max_backup_age_hours.saturating_mul(3600)),
+            };
+            let r = doctor::run(&data_dir, key_provider().as_deref(), &opts);
             let worst = r.worst();
             println!(
                 "{}",

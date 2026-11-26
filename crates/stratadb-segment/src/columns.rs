@@ -496,6 +496,79 @@ pub(crate) fn decode_column(
     Ok(data)
 }
 
+/// An `OptValue` column kept in its encoded form: row `i` is missing or the
+/// `encode_value` bytes `buf[start..end]`. Decoding is deferred to
+/// [`RawValues::value`]; the bytes are validated on construction exactly as
+/// [`decode_column`] validates them (presence markers, tags, lengths, UTF-8,
+/// nesting, map key order — via `skip_value`), so a chunk is accepted or
+/// rejected the same way in either form.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawValues {
+    buf: Vec<u8>,
+    spans: Vec<Option<(u32, u32)>>,
+}
+
+impl RawValues {
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    /// Encoded value of row `i` (`None` = missing). Panics if `i >= len`.
+    pub fn bytes(&self, i: usize) -> Option<&[u8]> {
+        self.spans[i].map(|(s, e)| &self.buf[s as usize..e as usize])
+    }
+
+    /// Decoded value of row `i`.
+    pub fn value(&self, i: usize) -> Result<Option<Value>> {
+        match self.bytes(i) {
+            None => Ok(None),
+            Some(b) => {
+                let mut d = Decoder::new(b, "raw value");
+                let v = decode_value(&mut d, &DecodeLimits::default())?;
+                d.expect_end()?;
+                Ok(Some(v))
+            }
+        }
+    }
+}
+
+/// Validate an `OptValue` chunk and index its values without decoding them.
+pub(crate) fn index_opt_values(buf: Vec<u8>, rows: usize) -> Result<RawValues> {
+    if rows > buf.len() {
+        return Err(Error::corruption("column", "row count exceeds chunk size"));
+    }
+    let end = u32::try_from(buf.len())
+        .map_err(|_| Error::corruption("column", "value chunk larger than 4 GiB"))?;
+    let lim = DecodeLimits::default();
+    let mut spans = Vec::with_capacity(rows);
+    {
+        let mut d = Decoder::new(&buf, "column chunk");
+        let pos = |d: &Decoder<'_>| end - d.remaining() as u32;
+        for _ in 0..rows {
+            match d.get_u8()? {
+                0 => spans.push(None),
+                1 => {
+                    let start = pos(&d);
+                    stratadb_schema::codec::skip_value(&mut d, &lim)?;
+                    spans.push(Some((start, pos(&d))));
+                }
+                other => {
+                    return Err(Error::corruption(
+                        "column",
+                        format!("invalid presence marker {other}"),
+                    ))
+                }
+            }
+        }
+        d.expect_end()?;
+    }
+    Ok(RawValues { buf, spans })
+}
+
 fn expected_encoding(id: ColumnId) -> Encoding {
     match id {
         ColumnId::EventTime

@@ -330,6 +330,35 @@ pub fn fuzz_map_projection(data: &[u8]) {
         .collect();
     let rows = 1 + usize::from(sel >> 5);
     let _ = stratadb_segment::fuzz_hooks::project_map_keys(rest, rows, &keys);
+    // Raw (undecoded) value columns accept exactly the chunks decoding
+    // accepts, and yield the same values.
+    let raw = stratadb_segment::fuzz_hooks::index_opt_values(rest, rows);
+    let dec = stratadb_segment::fuzz_hooks::decode_column(
+        stratadb_segment::ColumnId::Body as u16,
+        stratadb_segment::Encoding::OptValue as u8,
+        rest,
+        rows,
+    );
+    match (raw, dec) {
+        (Ok(r), Ok(stratadb_segment::ColumnData::Values(v))) => {
+            assert_eq!(r.len(), v.len());
+            // Compare encodings (NaN floats are not `==` to themselves).
+            let enc = |v: &Option<stratadb_schema::Value>| {
+                v.as_ref().map(|v| {
+                    let mut e = stratadb_common::codec::Encoder::new();
+                    stratadb_schema::codec::encode_value(&mut e, v);
+                    e.into_inner()
+                })
+            };
+            for (i, want) in v.iter().enumerate() {
+                let got = r.value(i).ok();
+                assert_eq!(got.as_ref().map(enc), Some(enc(want)), "row {i}");
+                assert_eq!(r.bytes(i).map(<[u8]>::to_vec), enc(want), "row {i}");
+            }
+        }
+        (Err(_), Err(_)) => {}
+        (r, d) => panic!("raw {:?} vs decoded {:?} disagree", r.is_ok(), d.is_ok()),
+    }
     let lim = DecodeLimits::default();
     let mut d = Decoder::new(rest, "fuzz");
     let _ = stratadb_schema::codec::skip_value(&mut d, &lim);
