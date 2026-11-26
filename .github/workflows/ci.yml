@@ -28,6 +28,24 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cd sdk/go && gofmt -l . | (! grep .) && go vet ./...
 
+  perf-smoke:
+    # Smoke-level performance checks only: shared CI VMs are not benchmark
+    # runners (spec STRATA-SYS-19-006). Verifies the harness, manifests, plan
+    # assertions and open-loop generator; timings are archived, not gated.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.95.0" }
+      - run: python3 scripts/spec_inventory.py --check
+      - run: cargo build --release --locked -p stratadb-bench
+      - run: target/release/strata-bench scenario benchmarks/scenarios/smoke.toml --out perf-smoke --hw-profile CI-SHARED
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-smoke
+          path: perf-smoke/
+
   parquet-interop:
     # Parquet export read back by independent implementations (ADR-0025).
     runs-on: ubuntu-latest

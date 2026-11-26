@@ -3,10 +3,12 @@
 States: NOT_STARTED · DESIGN · IN_PROGRESS · IMPLEMENTED · TESTED · VERIFIED · BLOCKED.
 "TESTED" = automated tests cover normal and failure behaviour. "VERIFIED" is
 reserved for features that additionally passed an independent review / release
-gate; **nothing is VERIFIED yet.**
+gate; **nothing is VERIFIED yet.** Spec Parts VIII–IX (performance and
+deep architecture, 416 requirements) are tracked separately in
+PERF_INVENTORY.md (ADR-0026).
 
-Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
-`-D warnings` ✅, `cargo test --workspace` ✅ (290 tests, 0 failures).
+Last full validation: 2026-11-26 — `scripts/check.sh`: fmt ✅, clippy
+`-D warnings` ✅, `cargo test --workspace` ✅ (311 tests, 0 failures; requirement inventory current).
 
 | ID | Feature | State | Evidence | Known limitations |
 |----|---------|-------|----------|-------------------|
@@ -34,6 +36,7 @@ Last full validation: 2026-11-25 — `scripts/check.sh`: fmt ✅, clippy
 | E-014 | Parallel segment scans with partial aggregation (ordered merge, query-wide budgets) | TESTED | `query/tests/parallel.rs` (2), `row_budget_stops_parallel_workers_early`, full query suite under parallelism; 4 injected bugs caught; report `2026-11-25-parallel-ab.md` (2.2–2.6×) | memtable + merge sequential; float sums not bit-identical to sequential |
 | E-015 | Attribute key projection (no whole-map decode for key references) | TESTED | `read_map_keys_equals_full_maps`, `skip_value_validates_like_decode`, engine equivalence proptest with the switch off; report `2026-11-25-map-projection-ab.md` (22× on query 10) | whole-map references still decode every row |
 | E-016 | Flat aggregation groups (HashTable + arena, aHash) | TESTED | `groups::tests`, full query suite (equivalence, parallel group order); report `2026-11-25-grouping-flat.md` (2.2× less CPU on high-cardinality GROUP BY) | — |
+| P0 | Measurement system (spec VIII.19, Part VI): TOML scenarios with plan assertions, run manifests, open-loop load with client-bound detection, Mann-Whitney regression comparison, CPU-ns cost ledger, `strata_insert_stage_seconds` / `strata_query_stage_seconds`, `plan_us`/`exec_us`/`queue_us`, release profiles, release declaration | TESTED | `apps/stratadb-bench` unit tests (stats known values, open loop vs coordinated omission, manifest fields, scenario end to end + invalid scenarios, compare selection/verdicts, ledger rule); `metrics_histograms_and_query_outcomes`; `cpu` clock test; CI perf-smoke; report `2026-11-26-p0-measurement-system.md` | gates meaningful only on a dedicated runner (A/A on HW-REF-7: 9/27 false verdicts); CPU ns, not cycles; in-process client |
 | E-017 | Undecoded group keys + top-k (shredded keys used only as `GROUP BY` keys read as validated raw bytes; group tables hold key bytes only, keys decoded once per output group; top-k selection for `ORDER BY … LIMIT`) | TESTED | `raw_values_agree_with_decoding` (proptest incl. corruptions) + fuzz differential in `map_projection`, `decode_keys_inverts_encoding`, `top_k_equals_stable_sort_then_truncate`, `merge_keeps_order_and_combines_states`, `raw_group_keys_only_when_used_solely_as_group_keys`, shredded-vs-plain engine equivalence; report `2026-11-25-raw-group-keys.md` (2.95× less CPU on query 08) | unshredded keys still decoded from maps; group keys computed by expressions still evaluated per row |
 | E-011 | Stable keyset pagination (row queries; HTTP `page_size`/`cursor`; Rust/Python/Go SDK helpers) | TESTED | `query/tests/pagination.rs` (9 tests incl. proptest; mutation-checked: removing the tie-break, the `as_of` bound, the strict cursor comparison or loosening either pruning rule each fails tests), `query_pagination_over_http`, SDK conformance (ADR-0023) | aggregates/EXPLAIN not paginated; deep pages of non-time orders rescan |
 | F-001 | Segment statistics | TESTED | footer stats + `verify` | — |

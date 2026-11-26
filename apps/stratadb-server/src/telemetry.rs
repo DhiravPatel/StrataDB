@@ -19,6 +19,39 @@ pub enum Endpoint {
 
 const ENDPOINTS: [&str; 2] = ["ingest", "otlp"];
 
+/// Server-side INSERT stages (spec VIII.1.2), in pipeline order. Engine
+/// stages (`EngineStats::insert_stages`) are rendered between `validate` and
+/// `ack` in the same `strata_insert_stage_seconds` family.
+#[derive(Debug, Clone, Copy)]
+pub enum InsertStage {
+    /// Token verification and permission check.
+    Auth = 0,
+    /// Body decompression, UTF-8 and JSON/protobuf framing.
+    Decode = 1,
+    /// Per-event schema mapping, validation and limits.
+    Validate = 2,
+    /// Response construction after the commit.
+    Ack = 3,
+}
+
+const INSERT_STAGES: [&str; 4] = ["auth", "decode", "validate", "ack"];
+
+/// SELECT stages (spec VIII.1.4, IX.1 `queue + plan + exec + send = total`).
+#[derive(Debug, Clone, Copy)]
+pub enum QueryStage {
+    /// Waiting for an execution thread after admission.
+    Queue = 0,
+    Parse = 1,
+    /// Bind + optimize (`plan_us`, STRATA-SYS-01-007).
+    Plan = 2,
+    /// Execution (`exec_us`).
+    Exec = 3,
+    /// Result serialization.
+    Serialize = 4,
+}
+
+const QUERY_STAGES: [&str; 5] = ["queue", "parse", "plan", "exec", "serialize"];
+
 /// Query outcomes (label values of `stratadb_queries_total`).
 pub const OUTCOMES: [&str; 6] = ["ok", "invalid", "timeout", "cancelled", "rejected", "error"];
 
@@ -32,11 +65,15 @@ pub struct ServerMetrics {
     bytes_read: AtomicU64,
     segments_scanned: AtomicU64,
     segments_pruned: AtomicU64,
+    insert_stages: [Histogram; 4],
+    query_stages: [Histogram; 5],
 }
 
 impl Default for ServerMetrics {
     fn default() -> Self {
         Self {
+            insert_stages: std::array::from_fn(|_| Histogram::stage()),
+            query_stages: std::array::from_fn(|_| Histogram::stage()),
             ingest_seconds: [Histogram::latency(), Histogram::latency()],
             query_seconds: Histogram::latency(),
             queries: Default::default(),
@@ -50,6 +87,56 @@ impl Default for ServerMetrics {
 }
 
 impl ServerMetrics {
+    pub fn insert_stage(&self, s: InsertStage, d: std::time::Duration) {
+        self.insert_stages[s as usize].observe_duration(d);
+    }
+
+    pub fn query_stage(&self, s: QueryStage, d: std::time::Duration) {
+        self.query_stages[s as usize].observe_duration(d);
+    }
+
+    /// Append `strata_insert_stage_seconds` (server stages around the
+    /// engine's, in pipeline order) and `strata_query_stage_seconds`.
+    pub fn render_stages(
+        &self,
+        out: &mut String,
+        engine: &[(&'static str, stratadb_common::metrics::HistogramSnapshot)],
+    ) {
+        let name = "strata_insert_stage_seconds";
+        let help = "INSERT pipeline stage latency (spec VIII.1.2).";
+        let mut first = true;
+        let mut emit = |label: &str, h: &stratadb_common::metrics::HistogramSnapshot| {
+            h.render(out, name, help, &format!("stage=\"{label}\""), first);
+            first = false;
+        };
+        for i in [
+            InsertStage::Auth,
+            InsertStage::Decode,
+            InsertStage::Validate,
+        ] {
+            emit(
+                INSERT_STAGES[i as usize],
+                &self.insert_stages[i as usize].snapshot(),
+            );
+        }
+        for (label, h) in engine {
+            emit(label, h);
+        }
+        emit(
+            INSERT_STAGES[InsertStage::Ack as usize],
+            &self.insert_stages[InsertStage::Ack as usize].snapshot(),
+        );
+        for (i, label) in QUERY_STAGES.iter().enumerate() {
+            self.query_stages[i].snapshot().render(
+                out,
+                "strata_query_stage_seconds",
+                "SELECT stage latency (queue, parse, plan, exec, serialize; spec VIII.1.4).",
+                &format!("stage=\"{label}\""),
+                i == 0,
+            );
+        }
+    }
+
     /// A committed (acknowledged) ingest request took `d` end to end.
     pub fn ingest_acked(&self, ep: Endpoint, d: std::time::Duration) {
         self.ingest_seconds[ep as usize].observe_duration(d);

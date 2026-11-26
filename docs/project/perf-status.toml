@@ -1,0 +1,341 @@
+# Status of spec Parts VIII–IX requirements (input to scripts/spec_inventory.py,
+# which renders docs/project/PERF_INVENTORY.md). Requirements not listed are
+# MISSING. IMPLEMENTED/PARTIAL need `evidence` (code + tests); PARTIAL,
+# BLOCKED and DEFERRED need a `note` with the reason. ADR-0026 explains the
+# vocabulary and why nothing here is PERF-ACCEPTED.
+
+# ---------------------------------------------------------------- P0 ----
+[req."STRATA-SYS-01-001"]
+status = "PARTIAL"
+evidence = "apps/stratadb-server/src/telemetry.rs (render_stages), crates/stratadb-storage/src/engine.rs + crates/stratadb-wal/src/lib.rs stage histograms; apps/stratadb-server/tests/http.rs metrics_histograms_and_query_outcomes"
+note = "stages auth, decode, validate, admission, wal_encode, wal_append (incl. CRC), group_commit_wait, memtable_insert, ack; schema resolution and partition routing do not exist yet; OTLP endpoint reports engine stages only"
+
+[req."STRATA-SYS-01-002"]
+status = "BLOCKED"
+note = "needs a HW-REF-1 CI runner; the harness reports per-stage p50/p99 vs budget (results.json insert_stages, gate_eligible=false elsewhere)"
+
+[req."STRATA-SYS-01-003"]
+status = "PARTIAL"
+evidence = "apps/stratadb-bench/src/scenario.rs (durability required, recorded in every result)"
+note = "modes are never merged; the async p50 target is unverified (no HW-REF-1)"
+
+[req."STRATA-SYS-01-004"]
+status = "PARTIAL"
+evidence = "apps/stratadb-bench/src/scenario.rs load_dataset label"
+note = "bulk loads are labelled burst / not publishable; no sustained mode spanning compaction cycles yet"
+
+[req."STRATA-SYS-01-007"]
+status = "PARTIAL"
+evidence = "crates/stratadb-query/src/exec.rs QueryStats.parse/plan; apps/stratadb-server/src/lib.rs (stats.plan_us/exec_us/queue_us, `query` log line); tests/http.rs"
+note = "no system.query_log table yet; reported in API response, query log line and strata_query_stage_seconds"
+
+[req."STRATA-SYS-01-009"]
+status = "PARTIAL"
+evidence = "apps/stratadb-bench/src/scenario.rs validate (cache must be warm)"
+note = "cold runs are refused rather than produced invalidly; dropping caches needs root and an idle device"
+
+[req."STRATA-SYS-01-010"]
+status = "MISSING"
+note = "violated today: parallel segment scans spawn scoped threads per query (ADR-0026 phase 10: bounded worker pool); the server does not use a thread per connection (tokio)"
+
+[req."STRATA-SYS-01-012"]
+status = "PARTIAL"
+evidence = "crates/stratadb-storage/src/engine.rs open (manifest + segment footers; full verify only with verify_on_open)"
+note = "every segment file is opened eagerly (fd held), not lazily"
+
+[req."STRATA-SYS-01-014"]
+status = "BLOCKED"
+note = "needs perf_event_open on an isolated Linux core; perf/cpr_ledger.toml records CPU ns per unit instead (labelled)"
+
+[req."STRATA-SYS-01-015"]
+status = "PARTIAL"
+evidence = "apps/stratadb-bench/src/ledger.rs (check: median > measured*(1+0.05+noise_band), 20-run noise band; tests)"
+note = "not enforced in CI: shared machines drift 20-40% between sessions (report 2026-11-26-p0-measurement-system)"
+
+[req."STRATA-SYS-01-016"]
+status = "PARTIAL"
+evidence = "Rust, no garbage collector on any path"
+note = "large frees are not deferred to a background thread"
+
+[req."STRATA-SYS-01-019"]
+status = "PARTIAL"
+evidence = "crates/stratadb-storage/src/engine.rs commit (WAL fsync completes before the memtable insert; snapshots take only the state lock)"
+note = "true by construction; no dedicated test"
+
+[req."STRATA-SYS-01-023"]
+status = "PARTIAL"
+evidence = "per-tenant ingest rate and storage quotas (apps/stratadb-server, docs/operations/configuration.md)"
+note = "no per-tenant CPU, memory or I/O quotas"
+
+[req."STRATA-SYS-18-001"]
+status = "PARTIAL"
+evidence = "Cargo.toml [profile.release] (opt-level 3, fat LTO, codegen-units 1, panic abort, line-tables-only)"
+note = "no separate debuginfo package yet"
+
+[req."STRATA-SYS-18-004"]
+status = "DEFERRED"
+note = "MAY; BOLT only after PGO exists (ADR-0026)"
+
+[req."STRATA-SYS-18-005"]
+status = "PARTIAL"
+evidence = "Cargo.toml [profile.release-checked]; .github/workflows/nightly.yml"
+note = "nightly job defined; no run recorded yet"
+
+[req."STRATA-SYS-18-006"]
+status = "PARTIAL"
+evidence = "benchmarks/reports/2026-11-26-p0-measurement-system.md (binary sizes, build time); glibc/system allocator (no musl)"
+note = "not yet tracked automatically per release; startup time not tracked"
+
+[req."STRATA-SYS-18-007"]
+status = "IMPLEMENTED"
+evidence = "no #[inline(always)] in the workspace; four small #[inline] helpers (checksum, failpoint)"
+
+[req."STRATA-SYS-19-001"]
+status = "IMPLEMENTED"
+evidence = "apps/stratadb-bench/src/{scenario,stats}.rs (TOML scenarios, warmup, >= 5 repetitions enforced, raw samples, median/p95/p99/p99.9/mean/stddev, bootstrap 95% CI); benchmarks/scenarios/*.toml; unit tests"
+
+[req."STRATA-SYS-19-002"]
+status = "IMPLEMENTED"
+evidence = "apps/stratadb-bench/src/openloop.rs (fixed timeline, latency from intended send time, closed loop labelled throughput-only); test open_loop_counts_queueing_from_intended_time"
+
+[req."STRATA-SYS-19-003"]
+status = "PARTIAL"
+evidence = "apps/stratadb-bench/src/openloop.rs (dispatcher CPU > 70% or p99 dispatch lag -> CLIENT_BOUND; excluded by compare)"
+note = "the client is in-process: only the dispatcher's CPU is attributable to the client; no separate client host"
+
+[req."STRATA-SYS-19-004"]
+status = "PARTIAL"
+evidence = "apps/stratadb-bench/src/manifest.rs (+ build.rs); test manifest_has_every_required_field"
+note = "storage firmware/model only from Linux sysfs; sysctls recorded, diff vs a baseline not computed; values that cannot be read are 'unknown'"
+
+[req."STRATA-SYS-19-005"]
+status = "IMPLEMENTED"
+evidence = "apps/stratadb-bench/src/compare.rs (last 10 runs, same runner/durability, Mann-Whitney p < 0.01 and >= 3% median change); tests"
+
+[req."STRATA-SYS-19-006"]
+status = "BLOCKED"
+note = "no dedicated benchmark runner; CI runs the smoke scenario only (.github/workflows/ci.yml perf-smoke)"
+
+[req."STRATA-SYS-25-002"]
+status = "IMPLEMENTED"
+evidence = "apps/stratadb-bench/src/scenario.rs (expect tables fail the verdict); benchmarks/scenarios/standard.toml, smoke.toml"
+
+[req."STRATA-SYS-38-001"]
+status = "IMPLEMENTED"
+evidence = "docs/project/RELEASE_DECLARATION.md"
+
+[req."STRATA-SYS-38-002"]
+status = "IMPLEMENTED"
+evidence = "docs/project/RELEASE_DECLARATION.md (no level claimed; rule stated)"
+
+# ---------------------------------------------------------------- P1 ----
+[req."STRATA-SYS-02-019"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-common/src/fsutil.rs (POSIX rename/fsync only); crates/stratadb-storage/tests/crash.rs, power_loss_sim.rs"
+
+[req."STRATA-SYS-02-020"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-common/src/fsutil.rs atomic_write/fsync_dir; docs/testing/crash-matrix.md"
+
+[req."STRATA-SYS-02-035"]
+status = "PARTIAL"
+evidence = "crates/stratadb-query QueryOptions.max_memory_bytes (queries fail with resource_exhausted)"
+note = "estimates, not a tracker hierarchy (VIII.5)"
+
+[req."STRATA-SYS-02-038"]
+status = "PARTIAL"
+evidence = "durations use std::time::Instant; data timestamps use the realtime clock"
+note = "not audited across all crates"
+
+[req."STRATA-SYS-02-040"]
+status = "IMPLEMENTED"
+evidence = "stage timers are per batch / per query (engine.rs, telemetry.rs); no per-row timing"
+
+[req."STRATA-SYS-02-041"]
+status = "PARTIAL"
+evidence = "apps/stratadb-cli/src/doctor.rs (exit 1 on any fail); tests/doctor.rs"
+note = "`strata doctor` covers fd/memory/disk/TLS/backups; no VIII.2 `doctor host` checklist (THP, governor, sysctls, filesystems)"
+
+[req."STRATA-SYS-02-042"]
+status = "PARTIAL"
+evidence = "apps/stratadb-cli/src/doctor.rs (JSON {checks:[{check,status,detail}]})"
+note = "as for STRATA-SYS-02-041"
+
+[req."STRATA-SYS-03-012"]
+status = "PARTIAL"
+evidence = "crates/stratadb-wal/src/lib.rs wait_durable (lock released during fsync)"
+note = "the manifest mutex is held across flush I/O (it serializes flushes)"
+
+[req."STRATA-SYS-03-015"]
+status = "PARTIAL"
+evidence = "crates/stratadb-storage/src/engine.rs (background thread named stratadb-bg)"
+note = "scan threads are unnamed; prefixes differ from sx-*"
+
+[req."STRATA-SYS-04-002"]
+status = "PARTIAL"
+evidence = "crates/stratadb-common/src/{failpoint,simfs}.rs; crates/stratadb-storage/tests/{crash,power_loss_sim}.rs"
+note = "failpoints and the power-loss recorder, not an IoEngine sim backend"
+
+[req."STRATA-SYS-04-026"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-wal/src/lib.rs (poison on sync error: no further acks); crates/stratadb-storage/tests/crash.rs"
+
+[req."STRATA-SYS-05-001"]
+status = "PARTIAL"
+evidence = "system allocator, named in every benchmark manifest (apps/stratadb-bench/src/manifest.rs)"
+note = "no system.build_info table"
+
+[req."STRATA-SYS-07-001"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-wal (u64 sequence numbers; durable prefix); crates/stratadb-wal/src/tests.rs"
+
+[req."STRATA-SYS-07-003"]
+status = "PARTIAL"
+evidence = "crc32c crate (SSE4.2 / ARMv8 CRC with software fallback); perf/cpr_ledger.toml crc32c entry"
+note = "throughput target unverified (HW-REF-7 only)"
+
+[req."STRATA-SYS-07-005"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-wal/src/lib.rs wait_durable (single leader fsync); test concurrent_sync_appends"
+
+[req."STRATA-SYS-07-009"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-wal recovery (CRC per frame, stop at invalid tail, mid-log damage fails closed); tests mid_log_corruption_fails_closed_unless_forced, reordered_unsynced_tail_is_truncated"
+
+[req."STRATA-SYS-07-011"]
+status = "IMPLEMENTED"
+evidence = "WAL reclamation after flush (crates/stratadb-storage/src/engine.rs, docs/storage-format/wal-v2.md)"
+
+[req."STRATA-SYS-13-006"]
+status = "PARTIAL"
+evidence = "EXPLAIN ANALYZE (crates/stratadb-query/src/exec.rs explain_text)"
+note = "query-level statistics, not per operator"
+
+[req."STRATA-SYS-36-001"]
+status = "PARTIAL"
+evidence = "crates/stratadb-segment/src/lib.rs (unknown versions and required extensions rejected, optional ones ignored)"
+note = "applies to the segment format; the VIII.36 part format does not exist yet"
+
+[req."STRATA-SYS-36-004"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-segment/src/lib.rs read_chunk (CRC verified before decompression); corruption tests"
+
+[req."STRATA-SYS-36-007"]
+status = "PARTIAL"
+evidence = "reads segment v1-v3 and WAL v1-v2; tests/fixtures/storage-v1"
+note = "pre-1.0: no major releases yet"
+
+[req."STRATA-SYS-36-008"]
+status = "PARTIAL"
+evidence = "tests/fixtures/storage-v1 (golden fixture decoded in CI)"
+note = "not one fixture per type x codec"
+
+# ---------------------------------------------------------------- P2/P3 --
+[req."STRATA-SYS-08-001"]
+status = "PARTIAL"
+evidence = "crates/stratadb-query/src/vector.rs vectorized_equals_scalar (scalar evaluation is the oracle)"
+note = "no ISA tiers yet (unsafe boundary: ADR-0026)"
+
+[req."STRATA-SYS-08-003"]
+status = "BLOCKED"
+note = "AVX2/AVX-512/NEON tiers need unsafe intrinsics or a vetted dependency; owner decision pending (ADR-0026)"
+
+[req."STRATA-SYS-09-001"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-query/src/groups.rs (aHash, per-query random seed)"
+
+[req."STRATA-SYS-10-009"]
+status = "PARTIAL"
+evidence = "engine write stall on frozen-memtable backlog (crates/stratadb-storage/src/engine.rs)"
+note = "a hard stall with timeout, not a smooth per-insert delay"
+
+[req."STRATA-SYS-14-003"]
+status = "PARTIAL"
+evidence = "crates/stratadb-query/src/exec.rs top_k / sort_keep (+ proptest top_k_equals_stable_sort_then_truncate)"
+note = "bounded selection per partial, no shared k-th threshold across workers"
+
+[req."STRATA-SYS-17-004"]
+status = "IMPLEMENTED"
+evidence = "obsolete segments deleted only when no snapshot references them (crates/stratadb-storage/tests/maintenance.rs)"
+
+[req."STRATA-SYS-06-006"]
+status = "PARTIAL"
+evidence = "HTTP query cancellation (atomic flag checked per 1,024 rows; apps/stratadb-server tests)"
+note = "propagation latency not measured; no native protocol"
+
+[req."STRATA-SYS-06-014"]
+status = "PARTIAL"
+evidence = "rustls + ring, TLS 1.3 (apps/stratadb-server/src/tls.rs, ADR-0021)"
+note = "TLS overhead not measured"
+
+# ---------------------------------------------------------------- A0 ----
+[req."STRATA-ARCH-00-001"]
+status = "PARTIAL"
+evidence = "docs/adr/0026-performance-architecture-adoption.md"
+note = "rule adopted; no docs/rfc template yet"
+
+[req."STRATA-ARCH-00-002"]
+status = "PARTIAL"
+evidence = "docs/adr/0026-performance-architecture-adoption.md; recent work (pruning, projection, raw group keys) followed it"
+note = "process rule, not mechanically checked"
+
+[req."STRATA-ARCH-01-005"]
+status = "IMPLEMENTED"
+evidence = "single strata-server process; no helper processes (deployments/)"
+
+[req."STRATA-ARCH-01-007"]
+status = "PARTIAL"
+evidence = "the engine and query crates run in-process (strata CLI, strata-bench, tests)"
+note = "no packaged libstrata embedding API"
+
+[req."STRATA-ARCH-01-008"]
+status = "PARTIAL"
+evidence = "ingest responses state durability (wal_synced / wal_written); sdk/rust WriteReceipt.durability"
+note = "no async-insert buffer mode"
+
+[req."STRATA-ARCH-01-009"]
+status = "IMPLEMENTED"
+evidence = "memtable visibility at commit; ingest response visible_to_queries=true; query tests read just-written events"
+
+[req."STRATA-ARCH-01-011"]
+status = "PARTIAL"
+evidence = "queue/parse/plan/exec/serialize timers per query (query log line, strata_query_stage_seconds)"
+note = "no tracing spans; prune time not separated from exec"
+
+[req."STRATA-ARCH-01-012"]
+status = "PARTIAL"
+evidence = "segment pruning (time, keys, severity, Bloom, n-gram) before reading column data; counts in EXPLAIN ANALYZE"
+note = "segment-level only (no granules); no query log table"
+
+# ---------------------------------------------------------------- A1/A2 --
+[req."STRATA-ARCH-02-004"]
+status = "PARTIAL"
+evidence = "obsolete segments stay readable by earlier snapshots (crates/stratadb-storage/tests/maintenance.rs)"
+note = "no explicit part state enum / system.parts"
+
+[req."STRATA-ARCH-04-005"]
+status = "IMPLEMENTED"
+evidence = "Snapshot = segments + memtable rows at query start (crates/stratadb-storage/src/engine.rs); snapshot tests"
+
+[req."STRATA-ARCH-04-006"]
+status = "IMPLEMENTED"
+evidence = "one WAL record + one memtable insert per batch under the write gate; crash tests recover whole batches"
+
+[req."STRATA-ARCH-12-005"]
+status = "PARTIAL"
+evidence = "ingest collects per-record errors with index (apps/stratadb-server/src/lib.rs ingest_inner)"
+note = "JSON ingest only; no allow-errors threshold setting"
+
+[req."STRATA-ARCH-12-008"]
+status = "IMPLEMENTED"
+evidence = "idempotency keys with bounded window (crates/stratadb-storage/src/idempotency.rs, ADR-0019)"
+
+[req."STRATA-ARCH-06-010"]
+status = "PARTIAL"
+evidence = "crates/stratadb-query/src/exec.rs AggState::{new,update,merge,finish}"
+note = "no serialize/deserialize (needed for projections, MVs, distributed)"
+
+[req."STRATA-ARCH-06-011"]
+status = "PARTIAL"
+evidence = "parallel_equals_sequential exercises merge for every aggregate (crates/stratadb-query/tests/parallel.rs)"
+note = "no per-function associativity/commutativity property tests"

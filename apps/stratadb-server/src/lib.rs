@@ -559,10 +559,14 @@ async fn ingest(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> 
 }
 
 async fn ingest_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    use telemetry::InsertStage;
+    let stage = Instant::now();
     let principal = match authenticate(&st, &headers, Permission::Ingest) {
         Ok(p) => p,
         Err(r) => return r,
     };
+    st.metrics.insert_stage(InsertStage::Auth, stage.elapsed());
+    let stage = Instant::now();
     let Ok(permit) = Arc::clone(&st.ingest_sem).try_acquire_owned() else {
         return error_response(&Error::resource_exhausted(
             "too many concurrent ingest requests",
@@ -595,6 +599,9 @@ async fn ingest_inner(State(st): State<AppState>, headers: HeaderMap, body: Byte
             .map(|l| serde_json::from_str::<J>(l).map_err(|e| format!("invalid JSON: {e}")))
             .collect()
     };
+    st.metrics
+        .insert_stage(InsertStage::Decode, stage.elapsed());
+    let stage = Instant::now();
     let now = time::now_unix_nanos();
     let mut events = Vec::new();
     let mut errors = Vec::new();
@@ -608,6 +615,8 @@ async fn ingest_inner(State(st): State<AppState>, headers: HeaderMap, body: Byte
                 .push(json!({"index": i, "error": e.kind().as_str(), "message": e.to_string()})),
         }
     }
+    st.metrics
+        .insert_stage(InsertStage::Validate, stage.elapsed());
     let rejected = errors.len();
     errors.truncate(100);
     if events.is_empty() {
@@ -623,17 +632,22 @@ async fn ingest_inner(State(st): State<AppState>, headers: HeaderMap, body: Byte
             .into_response();
     }
     match commit(&st, &principal, permit, events, idem).await {
-        Ok(c) => Json(json!({
-            // For a duplicate, `accepted` and `commit_seq` describe the original commit.
-            "accepted": c.accepted,
-            "rejected": rejected, "errors": errors,
-            "duplicate": c.receipt.duplicate,
-            "commit_seq": c.receipt.commit_seq,
-            // Explicit durability state (spec §2.1): never "stored successfully".
-            "durability": c.receipt.level.as_str(), "visible_to_queries": true,
-            "flushed_to_segments": false, "replicated": false,
-        }))
-        .into_response(),
+        Ok(c) => {
+            let stage = Instant::now();
+            let r = Json(json!({
+                // For a duplicate, `accepted` and `commit_seq` describe the original commit.
+                "accepted": c.accepted,
+                "rejected": rejected, "errors": errors,
+                "duplicate": c.receipt.duplicate,
+                "commit_seq": c.receipt.commit_seq,
+                // Explicit durability state (spec §2.1): never "stored successfully".
+                "durability": c.receipt.level.as_str(), "visible_to_queries": true,
+                "flushed_to_segments": false, "replicated": false,
+            }))
+            .into_response();
+            st.metrics.insert_stage(InsertStage::Ack, stage.elapsed());
+            r
+        }
         Err(e) => error_response(&e),
     }
 }
@@ -966,6 +980,7 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
     let tenant = principal.tenant.clone();
     let started = Instant::now();
     let res = blocking(move || {
+        let queued = started.elapsed();
         let _permit = permit;
         let _guard = guard;
         let opts = QueryOptions {
@@ -980,19 +995,22 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
                 page_size: req.page_size.unwrap_or(max_rows).min(max_rows),
                 cursor: req.cursor,
             };
-            execute_page(&snap, &req.query, &opts, &page).map(|p| (p.output, p.next_cursor))
+            execute_page(&snap, &req.query, &opts, &page).map(|p| (p.output, p.next_cursor, queued))
         } else {
-            execute(&snap, &req.query, &opts).map(|o| (o, None))
+            execute(&snap, &req.query, &opts).map(|o| (o, None, queued))
         }
     })
     .await;
     match res {
-        Ok((out, next_cursor)) => {
+        Ok((out, next_cursor, queued)) => {
+            use telemetry::QueryStage;
+            let serializing = Instant::now();
             st.metrics.query_work(&out.stats);
             let names = unique_names(&out.columns);
             let rows: Vec<J> = out.rows.iter().map(|r| row_object(&names, r)).collect();
             let s = &out.stats;
-            Json(json!({
+            let us = |d: Duration| d.as_secs_f64() * 1e6;
+            let r = Json(json!({
                 "query_id": query_id,
                 "columns": names,
                 "rows": rows,
@@ -1006,9 +1024,32 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
                     "segments_scanned": s.segments_scanned,
                     "segments_pruned": s.segments_pruned_time + s.segments_pruned_keys + s.segments_pruned_severity + s.segments_pruned_bloom + s.segments_pruned_ngram + s.segments_pruned_cursor,
                     "indexes_used": s.indexes_used,
+                    // Phase decomposition (spec VIII.1.4, STRATA-SYS-01-007):
+                    // queue + parse + plan + exec (+ serialize) ≈ elapsed.
+                    "queue_us": us(queued), "parse_us": us(s.parse),
+                    "plan_us": us(s.plan), "exec_us": us(s.elapsed),
                 },
             }))
-            .into_response()
+            .into_response();
+            let serialize = serializing.elapsed();
+            for (stage, d) in [
+                (QueryStage::Queue, queued),
+                (QueryStage::Parse, s.parse),
+                (QueryStage::Plan, s.plan),
+                (QueryStage::Exec, s.elapsed),
+                (QueryStage::Serialize, serialize),
+            ] {
+                st.metrics.query_stage(stage, d);
+            }
+            // Query log (no SQL text or values: they may carry tenant data).
+            tracing::info!(
+                target: "query", query_id = %query_id, tenant = %principal.tenant,
+                queue_us = us(queued) as u64, parse_us = us(s.parse) as u64,
+                plan_us = us(s.plan) as u64, exec_us = us(s.elapsed) as u64,
+                serialize_us = us(serialize) as u64, rows_scanned = s.rows_scanned,
+                rows_returned = rows.len(), segment_bytes_read = s.bytes_read, "query"
+            );
+            r
         }
         Err(e) => error_response(&e),
     }
@@ -1198,6 +1239,7 @@ async fn metrics(State(st): State<AppState>, headers: HeaderMap) -> Response {
         true,
     );
     st.metrics.render(&mut out);
+    st.metrics.render_stages(&mut out, &s.insert_stages);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],

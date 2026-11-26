@@ -90,7 +90,12 @@ pub struct QueryStats {
     pub bytes_read: u64,
     pub peak_memory_bytes: usize,
     pub early_stop: bool,
+    /// Execution time (scan to result rows), excluding parse and plan.
     pub elapsed: Duration,
+    /// Parse time (spec VIII.1.4 / STRATA-SYS-01-007: reported separately).
+    pub parse: Duration,
+    /// Plan (bind + optimize) time, reported separately from execution.
+    pub plan: Duration,
 }
 
 /// Result of a query. `rows[i][j]` is `None` when the value is missing.
@@ -105,9 +110,14 @@ pub struct QueryOutput {
 
 /// Parse, plan, and run `sql` against `snapshot`.
 pub fn execute(snapshot: &Snapshot, sql: &str, opts: &QueryOptions) -> Result<QueryOutput> {
+    let t = Instant::now();
     let stmt = crate::parser::parse(sql, &opts.parse_limits)?;
+    let parsed = t.elapsed();
     let plan = Plan::new(stmt)?;
+    let planned = t.elapsed() - parsed;
     let mut res = run(snapshot, &plan, opts, None)?;
+    res.output.stats.parse = parsed;
+    res.output.stats.plan = planned;
     if res.output.explain.is_none() && res.rows.len() > opts.max_result_rows {
         return Err(Error::resource_exhausted(format!(
             "result has more than {} rows; add a LIMIT or paginate",
@@ -155,8 +165,11 @@ pub fn execute_page(
     opts: &QueryOptions,
     req: &PageRequest,
 ) -> Result<Page> {
+    let t = Instant::now();
     let stmt = crate::parser::parse(sql, &opts.parse_limits)?;
+    let parsed = t.elapsed();
     let plan = Plan::new(stmt)?;
+    let planned = t.elapsed() - parsed;
     if plan.explain != ExplainMode::None {
         return Err(Error::invalid_input("EXPLAIN queries cannot be paginated"));
     }
@@ -219,6 +232,8 @@ pub fn execute_page(
         k: take.saturating_add(1),
     };
     let mut res = run(snapshot, &plan, opts, Some(pctx))?;
+    res.output.stats.parse = parsed;
+    res.output.stats.plan = planned;
     let more = res.rows.len() > take && remaining.is_none_or(|r| (take as u64) < r);
     res.rows.truncate(take);
     let next_cursor = match (more, res.rows.last()) {

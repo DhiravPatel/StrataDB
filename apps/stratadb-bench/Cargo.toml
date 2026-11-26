@@ -17,6 +17,9 @@ stratadb-storage.workspace = true
 stratadb-query.workspace = true
 stratadb-testkit.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+sha2.workspace = true
+toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 
 [dev-dependencies]

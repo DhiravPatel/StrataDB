@@ -1,0 +1,16 @@
+name: nightly
+on:
+  schedule: [{ cron: "17 3 * * *" }]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  release-checked:
+    # Full test suite with release optimizations plus debug assertions and
+    # overflow checks (spec STRATA-SYS-18-005).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.95.0" }
+      - run: cargo test --workspace --locked --profile release-checked

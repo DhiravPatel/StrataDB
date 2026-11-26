@@ -1,7 +1,9 @@
 # CLAUDE.md — persistent instructions for coding agents
 
 Read before every session: this file, `docs/project/NEXT_SESSION.md`, `docs/project/IMPLEMENTATION_STATUS.md`,
-`docs/project/TASKS.md`, and the relevant ADRs in `docs/adr/`. The master contract is
+`docs/project/TASKS.md`, and the relevant ADRs in `docs/adr/`. Performance/architecture
+requirements (spec Parts IV–IX): `docs/project/PERF_INVENTORY.md` (edit
+`perf-status.toml`, regenerate with `scripts/spec_inventory.py`) and ADR-0026. The master contract is
 `docs/spec/StrataDB_Master_Engineering_Specification.md` (the "spec").
 
 ## Non-negotiables (spec Appendix E, §36.3)

@@ -1371,7 +1371,22 @@ async fn metrics_histograms_and_query_outcomes() {
         assert_eq!(st, 200);
     }
     for _ in 0..3 {
-        assert_eq!(query(&s, &s.a_rw, "SELECT count(*) FROM logs").await.0, 200);
+        let (st, body) = query(&s, &s.a_rw, "SELECT count(*) FROM logs").await;
+        assert_eq!(st, 200);
+        // Phase decomposition is reported per query (STRATA-SYS-01-007).
+        let stats = &body["stats"];
+        for k in ["queue_us", "parse_us", "plan_us", "exec_us"] {
+            assert!(stats[k].as_f64().is_some_and(|v| v >= 0.0), "{k}: {stats}");
+        }
+        assert!(stats["exec_us"].as_f64().unwrap() > 0.0);
+        let parts = ["queue_us", "parse_us", "plan_us", "exec_us"]
+            .iter()
+            .map(|k| stats[k].as_f64().unwrap())
+            .sum::<f64>();
+        assert!(
+            parts <= stats["elapsed_ms"].as_f64().unwrap() * 1000.0 + 1.0,
+            "{stats}"
+        );
     }
     assert_eq!(query(&s, &s.a_rw, "SELECT nope FROM logs").await.0, 400);
     // Unauthenticated requests are not queries.
@@ -1463,6 +1478,62 @@ async fn metrics_histograms_and_query_outcomes() {
             *buckets.last().unwrap(),
             get(&format!("{fam}_count"), count_labels),
             "{fam}"
+        );
+    }
+    // INSERT stage family (STRATA-SYS-01-001): every stage, pipeline order,
+    // one observation per committed batch; µs-resolution buckets.
+    let stages = [
+        "auth",
+        "decode",
+        "validate",
+        "admission",
+        "wal_encode",
+        "wal_append",
+        "group_commit_wait",
+        "memtable_insert",
+        "ack",
+    ];
+    let order: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("strata_insert_stage_seconds_count{stage=\""))
+        .map(|l| l.split('"').next().unwrap())
+        .collect();
+    assert_eq!(order, stages, "stage order");
+    for st in stages {
+        assert_eq!(
+            get(
+                "strata_insert_stage_seconds_count",
+                &format!("stage=\"{st}\"")
+            ),
+            5.0,
+            "{st}"
+        );
+        assert_eq!(
+            get(
+                "strata_insert_stage_seconds_bucket",
+                &format!("stage=\"{st}\",le=\"+Inf\"")
+            ),
+            5.0
+        );
+    }
+    assert!(
+        text.contains("strata_insert_stage_seconds_bucket{stage=\"wal_append\",le=\"0.000001\"}")
+    );
+    // Group commit waits for an fsync: never zero.
+    assert!(
+        get(
+            "strata_insert_stage_seconds_sum",
+            "stage=\"group_commit_wait\""
+        ) > 0.0
+    );
+    for st in ["queue", "parse", "plan", "exec", "serialize"] {
+        assert_eq!(
+            get(
+                "strata_query_stage_seconds_count",
+                &format!("stage=\"{st}\"")
+            ),
+            3.0,
+            "{st}: successful queries only"
         );
     }
     assert!(

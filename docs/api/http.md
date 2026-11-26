@@ -43,6 +43,11 @@ and flushes. Beyond the window/capacity, delivery is at-least-once (ADR-0019).
 
 ## Query response
 `{"columns": [...], "rows": [{col: value}], "explain": null|text, "partial": false, "next_cursor": null|string, "stats": {...}}`.
+`stats` includes the phase decomposition `queue_us`, `parse_us`, `plan_us`
+and `exec_us` (spec VIII.1.4; `queue + parse + plan + exec ≤ elapsed_ms`,
+and the remainder is serialization). Each successful query is also logged as
+a structured `query` event (target `query`) with these timings, the rows
+scanned and returned, and the bytes read. It contains no SQL text or values.
 Missing values are **omitted** from row objects; null is JSON `null`.
 Duplicate column names get `#2`, `#3` suffixes. Timestamps are RFC 3339 strings.
 

@@ -152,6 +152,11 @@ pub struct Wal {
     sync_seconds: stratadb_common::metrics::Histogram,
     /// Records made durable by one fsync (group-commit size, spec §8.4).
     group_size: stratadb_common::metrics::Histogram,
+    /// INSERT stage `wal_append` (spec VIII.1.2): frame encode + checksum
+    /// (+ seal) + write, including waiting for the WAL lock.
+    append_seconds: stratadb_common::metrics::Histogram,
+    /// INSERT stage `group_commit_wait`: from written to durable (sync modes).
+    commit_wait_seconds: stratadb_common::metrics::Histogram,
 }
 
 /// WAL latency/size distributions.
@@ -159,6 +164,8 @@ pub struct Wal {
 pub struct WalMetrics {
     pub sync_seconds: stratadb_common::metrics::HistogramSnapshot,
     pub group_size: stratadb_common::metrics::HistogramSnapshot,
+    pub append_seconds: stratadb_common::metrics::HistogramSnapshot,
+    pub commit_wait_seconds: stratadb_common::metrics::HistogramSnapshot,
 }
 
 impl std::fmt::Debug for Wal {
@@ -491,6 +498,8 @@ impl Wal {
             cv: Condvar::new(),
             sync_seconds: stratadb_common::metrics::Histogram::latency(),
             group_size: stratadb_common::metrics::Histogram::sizes(),
+            append_seconds: stratadb_common::metrics::Histogram::stage(),
+            commit_wait_seconds: stratadb_common::metrics::Histogram::stage(),
         };
         Ok((wal, report))
     }
@@ -504,6 +513,8 @@ impl Wal {
         WalMetrics {
             sync_seconds: self.sync_seconds.snapshot(),
             group_size: self.group_size.snapshot(),
+            append_seconds: self.append_seconds.snapshot(),
+            commit_wait_seconds: self.commit_wait_seconds.snapshot(),
         }
     }
 
@@ -536,6 +547,7 @@ impl Wal {
     /// * `Indeterminate` — a write or sync failed after the frame may have
     ///   reached the file; the record may or may not survive recovery.
     pub fn append(&self, record_type: RecordType, payload: &[u8]) -> Result<u64> {
+        let started = Instant::now();
         if payload.len() > self.opts.max_record_bytes as usize {
             return Err(Error::invalid_input(format!(
                 "WAL record of {} bytes exceeds limit {}",
@@ -603,10 +615,14 @@ impl Wal {
             Self::poison(&mut g, e.to_string());
             return Err(Error::indeterminate(e.to_string()));
         }
+        self.append_seconds.observe_duration(started.elapsed());
         match self.opts.durability {
             Durability::Async => Ok(seq),
             Durability::Sync | Durability::GroupCommit { .. } => {
-                self.wait_durable(g, seq).map(|()| seq)
+                let waiting = Instant::now();
+                let r = self.wait_durable(g, seq).map(|()| seq);
+                self.commit_wait_seconds.observe_duration(waiting.elapsed());
+                r
             }
         }
     }

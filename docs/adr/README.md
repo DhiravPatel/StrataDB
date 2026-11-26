@@ -37,3 +37,4 @@ its decision; it is superseded by a new ADR. Status meanings:
 | [0023](0023-pagination.md) | Stable keyset pagination for row queries | Accepted |
 | [0024](0024-encryption-at-rest.md) | Encryption at rest | Accepted |
 | [0025](0025-parquet-import-export.md) | Parquet import/export (CLI) | Accepted |
+| [0026](0026-performance-architecture-adoption.md) | Adopting spec Parts IV–IX: phase plan, conflicts, hardware honesty | Accepted |

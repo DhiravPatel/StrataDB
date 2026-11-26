@@ -303,6 +303,10 @@ pub struct EngineStats {
     pub wal_metrics: stratadb_wal::WalMetrics,
     /// Duration of flushes that wrote at least one memtable.
     pub flush_seconds: stratadb_common::metrics::HistogramSnapshot,
+    /// Engine-side INSERT stages (spec VIII.1.2, `strata_insert_stage_seconds`)
+    /// in pipeline order: `admission` (backpressure wait), `wal_encode`
+    /// (batch encoding), `wal_append`, `group_commit_wait`, `memtable_insert`.
+    pub insert_stages: Vec<(&'static str, stratadb_common::metrics::HistogramSnapshot)>,
 }
 
 /// A consistent, tenant-scoped read view (spec §9.4): committed segments plus
@@ -413,6 +417,9 @@ struct Shared {
     bg_cv: Condvar,
     counters: Counters,
     flush_seconds: stratadb_common::metrics::Histogram,
+    stage_admission: stratadb_common::metrics::Histogram,
+    stage_encode: stratadb_common::metrics::Histogram,
+    stage_memtable: stratadb_common::metrics::Histogram,
     open_report: OpenReport,
     dedup: Mutex<DedupIndex>,
     disk: Mutex<DiskState>,
@@ -748,6 +755,9 @@ impl Engine {
             bg_cv: Condvar::new(),
             counters: Counters::default(),
             flush_seconds: stratadb_common::metrics::Histogram::latency(),
+            stage_admission: stratadb_common::metrics::Histogram::stage(),
+            stage_encode: stratadb_common::metrics::Histogram::stage(),
+            stage_memtable: stratadb_common::metrics::Histogram::stage(),
             open_report: report,
             dedup: Mutex::new(dedup),
             disk: Mutex::new(DiskState {
@@ -1084,6 +1094,7 @@ impl Shared {
         self.check_disk(0)?;
 
         // Backpressure (spec §7.4): bounded frozen backlog.
+        let admitted = Instant::now();
         {
             let mut st = self.state.lock();
             if st.frozen.len() >= self.opts.max_frozen_memtables {
@@ -1105,6 +1116,7 @@ impl Shared {
             }
         }
 
+        self.stage_admission.observe_duration(admitted.elapsed());
         let n = events.len();
         let level = match self.opts.wal.durability {
             Durability::Async => CommitLevel::WalWritten,
@@ -1122,6 +1134,7 @@ impl Shared {
                 });
             }
         }
+        let encoding = Instant::now();
         let batch = encode_batch(&events);
         let (rtype, payload) = match &key {
             Some(k) => (
@@ -1130,6 +1143,7 @@ impl Shared {
             ),
             None => (RecordType::EventBatch, batch),
         };
+        self.stage_encode.observe_duration(encoding.elapsed());
         let committed = self.commit(rtype, &payload, events, n, key.as_ref(), now_ms);
         let (seq, active, meta) = match committed {
             Ok(v) => v,
@@ -1183,8 +1197,10 @@ impl Shared {
             accepted: n as u32,
             committed_ms: now_ms,
         });
+        let inserting = Instant::now();
         let active = Arc::clone(&self.state.lock().active);
         active.insert_batch(seq, events, meta.clone());
+        self.stage_memtable.observe_duration(inserting.elapsed());
         Ok((seq, active, meta))
     }
 
@@ -1381,6 +1397,7 @@ impl Shared {
     }
 
     fn stats(&self) -> EngineStats {
+        let wal_metrics = self.wal.metrics();
         let (active_rows, active_bytes, frozen, segs) = {
             let st = self.state.lock();
             (
@@ -1428,8 +1445,15 @@ impl Shared {
             disk_total_bytes: self.disk_space().1,
             disk_write_rejections: c.disk_rejections.load(Ordering::Relaxed),
             duplicates_suppressed: c.duplicates.load(Ordering::Relaxed),
-            wal_metrics: self.wal.metrics(),
+            wal_metrics: wal_metrics.clone(),
             flush_seconds: self.flush_seconds.snapshot(),
+            insert_stages: vec![
+                ("admission", self.stage_admission.snapshot()),
+                ("wal_encode", self.stage_encode.snapshot()),
+                ("wal_append", wal_metrics.append_seconds),
+                ("group_commit_wait", wal_metrics.commit_wait_seconds),
+                ("memtable_insert", self.stage_memtable.snapshot()),
+            ],
         }
     }
 }

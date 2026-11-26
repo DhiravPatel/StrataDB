@@ -1,0 +1,50 @@
+# CI smoke scenario (spec VIII.19, STRATA-SYS-19-006: shared CI VMs run
+# smoke-level checks only). It verifies that the harness, manifests, plan
+# assertions and open-loop generator work; its timings are not evidence.
+name = "smoke"
+description = "Harness smoke test: 20k events, 1 tenant, 4 segments, plan assertions, short open-loop load"
+
+[dataset]
+profile = "app-logs"
+events = 20000
+tenants = 1
+seed = 1
+batch_size = 1000
+# Deterministic layout: 4 segments, so pruning assertions are reproducible.
+flush_every = 5000
+
+[engine]
+durability = "group_commit"
+
+[run]
+warmup = 1
+repetitions = 5
+
+[[query]]
+id = "trace_id_lookup"
+sql = "SELECT event_time, body FROM logs WHERE trace_id = '{trace_id}'"
+[query.expect]
+result_rows = ">= 1"
+indexes_used = "contains bloom(trace_id)"
+
+[[query]]
+id = "absent_substring"
+sql = "SELECT count(*) FROM logs WHERE body LIKE '%deadlock detected%'"
+[query.expect]
+segments_pruned_ngram = ">= 1"
+
+[[query]]
+id = "high_cardinality_agg"
+sql = "SELECT attributes['user_id'] AS u, count(*) AS n FROM logs GROUP BY attributes['user_id'] ORDER BY n DESC LIMIT 10"
+[query.expect]
+result_rows = "== 10"
+shredded_reads = ">= 1"
+
+[[load]]
+id = "ingest_open_loop"
+kind = "ingest"
+mode = "open"
+rate_per_s = 50
+duration_s = 2
+workers = 2
+batch_size = 50

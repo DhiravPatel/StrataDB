@@ -1342,13 +1342,16 @@ name = "stratadb-bench"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "serde",
  "serde_json",
+ "sha2",
  "stratadb-common",
  "stratadb-query",
  "stratadb-schema",
  "stratadb-storage",
  "stratadb-testkit",
  "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -1394,6 +1397,7 @@ version = "0.0.1"
 dependencies = [
  "crc32c",
  "proptest",
+ "rustix",
  "serde",
  "tempfile",
  "thiserror",

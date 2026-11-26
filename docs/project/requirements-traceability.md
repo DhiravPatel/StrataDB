@@ -66,3 +66,4 @@ Maps spec requirements → tasks → acceptance tests. Status: ✅ tested ·
 | §30.2 | Upgrade tool: dry run, backup before irreversible migration, rollback statement | — | `upgrade.rs`, docs/runbooks/upgrade.md | ✅ |
 | §31 | License, community files | ADR-0016 | files present; license pending owner | ◐ |
 | §32 | CI/CD, audit, SBOM | A-004 | workflow file | ◐ |
+| Parts IV–IX | Performance engineering and deep architecture (416 `STRATA-SYS`/`STRATA-ARCH` requirements) | ADR-0026 | docs/project/PERF_INVENTORY.md (generated, checked by `scripts/check.sh`); P0 measurement system in `apps/stratadb-bench` | ◐ (P0 mechanisms done; 345 MISSING) |

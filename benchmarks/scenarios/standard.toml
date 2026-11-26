@@ -1,0 +1,119 @@
+# Standard single-node scenario: the spec §27.4 log query suite plus open-loop
+# ingest and query load. Run with:
+#   strata-bench scenario benchmarks/scenarios/standard.toml --out <dir> --hw-profile <HW-REF-n>
+# Plan assertions (STRATA-SYS-25-002) fail the run if a query stops using the
+# mechanism that makes it fast (pruning, index, shredded read, early stop).
+name = "standard"
+description = "Log query suite (spec §27.4) on 200k app-log events, 4 tenants; open-loop ingest + query load"
+
+[dataset]
+profile = "app-logs"
+events = 200000
+tenants = 4
+seed = 1
+batch_size = 1000
+# Deterministic layout (4 flushes → 4 segments per tenant) so plan assertions
+# are reproducible; loads run with background flushing.
+flush_every = 50000
+
+[engine]
+durability = "group_commit"
+group_commit_delay_ms = 2
+
+[run]
+warmup = 2
+repetitions = 10
+cache = "warm"
+
+[[query]]
+id = "q01_trace_id_lookup"
+sql = "SELECT event_time, body FROM logs WHERE trace_id = '{trace_id}'"
+[query.expect]
+result_rows = ">= 1"
+indexes_used = "contains bloom(trace_id)"
+
+[[query]]
+id = "q02_request_id_lookup"
+sql = "SELECT event_time, body FROM logs WHERE attributes['request_id'] = '{request_id}'"
+[query.expect]
+result_rows = ">= 1"
+segments_pruned_bloom = ">= 1"
+
+[[query]]
+id = "q03_recent_errors"
+sql = "SELECT event_time, service, body FROM logs WHERE event_time >= {t_recent} AND severity = 'ERROR' ORDER BY event_time DESC LIMIT 100"
+[query.expect]
+segments_pruned_time = ">= 1"
+
+[[query]]
+id = "q04_service_severity"
+sql = "SELECT count(*) FROM logs WHERE service = 'auth' AND severity = 'WARN'"
+[query.expect]
+result_rows = "== 1"
+
+[[query]]
+id = "q05_time_range_scan"
+sql = "SELECT count(*) FROM logs WHERE event_time >= {t_mid_lo} AND event_time < {t_mid_hi}"
+[query.expect]
+segments_pruned_time = ">= 1"
+
+[[query]]
+id = "q06_message_token_search"
+sql = "SELECT count(*) FROM logs WHERE body LIKE '%TIMEOUT%'"
+
+[[query]]
+id = "q07_attribute_equality"
+sql = "SELECT count(*) FROM logs WHERE attributes['region'] = 'eu-west-1'"
+[query.expect]
+shredded_reads = ">= 1"
+
+[[query]]
+id = "q08_high_cardinality_agg"
+sql = "SELECT attributes['user_id'] AS u, count(*) AS n FROM logs GROUP BY attributes['user_id'] ORDER BY n DESC LIMIT 10"
+[query.expect]
+result_rows = "== 10"
+shredded_reads = ">= 1"
+
+[[query]]
+id = "q09_service_time_bucket"
+sql = "SELECT service, time_bucket(INTERVAL '1 minute', event_time) AS b, count(*) FROM logs GROUP BY service, time_bucket(INTERVAL '1 minute', event_time)"
+
+[[query]]
+id = "q10_top_error_codes"
+sql = "SELECT attributes['error.code'] AS code, count(*) AS n FROM logs WHERE severity IN ('ERROR', 'FATAL') GROUP BY attributes['error.code'] ORDER BY n DESC LIMIT 10"
+
+[[query]]
+id = "q12_historical_wide_range"
+sql = "SELECT severity, count(*) FROM logs GROUP BY severity"
+
+[[query]]
+id = "q13_absent_substring_search"
+sql = "SELECT count(*) FROM logs WHERE body LIKE '%deadlock detected%'"
+[query.expect]
+segments_pruned_ngram = ">= 1"
+
+[[load]]
+id = "ingest_open_loop"
+kind = "ingest"
+mode = "open"
+rate_per_s = 200
+duration_s = 10
+workers = 4
+batch_size = 100
+
+[[load]]
+id = "trace_lookup_open_loop"
+kind = "query"
+mode = "open"
+rate_per_s = 100
+duration_s = 10
+workers = 4
+query = "q01_trace_id_lookup"
+
+[[load]]
+id = "dashboard_closed_loop"
+kind = "query"
+mode = "closed"
+duration_s = 5
+workers = 4
+query = "q12_historical_wide_range"

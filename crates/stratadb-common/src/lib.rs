@@ -6,6 +6,7 @@
 
 pub mod checksum;
 pub mod codec;
+pub mod cpu;
 pub mod error;
 pub mod failpoint;
 pub mod fsutil;

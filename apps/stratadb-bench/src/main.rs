@@ -1,271 +1,233 @@
-//! `strata-bench`: reproducible ingest and query-suite measurements (spec §27).
+//! `strata-bench`: StrataDB benchmark harness (spec §27, VIII.19).
 //!
-//! Output is raw, machine-readable JSON including the full configuration and
-//! environment. It deliberately contains no comparisons or claims; reports
-//! must follow docs/benchmarks/methodology.md.
+//! * `strata-bench [flags]` — the fixed query suite (raw JSON, unchanged).
+//! * `strata-bench scenario FILE --out DIR` — a TOML scenario: manifest, raw
+//!   samples, summaries with bootstrap CIs, plan assertions, open-loop load.
+//! * `strata-bench compare CANDIDATE --baseline DIR` — regression detection
+//!   (Mann-Whitney U, p < 0.01, ≥ 3% median change).
+//! * `strata-bench ledger [--write]` — operator CPU-cost ledger.
+//!
+//! Output never contains comparisons with other systems or capacity claims;
+//! reports follow docs/benchmarks/methodology.md.
 
-use std::collections::BTreeMap;
+mod compare;
+mod ledger;
+mod manifest;
+mod openloop;
+mod scenario;
+mod stats;
+mod suite;
+
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::process::ExitCode;
 
-use clap::Parser;
-use serde_json::{json, Value as J};
-use stratadb_common::time::format_rfc3339;
-use stratadb_common::{Error, Result, TenantId};
-use stratadb_query::{execute, QueryOptions};
-use stratadb_schema::codec::encode_batch;
-use stratadb_schema::Event;
-use stratadb_storage::{Durability, Engine, EngineOptions};
-use stratadb_testkit::{Generator, Profile};
+use clap::{Parser, Subcommand};
+use serde_json::json;
+use stratadb_common::Error;
 
 #[derive(Parser)]
-#[command(name = "strata-bench", about = "StrataDB benchmark harness")]
-struct Args {
-    #[arg(long, default_value = "app-logs")]
-    profile: String,
-    #[arg(long, default_value_t = 100_000)]
-    events: usize,
-    #[arg(long, default_value_t = 1000)]
-    batch_size: usize,
-    #[arg(long, default_value_t = 4)]
-    tenants: usize,
-    #[arg(long, default_value_t = 1)]
-    seed: u64,
-    /// async | sync | group_commit
-    #[arg(long, default_value = "group_commit")]
-    durability: String,
-    #[arg(long, default_value_t = 5)]
-    reps: usize,
-    /// Data directory (default: a fresh temporary directory, removed afterwards).
-    #[arg(long)]
-    data_dir: Option<PathBuf>,
-    /// Write JSON here instead of stdout.
-    #[arg(long)]
-    out: Option<PathBuf>,
-    /// Disable Bloom filters (A/B comparisons).
-    #[arg(long)]
-    no_bloom: bool,
-    /// Disable segment chunk compression (A/B comparisons).
-    #[arg(long)]
-    no_compression: bool,
-    /// Disable attribute shredding (A/B comparisons).
-    #[arg(long)]
-    no_shredding: bool,
-    /// Disable vectorized filter evaluation (A/B comparisons).
-    #[arg(long)]
-    no_vectorize: bool,
-    /// Disable trigram (ngram) filters for LIKE (A/B comparisons).
-    #[arg(long)]
-    no_ngram: bool,
-    /// Scan segments sequentially (A/B comparisons).
-    #[arg(long)]
-    no_parallel: bool,
-    /// Decode whole attribute maps instead of projecting referenced keys (A/B).
-    #[arg(long)]
-    no_map_projection: bool,
+#[command(
+    name = "strata-bench",
+    about = "StrataDB benchmark harness",
+    args_conflicts_with_subcommands = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+    #[command(flatten)]
+    suite: suite::Args,
 }
 
-fn pct(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
+/// Hardware profile label (spec VIII.27). Laptops and other unclassified
+/// machines are HW-REF-7 and are never compared with server results.
+const DEFAULT_HW: &str = "HW-REF-7";
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run a TOML scenario; writes manifest.json and results.json to --out.
+    Scenario {
+        file: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value = DEFAULT_HW)]
+        hw_profile: String,
+        /// Engine data directory (default: a temporary directory, removed).
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+    /// Compare a results.json with the rolling baseline of earlier runs.
+    Compare {
+        candidate: PathBuf,
+        #[arg(long)]
+        baseline: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        window: usize,
+        #[arg(long, default_value_t = 0.01)]
+        alpha: f64,
+        #[arg(long, default_value_t = 0.03)]
+        min_effect: f64,
+        /// Write the JSON report here (default: stdout).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Measure the operator cost ledger; check it (default) or --write it.
+    Ledger {
+        #[arg(long, default_value = "perf/cpr_ledger.toml")]
+        path: PathBuf,
+        #[arg(long)]
+        write: bool,
+        #[arg(long, default_value_t = 20)]
+        runs: usize,
+        #[arg(long, default_value = DEFAULT_HW)]
+        hw_profile: String,
+    },
+}
+
+/// Physical memory in bytes (Linux `/proc/meminfo`, macOS `sysctl`).
+pub fn host_memory() -> Option<u64> {
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        let kb: u64 = s
+            .lines()
+            .find_map(|l| l.strip_prefix("MemTotal:"))?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        return kb.checked_mul(1024);
     }
-    let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
-    sorted[idx.min(sorted.len() - 1)]
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
-fn summary(mut ms: Vec<f64>) -> J {
-    ms.sort_by(f64::total_cmp);
-    json!({"n": ms.len(), "min_ms": ms.first(), "p50_ms": pct(&ms, 0.5), "p95_ms": pct(&ms, 0.95),
-           "p99_ms": pct(&ms, 0.99), "max_ms": ms.last(),
-           "mean_ms": if ms.is_empty() { 0.0 } else { ms.iter().sum::<f64>() / ms.len() as f64 }})
+fn fail(e: &Error) -> ExitCode {
+    eprintln!(
+        "{}",
+        json!({"error": e.kind().as_str(), "message": e.to_string()})
+    );
+    ExitCode::FAILURE
 }
 
-fn ms(d: Duration) -> f64 {
-    d.as_secs_f64() * 1000.0
-}
-
-fn run(a: Args) -> Result<J> {
-    let profile = Profile::parse(&a.profile)
-        .ok_or_else(|| Error::invalid_input(format!("unknown profile {}", a.profile)))?;
-    let durability = match a.durability.as_str() {
-        "async" => Durability::Async,
-        "sync" => Durability::Sync,
-        "group_commit" => Durability::GroupCommit {
-            max_delay: Duration::from_millis(2),
+fn emit(text: &str, out: Option<&PathBuf>) -> ExitCode {
+    match out {
+        Some(p) => match std::fs::write(p, text) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("writing {}: {e}", p.display());
+                ExitCode::FAILURE
+            }
         },
-        d => return Err(Error::invalid_input(format!("unknown durability {d}"))),
-    };
-    let tmp;
-    let dir = match &a.data_dir {
-        Some(d) => d.clone(),
         None => {
-            tmp = std::env::temp_dir().join(format!("strata-bench-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&tmp);
-            tmp.clone()
+            println!("{text}");
+            ExitCode::SUCCESS
         }
-    };
-    let mut opts = EngineOptions::new(&dir);
-    opts.wal.durability = durability;
-    opts.bloom_enabled = !a.no_bloom;
-    opts.ngram_enabled = !a.no_ngram;
-    opts.segment_compression = !a.no_compression;
-    opts.segment_shredding = !a.no_shredding;
-    let engine = Engine::open(opts.clone())?;
-    let mut gen = Generator::new(profile, a.seed, a.tenants);
-
-    // --- Ingestion
-    let mut ack_ms = Vec::new();
-    let mut raw_bytes = 0u64;
-    let started = Instant::now();
-    let mut written = 0usize;
-    let mut write_time = Duration::ZERO;
-    while written < a.events {
-        let n = a.batch_size.min(a.events - written);
-        let batch = gen.batch(n);
-        let mut by_tenant: BTreeMap<TenantId, Vec<Event>> = BTreeMap::new();
-        for e in batch {
-            by_tenant.entry(e.tenant_id.clone()).or_default().push(e);
-        }
-        for (t, evs) in by_tenant {
-            raw_bytes += encode_batch(&evs).len() as u64;
-            let t0 = Instant::now();
-            engine.write_batch(&t, evs)?;
-            let d = t0.elapsed();
-            write_time += d;
-            ack_ms.push(ms(d));
-        }
-        written += n;
     }
-    let ingest_wall = started.elapsed();
-    let t0 = Instant::now();
-    let flush = engine.flush()?;
-    let flush_ms = ms(t0.elapsed());
-    let st = engine.stats();
-
-    // --- Query suite (spec §27.4) against the largest tenant.
-    let tenant = TenantId::new("tenant-0")?;
-    let snap = engine.snapshot(&tenant);
-    let end = gen.ingest_time(a.events as u64);
-    let start = gen.start_ns;
-    let span = (end - start).max(1);
-    let lit = |t: i64| format!("TIMESTAMP '{}'", format_rfc3339(t));
-    let trace = gen
-        .sample_trace_ids
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "0".repeat(32));
-    let req = gen
-        .sample_request_ids
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "req_none".into());
-    let suite: Vec<(&str, String)> = vec![
-        ("01_trace_id_lookup", format!("SELECT event_time, body FROM logs WHERE trace_id = '{trace}'")),
-        ("02_request_id_lookup", format!("SELECT event_time, body FROM logs WHERE attributes['request_id'] = '{req}'")),
-        ("03_recent_errors", format!("SELECT event_time, service, body FROM logs WHERE event_time >= {} AND severity = 'ERROR' ORDER BY event_time DESC LIMIT 100", lit(end - span / 20))),
-        ("04_service_severity", "SELECT count(*) FROM logs WHERE service = 'auth' AND severity = 'WARN'".into()),
-        ("05_time_range_scan", format!("SELECT count(*) FROM logs WHERE event_time >= {} AND event_time < {}", lit(start + span * 45 / 100), lit(start + span * 55 / 100))),
-        ("06_message_token_search", "SELECT count(*) FROM logs WHERE body LIKE '%TIMEOUT%'".into()),
-        ("07_attribute_equality", "SELECT count(*) FROM logs WHERE attributes['region'] = 'eu-west-1'".into()),
-        ("08_high_cardinality_agg", "SELECT attributes['user_id'] AS u, count(*) AS n FROM logs GROUP BY attributes['user_id'] ORDER BY n DESC LIMIT 10".into()),
-        ("09_service_time_bucket", "SELECT service, time_bucket(INTERVAL '1 minute', event_time) AS b, count(*) FROM logs GROUP BY service, time_bucket(INTERVAL '1 minute', event_time)".into()),
-        ("10_top_error_codes", "SELECT attributes['error.code'] AS code, count(*) AS n FROM logs WHERE severity IN ('ERROR', 'FATAL') GROUP BY attributes['error.code'] ORDER BY n DESC LIMIT 10".into()),
-        ("12_historical_wide_range", "SELECT severity, count(*) FROM logs GROUP BY severity".into()),
-        ("13_absent_substring_search", "SELECT count(*) FROM logs WHERE body LIKE '%deadlock detected%'".into()),
-    ];
-    let qopts = QueryOptions {
-        max_result_rows: 1_000_000,
-        enable_vectorized: !a.no_vectorize,
-        enable_map_projection: !a.no_map_projection,
-        parallelism: if a.no_parallel {
-            1
-        } else {
-            QueryOptions::default().parallelism
-        },
-        ..QueryOptions::default()
-    };
-    let mut queries = Vec::new();
-    for (name, sql) in &suite {
-        let mut lat = Vec::new();
-        let mut last = None;
-        for _ in 0..a.reps.max(1) {
-            let t0 = Instant::now();
-            let out = execute(&snap, sql, &qopts)?;
-            lat.push(ms(t0.elapsed()));
-            last = Some(out);
-        }
-        let s = last.map(|o| o.stats).unwrap_or_default();
-        let rows = execute(&snap, sql, &qopts)?.rows.len();
-        queries.push(json!({
-            "name": name, "sql": sql, "latency": summary(lat), "result_rows": rows,
-            "rows_scanned": s.rows_scanned, "rows_matched": s.rows_matched, "segment_bytes_read": s.bytes_read,
-            "segments_total": s.segments_total, "segments_scanned": s.segments_scanned,
-            "indexes_used": s.indexes_used,
-            "segments_pruned": s.segments_pruned_time + s.segments_pruned_keys + s.segments_pruned_severity + s.segments_pruned_bloom + s.segments_pruned_ngram,
-        }));
-    }
-    drop(snap);
-
-    // --- Restart (recovery) time: everything flushed, so this measures open cost.
-    drop(engine);
-    let t0 = Instant::now();
-    let engine = Engine::open(opts)?;
-    let reopen_ms = ms(t0.elapsed());
-    drop(engine);
-    if a.data_dir.is_none() {
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    Ok(json!({
-        "label": "developer-hardware measurement; not a production capacity claim",
-        "stratadb_version": env!("CARGO_PKG_VERSION"),
-        "build": if cfg!(debug_assertions) { "debug" } else { "release" },
-        "environment": {"os": std::env::consts::OS, "arch": std::env::consts::ARCH,
-                        "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)},
-        "config": {"profile": profile.name(), "events": a.events, "batch_size": a.batch_size,
-                   "tenants": a.tenants, "seed": a.seed, "durability": a.durability, "reps": a.reps,
-                   "bloom": !a.no_bloom, "compression": !a.no_compression, "shredding": !a.no_shredding, "vectorized": !a.no_vectorize, "ngram": !a.no_ngram, "parallel": !a.no_parallel, "map_projection": !a.no_map_projection,
-                   "cache_state": "warm (same process, OS page cache not dropped)"},
-        "ingest": {
-            "wall_s": ingest_wall.as_secs_f64(),
-            "events_per_s_wall": a.events as f64 / ingest_wall.as_secs_f64().max(1e-9),
-            "encoded_bytes": raw_bytes,
-            "encoded_bytes_per_s_wall": raw_bytes as f64 / ingest_wall.as_secs_f64().max(1e-9),
-            "write_batch_time_s": write_time.as_secs_f64(),
-            "ack_latency": summary(ack_ms),
-        },
-        "flush": {"final_flush_ms": flush_ms, "rows": flush.rows_flushed},
-        "storage": {"segments": st.segments, "segment_bytes": st.segment_bytes,
-                    "encoded_to_segment_ratio": raw_bytes as f64 / st.segment_bytes.max(1) as f64,
-                    "flushes": st.flushes, "write_stalls": st.write_stalls},
-        "queries": queries,
-        "reopen_ms": reopen_ms,
-    }))
 }
 
-fn main() -> std::process::ExitCode {
-    let a = Args::parse();
-    let out = a.out.clone();
-    match run(a) {
-        Ok(j) => {
-            let text = serde_json::to_string_pretty(&j).unwrap_or_default();
-            match out {
-                Some(p) => {
-                    if let Err(e) = std::fs::write(&p, text) {
-                        eprintln!("writing {}: {e}", p.display());
-                        return std::process::ExitCode::FAILURE;
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match cli.cmd {
+        None => {
+            let out = cli.suite.out.clone();
+            match suite::run(cli.suite) {
+                Ok(j) => emit(
+                    &serde_json::to_string_pretty(&j).unwrap_or_default(),
+                    out.as_ref(),
+                ),
+                Err(e) => fail(&e),
+            }
+        }
+        Some(Cmd::Scenario {
+            file,
+            out,
+            hw_profile,
+            data_dir,
+        }) => {
+            let text = match std::fs::read_to_string(&file) {
+                Ok(t) => t,
+                Err(e) => {
+                    return fail(&Error::invalid_input(format!(
+                        "reading {}: {e}",
+                        file.display()
+                    )))
+                }
+            };
+            match scenario::run(&text, &out, &hw_profile, data_dir) {
+                Ok(r) => {
+                    let v = &r["verdict"];
+                    eprintln!(
+                        "scenario {}: ok={} failures={} flags={} -> {}",
+                        r["scenario"],
+                        v["ok"],
+                        v["failures"],
+                        v["flags"],
+                        out.join("results.json").display()
+                    );
+                    if v["ok"].as_bool() == Some(true) {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(2)
                     }
                 }
-                None => println!("{text}"),
+                Err(e) => fail(&e),
             }
-            std::process::ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!(
-                "{}",
-                json!({"error": e.kind().as_str(), "message": e.to_string()})
-            );
-            std::process::ExitCode::FAILURE
+        Some(Cmd::Compare {
+            candidate,
+            baseline,
+            window,
+            alpha,
+            min_effect,
+            out,
+        }) => {
+            let p = compare::Params {
+                window,
+                alpha,
+                min_effect,
+            };
+            match compare::compare(&candidate, &baseline, p) {
+                Ok(r) => {
+                    for m in &r.metrics {
+                        eprintln!(
+                            "{:<11} {:<48} {:>10.3} -> {:>10.3} ({:+6.1}%, p={:.2e})",
+                            m.verdict,
+                            m.metric,
+                            m.baseline_median,
+                            m.candidate_median,
+                            m.change * 100.0,
+                            m.p_value
+                        );
+                    }
+                    let code = emit(
+                        &serde_json::to_string_pretty(&r).unwrap_or_default(),
+                        out.as_ref(),
+                    );
+                    if r.regressions > 0 {
+                        ExitCode::from(2)
+                    } else {
+                        code
+                    }
+                }
+                Err(e) => fail(&e),
+            }
         }
+        Some(Cmd::Ledger {
+            path,
+            write,
+            runs,
+            hw_profile,
+        }) => match ledger::run(&path, write, runs, &hw_profile) {
+            Ok((report, ok)) => {
+                println!("{report}");
+                if ok {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(2)
+                }
+            }
+            Err(e) => fail(&e),
+        },
     }
 }

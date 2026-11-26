@@ -42,7 +42,16 @@
 - Fsync failures poison the WAL by design; recovery requires restart.
 
 ## Performance
-- Only one internal developer-laptop baseline exists (`benchmarks/reports/`). **No performance claims are made**; no competitor comparisons.
+- Only developer-laptop (HW-REF-7) measurements exist (`benchmarks/reports/`). **No performance claims are made**, and there are no competitor comparisons. No spec Part VIII level is achieved (RELEASE_DECLARATION.md).
+- Of the 416 spec Part VIII–IX requirements, most are MISSING
+  (PERF_INVENTORY.md; phase plan in ADR-0026).
+- The regression gate and the cost ledger work, but on a shared machine
+  they give false verdicts: the A/A test found 9 of 27. CI runs only the
+  smoke scenario until a dedicated runner exists. The ledger records CPU ns,
+  not cycles.
+- Each query spawns its own scan threads (no shared bounded worker pool:
+  STRATA-SYS-01-010). Under concurrent load this inflates latency (report
+  2026-11-26).
 - Segments use LZ4 chunk compression (v2); no zstd cold tier yet. Hot attribute keys (≥ 10 % of
   rows) are shredded into columns (v3); rarer keys stay in per-row maps.
 - `WHERE` filters are vectorized and group keys are encoded without copies

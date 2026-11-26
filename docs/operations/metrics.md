@@ -1,7 +1,9 @@
 # Metrics (spec §2.5, §3.2, §25)
 
 `GET /api/v1/metrics` (permission `cluster.read`) returns the Prometheus text
-format (version 0.0.4). All series are prefixed `stratadb_`.
+format (version 0.0.4). Series are prefixed `stratadb_`. The exceptions are
+the pipeline-stage families below, which use the spec's `strata_` names
+(ADR-0026).
 
 **No tenant labels.** Per-tenant series would make cardinality unbounded and
 would reveal tenant names to anyone with `cluster.read`. Label sets are fixed
@@ -18,6 +20,22 @@ Each histogram has cumulative `_bucket{le=…}`, `_sum` and `_count` series.
 | `wal_sync_seconds` | WAL fsync latency (group commits and segment rotations) |
 | `wal_group_commit_records` | records made durable by one WAL fsync (group-commit size, spec §8.4) |
 | `flush_seconds` | memtable flushes that wrote segments |
+
+## Pipeline stages (spec VIII.1, µs resolution)
+Buckets: 1 µs … 10 s. The sum is kept in nanoseconds, so sub-microsecond
+stages are not lost.
+
+| Series | Stages |
+|--------|--------|
+| `strata_insert_stage_seconds{stage}` | in pipeline order: `auth`, `decode` (body decompress, UTF-8, JSON framing), `validate` (event mapping and limits), `admission` (flush-backlog backpressure wait), `wal_encode` (batch encoding), `wal_append` (frame + CRC + write, including WAL lock wait), `group_commit_wait` (written → durable; sync modes), `memtable_insert`, `ack` (response construction). Server stages cover `/api/v1/ingest`; engine stages cover every write path |
+| `strata_query_stage_seconds{stage}` | `queue` (waiting for an execution thread), `parse`, `plan`, `exec`, `serialize`; successful queries only |
+
+Compare stage quantiles with the VIII.1.2 budgets
+(docs/benchmarks/harness.md); the budgets are defined for HW-REF-1.
+
+```promql
+histogram_quantile(0.99, sum by (le, stage) (rate(strata_insert_stage_seconds_bucket[5m])))
+```
 
 Useful queries:
 ```promql

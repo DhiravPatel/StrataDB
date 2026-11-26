@@ -31,6 +31,28 @@ with durable `obsolete_segments`; full verified backups; rustls+ring TLS;
 hash-chained audit log (admin actions fail closed); Bloom filters ext tag 2
 (string values only) with A/B evidence; TOML config with flag > env > file precedence.
 
+## Spec v0.4 (Parts IV–IX) adopted — read first
+ADR-0026 maps the spec's phases P0–P4 and A0–A4 onto roadmap phases 9–14
+and resolves the conflicts: `unsafe` stays forbidden; kernels are scalar
+first; io_uring comes after a portable `IoEngine`; there is no
+general-purpose table claim until typed tables exist.
+`docs/project/PERF_INVENTORY.md` has a row for every requirement. To update
+a status, edit `docs/project/perf-status.toml` and run
+`scripts/spec_inventory.py`; `check.sh` fails if the inventory is stale.
+
+**Phase 9 (P0, measurement system) is done.** It provides:
+- `strata-bench scenario`, `compare` and `ledger`;
+- `benchmarks/scenarios/{smoke,standard}.toml`;
+- stage metrics;
+- release profiles;
+- `RELEASE_DECLARATION.md`.
+
+The gates give false verdicts on this laptop (A/A: 9 of 27), so CI runs the
+smoke scenario only. **Next: phase 10, task P1-1**: a bounded scan worker
+pool replacing per-query threads (STRATA-SYS-01-010/006). Measure it with
+the standard scenario's open-loop trace-lookup load, using interleaved CPU
+time.
+
 ## Exact next tasks (priority order)
 1. Query execution follow-ups: intra-segment parallelism; row-selective
    decoding of whole maps; cheaper value validation for raw group keys (UTF-8

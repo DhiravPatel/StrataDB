@@ -2,6 +2,28 @@
 
 ## Unreleased (0.0.1)
 ### Added
+- **Performance measurement system (spec P0, ADR-0026).** These subcommands
+  are new; `strata-bench [flags]` (the fixed suite) is unchanged:
+  - `strata-bench scenario` runs TOML scenarios
+    (`benchmarks/scenarios/`) with a run manifest, raw samples, bootstrap
+    CIs, plan assertions and open-loop load (latency from the intended send
+    time; `CLIENT_BOUND` detection).
+  - `strata-bench compare` detects regressions (Mann-Whitney U, p < 0.01,
+    at least a 3% median change, rolling window of 10 runs).
+  - `strata-bench ledger` maintains the operator cost ledger
+    `perf/cpr_ledger.toml` (CPU ns per unit, 5% + noise rule).
+  - New metric families `strata_insert_stage_seconds{stage}` (9 stages) and
+    `strata_query_stage_seconds{stage}`.
+  - Query responses report `queue_us`, `parse_us`, `plan_us` and `exec_us`,
+    and the server logs a structured `query` line.
+  - Requirement inventory `docs/project/PERF_INVENTORY.md` for all 416 Part
+    VIII–IX requirements, checked by `scripts/check.sh`.
+  - `docs/project/RELEASE_DECLARATION.md`.
+### Changed
+- Release profile: fat LTO, `opt-level = 3`, `panic = "abort"` (spec
+  STRATA-SYS-18-001). A panic now exits the process; the service manager
+  restarts it and recovery replays the WAL. New `release-checked` profile and
+  a nightly job running the tests with it.
 - High-cardinality `GROUP BY` of shredded attributes uses 2.95× less CPU
   (query 08, `benchmarks/reports/2026-11-25-raw-group-keys.md`): group-only
   keys are read as validated raw bytes, without per-row allocation; group
