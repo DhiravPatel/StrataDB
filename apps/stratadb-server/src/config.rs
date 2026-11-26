@@ -22,6 +22,7 @@
 //! max_concurrent_queries = 16
 //! max_query_timeout_ms = 60000
 //! max_query_rows = 100000
+//! scan_threads = 8          # shared scan worker pool (default: logical CPUs)
 //!
 //! [storage]
 //! memtable_max_bytes = 67108864
@@ -121,6 +122,8 @@ pub struct LimitsSection {
     pub max_concurrent_queries: Option<usize>,
     pub max_query_timeout_ms: Option<u64>,
     pub max_query_rows: Option<usize>,
+    /// Threads of the shared scan worker pool (1..=256; default: logical CPUs).
+    pub scan_threads: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -179,6 +182,8 @@ pub struct Resolved {
     pub insecure_allow_remote_without_tls: bool,
     pub server: ServerConfig,
     pub engine: EngineOptions,
+    /// Scan worker pool size (`None`: one per logical CPU).
+    pub scan_threads: Option<usize>,
 }
 
 /// Values from flags/environment that override the file (None = not given).
@@ -302,6 +307,15 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
     if let Some(v) = positive("limits.max_query_rows", l.max_query_rows)? {
         server.max_query_rows = v;
     }
+    let scan_threads = positive("limits.scan_threads", l.scan_threads)?;
+    if let Some(n) = scan_threads {
+        if n > stratadb_query::pool::MAX_WORKERS {
+            return Err(Error::invalid_input(format!(
+                "limits.scan_threads must be at most {}",
+                stratadb_query::pool::MAX_WORKERS
+            )));
+        }
+    }
     if server.max_decompressed_bytes < server.max_body_bytes {
         return Err(Error::invalid_input(
             "limits.max_decompressed_bytes must be >= max_body_bytes",
@@ -408,6 +422,7 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
         insecure_allow_remote_without_tls: insecure,
         server,
         engine,
+        scan_threads,
     })
 }
 
@@ -427,6 +442,9 @@ impl Resolved {
                 "max_concurrent_queries": self.server.max_concurrent_queries,
                 "max_query_timeout_ms": self.server.max_query_timeout.as_millis() as u64,
                 "max_query_rows": self.server.max_query_rows,
+                "scan_threads": self.scan_threads.unwrap_or_else(|| {
+                    std::thread::available_parallelism().map_or(1, |n| n.get())
+                }),
             },
             "storage": {
                 "memtable_max_bytes": self.engine.memtable_max_bytes,
@@ -512,6 +530,17 @@ mod tests {
             !shown.contains(secret.trim()),
             "key material must never be displayed"
         );
+    }
+
+    #[test]
+    fn scan_threads_setting() {
+        let r = |s: &str| resolve(&parse(s).unwrap(), &Overrides::default());
+        let base = "config_version = 1\ndata_dir = \"/d\"\n";
+        assert_eq!(r(base).unwrap().scan_threads, None);
+        let ok = r(&format!("{base}[limits]\nscan_threads = 4\n")).unwrap();
+        assert_eq!(ok.scan_threads, Some(4));
+        assert!(r(&format!("{base}[limits]\nscan_threads = 0\n")).is_err());
+        assert!(r(&format!("{base}[limits]\nscan_threads = 100000\n")).is_err());
     }
 
     #[test]

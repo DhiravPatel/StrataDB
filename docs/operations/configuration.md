@@ -15,6 +15,7 @@
 | `[limits] max_body_bytes` | flag only | 8 MiB | |
 | `[limits] max_decompressed_bytes` | — | 32 MiB | gzip bomb protection |
 | `[limits] max_concurrent_ingest` / `max_concurrent_queries` | — | 32 / 16 | excess → 429 |
+| `[limits] scan_threads` | — | logical CPUs | threads of the shared scan worker pool (1–256), fixed at startup; queries scan on their own thread plus pool tasks, never on threads of their own |
 | `[limits] max_query_timeout_ms` / `max_query_rows` | — | 60 000 / 100 000 | per-request caps |
 | `[storage] memtable_max_bytes` | — | 64 MiB | flush threshold |
 | `[storage] wal_segment_max_bytes` | — | 64 MiB | |

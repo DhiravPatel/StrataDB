@@ -776,7 +776,7 @@ impl Engine {
         if shared.opts.background {
             let s = Arc::clone(&shared);
             let h = std::thread::Builder::new()
-                .name("stratadb-bg".into())
+                .name("sx-maint".into())
                 .spawn(move || background_loop(&s))
                 .ctx(|| "spawning background thread".to_owned())?;
             *engine.bg_thread.lock() = Some(h);

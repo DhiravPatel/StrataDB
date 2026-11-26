@@ -55,11 +55,10 @@ Requirement-level status: PERF_INVENTORY.md (generated; `scripts/spec_inventory.
 - ☐ **P0-12** Dedicated HW-REF-1 runner + CI gate (SYS-01-002, SYS-19-006). Owner action.
 
 ### Phase 10: P1 + A0 (next, in order)
-1. ▶ **P1-1** Bounded scan worker pool shared by all queries. It replaces
-   the per-query scoped threads (SYS-01-010) and adds DOP limits for small
-   queries (SYS-01-006). The open-loop trace-lookup load shows the cost
-   (report 2026-11-26).
-2. ☐ **P1-2** Thread inventory and naming (SYS-03-014/015).
+1. ✅ **P1-1** Shared scan worker pool (`sx-work-NN`, bounded queue,
+   caller-runs when busy) and cost-based DOP (SYS-01-010/006, 11-008 partial);
+   report 2026-11-26-scan-pool.
+2. ▶ **P1-2** Thread inventory and naming (SYS-03-014/015).
 3. ☐ **P1-3** `IoEngine` trait with a portable backend and the `sim` fault
    backend (SYS-04-001/002); fd budget and LRU (SYS-02-037).
 4. ☐ **P1-4** `strata doctor host` VIII.2 checklist (SYS-02-*), including

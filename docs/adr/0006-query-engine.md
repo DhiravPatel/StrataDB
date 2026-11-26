@@ -78,6 +78,36 @@ for high-cardinality string keys is decoding each value into an owned string.
   (`benchmarks/reports/2026-11-25-raw-group-keys.md`). No persistent format
   changed.
 
+### Update 2026-11-26: shared scan worker pool and cost-based parallelism
+Parallel scans no longer create threads per query (STRATA-SYS-01-010):
+- **Shared pool.** One process-wide pool of `sx-work-NN` threads
+  (`[limits] scan_threads`, default one per logical CPU) runs the scan tasks
+  of all queries.
+- **Bounded queue.** It holds at most `workers` tasks, so at most 2 × workers
+  are active.
+- **Caller runs.** The query's thread always scans too, and takes over any
+  share the pool cannot accept. A busy pool lowers parallelism instead of
+  queueing or blocking.
+- **Owned task state.** Tasks own their inputs (`Arc`). A task that starts
+  after its query finished finds no work.
+- **Order unchanged.** Results are still merged in segment order.
+- **Degree of parallelism.** The base is `ceil(est_cpu_ms / 5 ms)`, clamped
+  to `1..=min(parallelism, segments)` (STRATA-SYS-11-008). It applies when
+  no pool worker is idle.
+  - When workers are idle, a query may also use them, up to
+    `min(parallelism, segments)`; queries under 2 ms of estimated work stay
+    at 4 or fewer (STRATA-SYS-01-006).
+  - The estimate is rows to scan × a per-row cost by query shape,
+    calibrated on HW-REF-7.
+  - *Deviation, with evidence:* the base formula alone scanned 1.7–3.8 ms
+    queries on one worker and made them 2–4× slower on an idle machine,
+    while fan-out costs this engine only 0–13% extra CPU. Under contention
+    the formula still applies.
+- **Visibility.** `stats.scan_workers`, `stats.est_cpu_ms` and EXPLAIN
+  ANALYZE report it; `QueryOptions::target_ms_per_worker = 0` restores the
+  fixed fan-out.
+- **Evidence:** `benchmarks/reports/2026-11-26-scan-pool.md`.
+
 ## Revisit conditions
 If the supported SQL surface grows to joins/window functions, or benchmarks
 show vectorized Arrow execution is materially faster on Class B/C workloads.

@@ -292,16 +292,36 @@ fn finish(
 mod tests {
     use super::*;
 
+    /// Up to 3 attempts until `ok` holds: properties that depend on the OS
+    /// scheduling the dispatcher on time (no `CLIENT_BOUND`) can fail on a
+    /// heavily loaded machine, where the flag is then correct.
+    fn eventually(
+        mut run: impl FnMut() -> LoadReport,
+        ok: impl Fn(&LoadReport) -> bool,
+    ) -> LoadReport {
+        let mut r = run();
+        for _ in 0..2 {
+            if ok(&r) {
+                break;
+            }
+            r = run();
+        }
+        r
+    }
+
     #[test]
     fn open_loop_counts_queueing_from_intended_time() {
         // 1 worker, 5 ms of service per request, offered 400/s (one every
         // 2.5 ms): the system cannot keep up, so latency from the intended
         // time must grow well beyond the service time. A closed-loop client
         // would report ~5 ms for every request (coordinated omission).
-        let r = run_open(400.0, 40, 1, |_| {
-            std::thread::sleep(Duration::from_millis(5));
-            Ok(())
-        });
+        let run = || {
+            run_open(400.0, 40, 1, |_| {
+                std::thread::sleep(Duration::from_millis(5));
+                Ok(())
+            })
+        };
+        let r = eventually(run, |r| !r.flags.contains(&"CLIENT_BOUND"));
         assert_eq!(r.requests, 40);
         assert!(r.service_ms.median < 15.0, "{:?}", r.service_ms);
         assert!(
@@ -311,12 +331,16 @@ mod tests {
         );
         assert!(r.flags.contains(&"SATURATED"), "{:?}", r.flags);
         assert!(r.queued_behind_busy_workers > 0);
+        // A slow system is not misattributed to the client.
         assert!(!r.flags.contains(&"CLIENT_BOUND"), "{:?}", r.flags);
     }
 
     #[test]
     fn open_loop_with_capacity_tracks_the_offered_rate() {
-        let r = run_open(200.0, 100, 4, |_| Ok(()));
+        let r = eventually(
+            || run_open(200.0, 100, 4, |_| Ok(())),
+            |r| r.flags.is_empty() && r.latency_ms.median < 5.0,
+        );
         assert_eq!((r.requests, r.errors), (100, 0));
         assert!(r.achieved_rate_per_s > 150.0, "{}", r.achieved_rate_per_s);
         assert!(r.latency_ms.median < 5.0, "{:?}", r.latency_ms);

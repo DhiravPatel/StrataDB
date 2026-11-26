@@ -45,7 +45,13 @@ pub struct QueryOptions {
     /// spec §13.5). 1 = sequential. Results are merged in segment order, so
     /// rows and groups match a sequential scan; float `sum`/`avg` may differ
     /// in the last bits (different addition order), deterministically.
+    /// This is an upper bound: the cost-based degree of parallelism
+    /// (`target_ms_per_worker`) usually picks fewer for small scans.
     pub parallelism: usize,
+    /// Estimated single-core CPU milliseconds of scan work per worker
+    /// (STRATA-SYS-11-008: 5 ms for interactive queries). `0` disables the
+    /// estimate and always uses `parallelism` workers.
+    pub target_ms_per_worker: f64,
 }
 
 impl Default for QueryOptions {
@@ -63,6 +69,7 @@ impl Default for QueryOptions {
             parallelism: std::thread::available_parallelism()
                 .map_or(1, |n| n.get())
                 .min(8),
+            target_ms_per_worker: TARGET_MS_PER_WORKER,
         }
     }
 }
@@ -96,6 +103,14 @@ pub struct QueryStats {
     pub parse: Duration,
     /// Plan (bind + optimize) time, reported separately from execution.
     pub plan: Duration,
+    /// Workers that scanned at least one segment (this thread + pool tasks;
+    /// 0 = no segment scan, 1 = sequential).
+    pub scan_workers: usize,
+    /// Pool tasks requested for this scan (the pool grants fewer when busy).
+    pub scan_tasks_queued: usize,
+    /// Estimated single-core CPU ms of the segment scan (drives the degree
+    /// of parallelism, STRATA-SYS-11-008).
+    pub est_cpu_ms: f64,
 }
 
 /// Result of a query. `rows[i][j]` is `None` when the value is missing.
@@ -911,27 +926,6 @@ impl<'a> Ctx<'a> {
             reported_mem: 0,
         }
     }
-
-    /// A fresh context for one parallel work item (same plan and budget).
-    /// A context for one parallel work item. Its groups hash with this
-    /// context's seed so [`crate::groups::GroupTable::merge_into`] can reuse
-    /// the hashes.
-    fn partial(&self) -> Self {
-        let mut p = Self::new(
-            self.plan,
-            self.opts,
-            self.deadline,
-            self.page.clone(),
-            self.keep,
-            self.vfilter.clone(),
-            Arc::clone(&self.budget),
-        );
-        p.groups = crate::groups::GroupTable::with_hasher(
-            self.plan.aggregates.len(),
-            self.groups.hasher(),
-        );
-        p
-    }
 }
 
 impl Ctx<'_> {
@@ -1334,62 +1328,248 @@ struct Partial {
     mem: usize,
 }
 
-/// Scan `segs` with `workers` threads, one partial result per segment, then
-/// merge the partials into `ctx` **in segment order** — so result rows (after
-/// a stable sort) and group order are exactly those of a sequential scan.
-/// The first failing segment (lowest index) determines the error.
+/// Everything a scan task needs, owned so tasks can run on the shared pool
+/// (`'static`) and outlive the query harmlessly: a late task finds `next`
+/// past the end and returns.
+struct ScanShared {
+    plan: Plan,
+    opts: QueryOptions,
+    deadline: Instant,
+    page: Option<PageCtx>,
+    keep: Option<usize>,
+    vfilter: Option<crate::vector::Filter>,
+    budget: Arc<SharedBudget>,
+    hasher: ahash::RandomState,
+    segs: Vec<Arc<SegmentHandle>>,
+    needed: Vec<ColumnId>,
+    tenant: TenantId,
+    /// Next segment index to claim.
+    next: std::sync::atomic::AtomicUsize,
+    /// Workers that claimed at least one segment.
+    participants: std::sync::atomic::AtomicUsize,
+    /// Per-segment results; every claimed index is filled exactly once.
+    slots: std::sync::Mutex<(usize, Vec<Option<Result<Partial>>>)>,
+    filled: std::sync::Condvar,
+}
+
+impl ScanShared {
+    /// Claim and scan segments until none are left or the query stops.
+    fn work(&self) {
+        let mut first = true;
+        loop {
+            if self.budget.stop.load(AtomicOrdering::Relaxed) {
+                return;
+            }
+            let i = self.next.fetch_add(1, AtomicOrdering::Relaxed);
+            if i >= self.segs.len() {
+                return;
+            }
+            if std::mem::take(&mut first) {
+                self.participants.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            // From here slot `i` must be filled, whatever happens (a panic
+            // fills it through the guard).
+            let mut guard = SlotGuard {
+                shared: self,
+                i,
+                done: false,
+            };
+            let r = self.scan_one(i);
+            if r.is_err() {
+                self.budget.stop.store(true, AtomicOrdering::Relaxed);
+            }
+            guard.fill(r);
+        }
+    }
+
+    fn scan_one(&self, i: usize) -> Result<Partial> {
+        let mut p = Ctx::new(
+            &self.plan,
+            &self.opts,
+            self.deadline,
+            self.page.clone(),
+            self.keep,
+            self.vfilter.clone(),
+            Arc::clone(&self.budget),
+        );
+        p.groups =
+            crate::groups::GroupTable::with_hasher(self.plan.aggregates.len(), self.hasher.clone());
+        p.check_budget()?;
+        p.stats.segments_scanned += 1;
+        let batch = load_batch(
+            &self.segs[i],
+            &self.plan,
+            &self.needed,
+            &self.tenant,
+            &mut p.stats,
+            self.opts.enable_map_projection,
+        )?;
+        p.process(&batch)?;
+        p.check_budget()?;
+        let empty = crate::groups::GroupTable::new(0);
+        Ok(Partial {
+            stats: std::mem::take(&mut p.stats),
+            rows: std::mem::take(&mut p.rows),
+            groups: std::mem::replace(&mut p.groups, empty),
+            mem: p.mem,
+        })
+    }
+}
+
+/// Fills a claimed slot exactly once, also when the scan panics.
+struct SlotGuard<'s> {
+    shared: &'s ScanShared,
+    i: usize,
+    done: bool,
+}
+
+impl SlotGuard<'_> {
+    fn fill(&mut self, r: Result<Partial>) {
+        let mut st = self.shared.slots.lock().unwrap_or_else(|e| e.into_inner());
+        st.1[self.i] = Some(r);
+        st.0 += 1;
+        self.done = true;
+        self.shared.filled.notify_all();
+    }
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.shared.budget.stop.store(true, AtomicOrdering::Relaxed);
+            self.fill(Err(Error::internal("scan task panicked")));
+        }
+    }
+}
+
+/// Estimated single-core scan cost per row scanned, by query shape.
+/// Calibrated on HW-REF-7 (performance cores, one worker; report
+/// 2026-11-26-scan-pool): filters 34–49 ns, GROUP BY 48–72 ns, LIKE 63 ns per
+/// row. Sorting an aggregate's groups is negligible next to the scan; row
+/// queries with ORDER BY pay for sort keys of matched rows. The VIII.12 cost
+/// model replaces this.
+fn est_ns_per_row(plan: &Plan) -> f64 {
+    let mut ns = 30.0;
+    if !plan.group_by.is_empty() {
+        ns += 40.0;
+    }
+    if plan.filter.as_ref().is_some_and(contains_like) {
+        ns += 30.0;
+    }
+    if !plan.aggregate && !plan.order.is_empty() {
+        ns += 100.0;
+    }
+    ns
+}
+
+fn contains_like(e: &Expr) -> bool {
+    let mut found = false;
+    e.walk(&mut |x| {
+        if matches!(x, Expr::Like { .. }) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Per-worker CPU target for interactive queries (STRATA-SYS-11-008).
+pub const TARGET_MS_PER_WORKER: f64 = 5.0;
+
+/// Below this estimated CPU time a query never uses more than
+/// [`SMALL_QUERY_MAX_WORKERS`] workers (STRATA-SYS-01-006).
+pub const SMALL_QUERY_MS: f64 = 2.0;
+pub const SMALL_QUERY_MAX_WORKERS: usize = 4;
+
+/// Degree of parallelism for scanning `segs`, given `idle_workers` (pool
+/// workers not running or holding queued tasks).
+///
+/// * Base (STRATA-SYS-11-008): `ceil(est_cpu_ms / target_ms_per_worker)`,
+///   clamped to `1..=min(parallelism, segments)`. This is what a query gets
+///   when the pool is busy, so concurrent queries share workers instead of
+///   each fanning out.
+/// * When workers are idle, a query may also use them, up to
+///   `min(parallelism, segments)`. Queries under 2 ms of estimated work stay
+///   at no more than 4 workers (STRATA-SYS-01-006). On this engine fan-out
+///   costs little extra CPU and cuts latency 2–4× for 1–5 ms queries, which
+///   the base formula alone would scan on one worker (report
+///   2026-11-26-scan-pool; ADR-0006).
+///
+/// `target_ms_per_worker = 0` always uses `min(parallelism, segments)`.
+pub(crate) fn scan_dop(
+    plan: &Plan,
+    segs: &[&Arc<SegmentHandle>],
+    opts: &QueryOptions,
+    idle_workers: usize,
+) -> (usize, f64) {
+    let rows: u64 = segs.iter().map(|s| s.reader.footer().row_count).sum();
+    let est_ms = rows as f64 * est_ns_per_row(plan) / 1e6;
+    let max = opts.parallelism.max(1).min(segs.len().max(1));
+    if opts.target_ms_per_worker <= 0.0 {
+        return (max, est_ms);
+    }
+    let base = ((est_ms / opts.target_ms_per_worker).ceil() as usize).clamp(1, max);
+    let cap = if est_ms < SMALL_QUERY_MS {
+        SMALL_QUERY_MAX_WORKERS.min(max)
+    } else {
+        max
+    };
+    let idle = (1 + idle_workers).min(cap);
+    (base.max(idle).min(max), est_ms)
+}
+
+/// Scan `segs` with up to `workers` workers: this thread plus up to
+/// `workers - 1` tasks on the shared pool (fewer when the pool is busy;
+/// STRATA-SYS-11-008). One partial result per segment is merged into `ctx`
+/// **in segment order**, so result rows (after a stable sort) and group
+/// order are exactly those of a sequential scan. The first failing segment
+/// (lowest index) determines the error.
 fn scan_parallel(
     ctx: &mut Ctx<'_>,
     segs: &[&Arc<SegmentHandle>],
     needed: &[ColumnId],
     tenant: &TenantId,
     workers: usize,
+    pool: &crate::pool::ScanPool,
 ) -> Result<()> {
     let n = segs.len();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let slots: Vec<std::sync::Mutex<Option<Result<Partial>>>> =
-        (0..n).map(|_| std::sync::Mutex::new(None)).collect();
-    let template = &*ctx;
-    std::thread::scope(|s| {
-        for _ in 0..workers {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, AtomicOrdering::Relaxed);
-                if i >= n || template.budget.stop.load(AtomicOrdering::Relaxed) {
-                    break;
-                }
-                let mut p = template.partial();
-                let r = (|| -> Result<Partial> {
-                    p.check_budget()?;
-                    p.stats.segments_scanned += 1;
-                    let batch = load_batch(
-                        segs[i],
-                        template.plan,
-                        needed,
-                        tenant,
-                        &mut p.stats,
-                        template.opts.enable_map_projection,
-                    )?;
-                    p.process(&batch)?;
-                    p.check_budget()?;
-                    let empty = crate::groups::GroupTable::new(0);
-                    Ok(Partial {
-                        stats: std::mem::take(&mut p.stats),
-                        rows: std::mem::take(&mut p.rows),
-                        groups: std::mem::replace(&mut p.groups, empty),
-                        mem: p.mem,
-                    })
-                })();
-                if r.is_err() {
-                    template.budget.stop.store(true, AtomicOrdering::Relaxed);
-                }
-                *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
-            });
-        }
+    let shared = Arc::new(ScanShared {
+        plan: ctx.plan.clone(),
+        opts: ctx.opts.clone(),
+        deadline: ctx.deadline,
+        page: ctx.page.clone(),
+        keep: ctx.keep,
+        vfilter: ctx.vfilter.clone(),
+        budget: Arc::clone(&ctx.budget),
+        hasher: ctx.groups.hasher(),
+        segs: segs.iter().map(|s| Arc::clone(s)).collect(),
+        needed: needed.to_vec(),
+        tenant: tenant.clone(),
+        next: std::sync::atomic::AtomicUsize::new(0),
+        participants: std::sync::atomic::AtomicUsize::new(0),
+        slots: std::sync::Mutex::new((0, (0..n).map(|_| None).collect())),
+        filled: std::sync::Condvar::new(),
     });
-    let results: Vec<Option<Result<Partial>>> = slots
-        .into_iter()
-        .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
-        .collect();
+    let helpers = workers.saturating_sub(1).min(pool.free_slots());
+    let mut queued = 0;
+    for _ in 0..helpers {
+        let s = Arc::clone(&shared);
+        match pool.try_submit(Box::new(move || s.work())) {
+            Ok(()) => queued += 1,
+            Err(_) => break, // saturated: this thread does the rest
+        }
+    }
+    shared.work();
+    // No index is claimed after this; every claimed index gets filled.
+    let claimed = shared.next.fetch_max(n, AtomicOrdering::Relaxed).min(n);
+    let results: Vec<Option<Result<Partial>>> = {
+        let mut st = shared.slots.lock().unwrap_or_else(|e| e.into_inner());
+        while st.0 < claimed {
+            st = shared.filled.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        std::mem::take(&mut st.1)
+    };
+    ctx.stats.scan_workers = shared.participants.load(AtomicOrdering::Relaxed).max(1);
+    ctx.stats.scan_tasks_queued = queued;
     // Report the first real error in segment order; a "worker failed"
     // cancellation is only a symptom of another worker's error.
     let user_cancel = ctx
@@ -1526,10 +1706,16 @@ fn run(
     }
     // Parallel scans only where every row must be seen anyway (sorted or
     // aggregate queries); unsorted LIMIT queries keep sequential early stop.
-    let workers = opts.parallelism.min(to_scan.len());
+    let pool = crate::pool::scan_pool();
+    let idle = pool.free_slots().saturating_sub(pool.workers());
+    let (workers, est_ms) = scan_dop(plan, &to_scan, opts, idle);
+    ctx.stats.est_cpu_ms = est_ms;
     if workers > 1 && (plan.aggregate || ctx.sorted()) {
-        scan_parallel(&mut ctx, &to_scan, &needed, tenant, workers)?;
+        scan_parallel(&mut ctx, &to_scan, &needed, tenant, workers, pool)?;
     } else {
+        if !to_scan.is_empty() {
+            ctx.stats.scan_workers = 1;
+        }
         for seg in to_scan {
             if ctx.limit_reached() {
                 ctx.stats.early_stop = true;
@@ -1791,6 +1977,11 @@ fn explain_text(
             "Actual: rows scanned {}, matched {}, segment bytes read {}, peak memory ~{} B, early stop {}, elapsed {:?}",
             s.rows_scanned, s.rows_matched, s.bytes_read, s.peak_memory_bytes, s.early_stop, s.elapsed
         );
+        let _ = writeln!(
+            t,
+            "Parallelism: estimated scan CPU {:.3} ms, {} scan worker(s), {} pool task(s) requested",
+            s.est_cpu_ms, s.scan_workers, s.scan_tasks_queued
+        );
     }
     t
 }
@@ -1841,7 +2032,8 @@ mod parallel_budget_tests {
         let segs: Vec<&Arc<SegmentHandle>> = snap.segments().iter().collect();
         assert_eq!(segs.len(), 40);
         let needed: Vec<ColumnId> = plan.columns.iter().copied().collect();
-        let err = scan_parallel(&mut ctx, &segs, &needed, &t, 4).unwrap_err();
+        let err =
+            scan_parallel(&mut ctx, &segs, &needed, &t, 4, crate::pool::scan_pool()).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ResourceExhausted);
         let scanned = budget.rows.load(AtomicOrdering::Relaxed);
         // Budget + at most one in-flight segment per worker (plus slack).
@@ -1849,6 +2041,190 @@ mod parallel_budget_tests {
             scanned <= 1000 + 4 * 150 + 150,
             "scanned {scanned} of 6000 rows"
         );
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use stratadb_storage::{Durability, Engine, EngineOptions};
+
+    fn engine(dir: &std::path::Path, segments: i64, rows: i64) -> (Engine, TenantId) {
+        let t = TenantId::new("p").unwrap();
+        let mut o = EngineOptions::new(dir);
+        o.background = false;
+        o.wal.durability = Durability::Async;
+        let e = Engine::open(o).unwrap();
+        for s in 0..segments {
+            let evs: Vec<Event> = (0..rows)
+                .map(|j| {
+                    let mut ev = Event::new(t.clone(), 1_795_170_600_000_000_000 + s * rows + j, 1);
+                    ev.service = Some(format!("svc{}", j % 7));
+                    ev
+                })
+                .collect();
+            e.write_batch(&t, evs).unwrap();
+            e.flush().unwrap();
+        }
+        (e, t)
+    }
+
+    fn plan(sql: &str) -> Plan {
+        Plan::new(crate::parser::parse(sql, &Default::default()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn degree_of_parallelism_follows_estimated_work_and_idle_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (e, t) = engine(dir.path(), 8, 1000);
+        let snap = e.snapshot(&t);
+        let segs: Vec<&Arc<SegmentHandle>> = snap.segments().iter().collect();
+        let opts = |par: usize, target: f64| QueryOptions {
+            parallelism: par,
+            target_ms_per_worker: target,
+            ..QueryOptions::default()
+        };
+        let count = plan("SELECT count(*) FROM logs");
+        let group = plan("SELECT service, count(*) AS n FROM logs GROUP BY service ORDER BY n");
+        let rows = plan("SELECT event_id FROM logs ORDER BY event_time");
+        // Shape-dependent cost per row: group-by > filter; row sort > both.
+        let est = |p: &Plan| scan_dop(p, &segs, &opts(8, 5.0), 0).1;
+        assert!(est(&count) < est(&group) && est(&group) < est(&rows));
+        // Busy pool (no idle workers): the base formula. 8,000 rows is far
+        // below 5 ms, so one worker.
+        assert!(est(&count) < SMALL_QUERY_MS);
+        assert_eq!(scan_dop(&count, &segs, &opts(8, 5.0), 0).0, 1);
+        // ceil(est / target), capped by parallelism and segment count.
+        let e_rows = est(&rows);
+        assert_eq!(scan_dop(&rows, &segs, &opts(8, e_rows / 3.0), 0).0, 3);
+        assert_eq!(
+            scan_dop(&rows, &segs, &opts(2, e_rows / 3.0), 0).0,
+            2,
+            "parallelism caps"
+        );
+        assert_eq!(
+            scan_dop(&rows, &segs[..2], &opts(8, e_rows / 9.0), 0).0,
+            2,
+            "segments cap"
+        );
+        // Idle workers: fan out, but a < 2 ms query never beyond 4
+        // (STRATA-SYS-01-006) ...
+        assert_eq!(
+            scan_dop(&count, &segs, &opts(8, 5.0), 100).0,
+            SMALL_QUERY_MAX_WORKERS
+        );
+        assert_eq!(
+            scan_dop(&count, &segs, &opts(8, 5.0), 1).0,
+            2,
+            "only as many as are idle"
+        );
+        // ... while a query above 2 ms may use every idle worker up to the
+        // caps (24,000 rows of a sorted row query).
+        let dir2 = tempfile::tempdir().unwrap();
+        let (e2, t2) = engine(dir2.path(), 8, 3000);
+        let snap2 = e2.snapshot(&t2);
+        let segs2: Vec<&Arc<SegmentHandle>> = snap2.segments().iter().collect();
+        let (d, est2) = scan_dop(&rows, &segs2, &opts(8, 5.0), 100);
+        assert!(est2 >= SMALL_QUERY_MS, "{est2}");
+        assert_eq!(d, 8);
+        assert_eq!(
+            scan_dop(&rows, &segs2, &opts(8, 5.0), 0).0,
+            1,
+            "busy: base formula"
+        );
+        // 0 = no estimate: always min(parallelism, segments).
+        assert_eq!(scan_dop(&count, &segs, &opts(6, 0.0), 0).0, 6);
+        assert_eq!(scan_dop(&count, &[], &opts(6, 5.0), 100).0, 1);
+        // End to end: reported in stats.
+        let out = execute(&snap, "SELECT count(*) FROM logs", &QueryOptions::default()).unwrap();
+        assert!((1..=SMALL_QUERY_MAX_WORKERS).contains(&out.stats.scan_workers));
+        assert!(out.stats.est_cpu_ms > 0.0);
+    }
+
+    #[test]
+    fn saturated_pool_degrades_to_caller_runs_without_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (e, t) = engine(dir.path(), 12, 500);
+        let snap = e.snapshot(&t);
+        let opts = QueryOptions {
+            parallelism: 8,
+            target_ms_per_worker: 0.0,
+            ..QueryOptions::default()
+        };
+        let p = plan("SELECT service, count(*) FROM logs GROUP BY service");
+        // A private pool (the global one is shared with concurrent tests),
+        // saturated with blocked tasks: 1 running + 1 queued for 1 worker.
+        let pool = crate::pool::ScanPool::start(1);
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pool.free_slots() > 0 {
+            assert!(Instant::now() < deadline, "pool never saturated");
+            let g = Arc::clone(&gate);
+            let _ = pool.try_submit(Box::new(move || {
+                let (m, cv) = &*g;
+                let mut open = m.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+            }));
+        }
+        let segs: Vec<&Arc<SegmentHandle>> = snap.segments().iter().collect();
+        let needed: Vec<ColumnId> = p.columns.iter().copied().collect();
+        let budget = Arc::new(SharedBudget::default());
+        let mut ctx = Ctx::new(
+            &p,
+            &opts,
+            Instant::now() + opts.timeout,
+            None,
+            None,
+            None,
+            budget,
+        );
+        // The scan completes on this thread alone: no wait on the pool.
+        scan_parallel(&mut ctx, &segs, &needed, &t, 8, &pool).unwrap();
+        assert_eq!(ctx.stats.scan_workers, 1);
+        assert_eq!(ctx.stats.scan_tasks_queued, 0);
+        assert_eq!(ctx.stats.segments_scanned, 12);
+        assert_eq!(ctx.stats.rows_scanned, 12 * 500);
+        assert_eq!(ctx.groups.len(), 7, "every service group");
+        let (m, cv) = &*gate;
+        *m.lock().unwrap() = true;
+        cv.notify_all();
+    }
+
+    #[test]
+    fn concurrent_queries_share_a_fixed_set_of_threads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (e, t) = engine(dir.path(), 10, 300);
+        let e = Arc::new(e);
+        let workers = crate::pool::scan_pool().workers();
+        let attempts = |s: crate::pool::PoolStats| s.submitted + s.rejected;
+        let before = attempts(crate::pool::scan_pool().stats());
+        let opts = QueryOptions {
+            parallelism: 8,
+            target_ms_per_worker: 0.0,
+            ..QueryOptions::default()
+        };
+        let sql = "SELECT service, count(*) FROM logs GROUP BY service ORDER BY service";
+        let want = execute(&e.snapshot(&t), sql, &opts).unwrap().rows;
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let (e, t, opts, want) = (&e, &t, &opts, &want);
+                s.spawn(move || {
+                    for _ in 0..25 {
+                        let out = execute(&e.snapshot(t), sql, opts).unwrap();
+                        assert_eq!(&out.rows, want);
+                    }
+                });
+            }
+        });
+        let st = crate::pool::scan_pool().stats();
+        assert_eq!(st.workers, workers, "no threads created per query");
+        // Tasks were offered to the pool (another test may hold it saturated
+        // for a moment, in which case the offers were declined).
+        assert!(attempts(st) > before, "pool used");
+        assert_eq!(st.panicked, 0);
     }
 }
 

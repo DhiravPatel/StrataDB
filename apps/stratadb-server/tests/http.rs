@@ -1379,6 +1379,7 @@ async fn metrics_histograms_and_query_outcomes() {
             assert!(stats[k].as_f64().is_some_and(|v| v >= 0.0), "{k}: {stats}");
         }
         assert!(stats["exec_us"].as_f64().unwrap() > 0.0);
+        assert!(stats["scan_workers"].as_u64().is_some() && stats["est_cpu_ms"].as_f64().is_some());
         let parts = ["queue_us", "parse_us", "plan_us", "exec_us"]
             .iter()
             .map(|k| stats[k].as_f64().unwrap())
@@ -1526,6 +1527,11 @@ async fn metrics_histograms_and_query_outcomes() {
             "stage=\"group_commit_wait\""
         ) > 0.0
     );
+    // Shared scan pool (STRATA-SYS-01-010): fixed workers, bounded tasks.
+    assert!(get("strata_scan_pool_workers", "") >= 1.0);
+    assert!(get("strata_scan_pool_active_tasks", "") <= 2.0 * get("strata_scan_pool_workers", ""));
+    get("strata_scan_pool_tasks_total", "result=\"accepted\"");
+    get("strata_scan_pool_tasks_total", "result=\"rejected\"");
     for st in ["queue", "parse", "plan", "exec", "serialize"] {
         assert_eq!(
             get(

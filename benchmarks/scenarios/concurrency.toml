@@ -1,0 +1,79 @@
+# Concurrency scenario: single-query latency of scan-heavy queries plus
+# concurrent load (8 clients), to evaluate scan parallelism and the shared
+# scan worker pool (report 2026-11-26-scan-pool). Run in the foreground: a
+# background (low-QoS) process may be scheduled on efficiency cores.
+name = "concurrency"
+description = "Scan-heavy queries alone and under 8 concurrent clients (closed and open loop)"
+
+[dataset]
+profile = "app-logs"
+events = 200000
+tenants = 4
+seed = 1
+batch_size = 1000
+flush_every = 50000
+
+[engine]
+durability = "group_commit"
+
+[run]
+warmup = 2
+repetitions = 10
+
+[[query]]
+id = "q04_service_severity"
+sql = "SELECT count(*) FROM logs WHERE service = 'auth' AND severity = 'WARN'"
+
+[[query]]
+id = "q06_message_token_search"
+sql = "SELECT count(*) FROM logs WHERE body LIKE '%TIMEOUT%'"
+
+[[query]]
+id = "q07_attribute_equality"
+sql = "SELECT count(*) FROM logs WHERE attributes['region'] = 'eu-west-1'"
+
+[[query]]
+id = "q08_high_cardinality_agg"
+sql = "SELECT attributes['user_id'] AS u, count(*) AS n FROM logs GROUP BY attributes['user_id'] ORDER BY n DESC LIMIT 10"
+
+[[query]]
+id = "q12_historical_wide_range"
+sql = "SELECT severity, count(*) FROM logs GROUP BY severity"
+
+[[query]]
+id = "q01_trace_id_lookup"
+sql = "SELECT event_time, body FROM logs WHERE trace_id = '{trace_id}'"
+
+[[load]]
+id = "like_closed_8"
+kind = "query"
+mode = "closed"
+duration_s = 5
+workers = 8
+query = "q06_message_token_search"
+
+[[load]]
+id = "groupby_closed_8"
+kind = "query"
+mode = "closed"
+duration_s = 5
+workers = 8
+query = "q12_historical_wide_range"
+
+[[load]]
+id = "filter_open_300"
+kind = "query"
+mode = "open"
+rate_per_s = 300
+duration_s = 8
+workers = 8
+query = "q04_service_severity"
+
+[[load]]
+id = "trace_open_200"
+kind = "query"
+mode = "open"
+rate_per_s = 200
+duration_s = 8
+workers = 8
+query = "q01_trace_id_lookup"

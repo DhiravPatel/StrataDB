@@ -30,6 +30,17 @@ stages are not lost.
 | `strata_insert_stage_seconds{stage}` | in pipeline order: `auth`, `decode` (body decompress, UTF-8, JSON framing), `validate` (event mapping and limits), `admission` (flush-backlog backpressure wait), `wal_encode` (batch encoding), `wal_append` (frame + CRC + write, including WAL lock wait), `group_commit_wait` (written → durable; sync modes), `memtable_insert`, `ack` (response construction). Server stages cover `/api/v1/ingest`; engine stages cover every write path |
 | `strata_query_stage_seconds{stage}` | `queue` (waiting for an execution thread), `parse`, `plan`, `exec`, `serialize`; successful queries only |
 
+## Scan worker pool
+| Series | Meaning |
+|--------|---------|
+| `strata_scan_pool_workers` | threads of the shared scan pool (`sx-work-NN`; `[limits] scan_threads`) |
+| `strata_scan_pool_active_tasks` | scan tasks queued or running, at most 2 × workers |
+| `strata_scan_pool_tasks_total{result="accepted"\|"rejected"}` | tasks offered to the pool; `rejected` means the pool was busy and the query ran that share on its own thread |
+
+A rising `rejected` rate under load means the pool is the bottleneck. Queries
+still complete (with lower parallelism). Per-query parallelism is reported in
+query responses as `stats.scan_workers` and `stats.est_cpu_ms`.
+
 Compare stage quantiles with the VIII.1.2 budgets
 (docs/benchmarks/harness.md); the budgets are defined for HW-REF-1.
 

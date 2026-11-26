@@ -49,9 +49,16 @@
   they give false verdicts: the A/A test found 9 of 27. CI runs only the
   smoke scenario until a dedicated runner exists. The ledger records CPU ns,
   not cycles.
-- Each query spawns its own scan threads (no shared bounded worker pool:
-  STRATA-SYS-01-010). Under concurrent load this inflates latency (report
-  2026-11-26).
+- Scans run on a shared, fixed pool with cost-based parallelism.
+  - The unit of parallel work is a whole segment, not a granule morsel
+    (STRATA-SYS-11-007).
+  - There are no interactive/batch scheduling classes.
+  - The per-row cost estimate is a fixed calibration from HW-REF-7, not the
+    VIII.12 cost model.
+  - Idle workers are used beyond the STRATA-SYS-11-008 base formula
+    (ADR-0006).
+  - Very short queries (under about 1 ms) pay up to about 45% for the
+    handoff to pool threads (report 2026-11-26-scan-pool).
 - Segments use LZ4 chunk compression (v2); no zstd cold tier yet. Hot attribute keys (≥ 10 % of
   rows) are shredded into columns (v3); rarer keys stay in per-row maps.
 - `WHERE` filters are vectorized and group keys are encoded without copies

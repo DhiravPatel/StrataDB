@@ -10,6 +10,11 @@ strata-bench [legacy flags]          # the fixed §27.4 suite (raw JSON, unchang
 `--hw-profile` defaults to `HW-REF-7` (an unclassified or laptop machine).
 Results from different profiles are never compared.
 
+**Run benchmarks in the foreground.** macOS may schedule a background
+(low-priority) process on efficiency cores. In one session a background A/B
+ran 3–30× slower than the same scenario in the foreground, in both arms
+(report 2026-11-26-scan-pool).
+
 ## Scenarios
 Scenarios are TOML files in `benchmarks/scenarios/`:
 - `smoke.toml` is the CI smoke test: 20k events, a deterministic layout and
@@ -23,7 +28,7 @@ Unknown keys are rejected.
 | top | `name`, `description` |
 | `[dataset]` | `profile` (testkit profile), `events`, `tenants`, `seed`, `batch_size`, `flush_every` (optional: deterministic segment layout) |
 | `[engine]` | `durability` = `async` \| `sync` \| `group_commit` (**required**, Part V.8), `group_commit_delay_ms`, `bloom`, `ngram`, `compression`, `shredding`, `memtable_max_bytes` |
-| `[query_options]` | `parallelism` (0 = default), `vectorized`, `map_projection` |
+| `[query_options]` | `parallelism` (0 = default), `vectorized`, `map_projection`, `target_ms_per_worker` (0 = always `parallelism` workers) |
 | `[run]` | `warmup`, `repetitions` (≥ 5, STRATA-SYS-19-001), `cache` (only `"warm"`: a valid cold run needs a dropped page cache and an idle device, STRATA-SYS-01-009) |
 | `[[query]]` | `id`, `sql` (placeholders `{trace_id}`, `{request_id}`, `{t_start}`, `{t_end}`, `{t_recent}`, `{t_mid_lo}`, `{t_mid_hi}`), `tenant`, `[query.expect]` |
 | `[[load]]` | `id`, `kind` = `ingest` \| `query`, `mode` = `open` \| `closed`, `rate_per_s` (open), `duration_s`, `workers`, `batch_size` (ingest), `query` (a `[[query]]` id) |
@@ -39,7 +44,7 @@ The statistics are:
 - `segments_total`, `segments_scanned`, `segments_pruned`;
 - `segments_pruned_time`, `segments_pruned_keys`, `segments_pruned_severity`,
   `segments_pruned_bloom`, `segments_pruned_ngram`;
-- `shredded_reads`, `memory_rows_scanned`.
+- `shredded_reads`, `memory_rows_scanned`, `scan_workers`.
 
 Assertions that depend on the number of segments need `flush_every`.
 Background flush timing is not deterministic, and a run with a different

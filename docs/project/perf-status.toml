@@ -35,8 +35,12 @@ evidence = "apps/stratadb-bench/src/scenario.rs validate (cache must be warm)"
 note = "cold runs are refused rather than produced invalidly; dropping caches needs root and an idle device"
 
 [req."STRATA-SYS-01-010"]
-status = "MISSING"
-note = "violated today: parallel segment scans spawn scoped threads per query (ADR-0026 phase 10: bounded worker pool); the server does not use a thread per connection (tokio)"
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-query/src/pool.rs (fixed shared scan pool); exec.rs scan_parallel (no thread creation); tests pool_tests::concurrent_queries_share_a_fixed_set_of_threads; server: tokio tasks per connection, queries on the bounded blocking pool behind max_concurrent_queries"
+
+[req."STRATA-SYS-01-006"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-query/src/exec.rs scan_dop (< 2 ms estimated -> at most 4 workers, even with idle workers); test pool_tests::degree_of_parallelism_follows_estimated_work_and_idle_capacity"
 
 [req."STRATA-SYS-01-012"]
 status = "PARTIAL"
@@ -168,8 +172,28 @@ note = "the manifest mutex is held across flush I/O (it serializes flushes)"
 
 [req."STRATA-SYS-03-015"]
 status = "PARTIAL"
-evidence = "crates/stratadb-storage/src/engine.rs (background thread named stratadb-bg)"
-note = "scan threads are unnamed; prefixes differ from sx-*"
+evidence = "scan pool threads sx-work-NN (crates/stratadb-query/src/pool.rs), background thread sx-maint (crates/stratadb-storage/src/engine.rs)"
+note = "server runtime threads keep tokio's default names; no sx-net/sx-wal yet"
+
+[req."STRATA-SYS-03-010"]
+status = "PARTIAL"
+evidence = "scan pool queue bounded at `workers` tasks (crates/stratadb-query/src/pool.rs)"
+note = "one shared MPMC queue behind a mutex, not per-worker SPSC queues with cache-line padding"
+
+[req."STRATA-SYS-03-014"]
+status = "PARTIAL"
+evidence = "scan pool size fixed at start (<= 256); engine background thread; strata_scan_pool_workers metric"
+note = "no system.threads inventory; tokio blocking threads are bounded by request semaphores, not by this rule directly"
+
+[req."STRATA-SYS-11-007"]
+status = "PARTIAL"
+evidence = "scan tasks claim whole segments (crates/stratadb-query/src/exec.rs ScanShared::work)"
+note = "morsel = segment; segments have no granules yet"
+
+[req."STRATA-SYS-11-008"]
+status = "PARTIAL"
+evidence = "crates/stratadb-query/src/exec.rs scan_dop + scan_parallel (pool free slots cap tasks: active <= 2 x workers); tests pool_tests"
+note = "one class (interactive, 5 ms target); idle workers are used beyond the base formula (deviation with HW-REF-7 evidence, ADR-0006); per-row cost is a fixed calibration, not the VIII.12 cost model"
 
 [req."STRATA-SYS-04-002"]
 status = "PARTIAL"

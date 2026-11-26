@@ -2,6 +2,18 @@
 
 ## Unreleased (0.0.1)
 ### Added
+- **Shared scan worker pool.** Queries no longer create scan threads.
+  - Pool: one fixed pool of `sx-work-NN` threads (`[limits] scan_threads`)
+    with a bounded queue (≤ 2 × workers active). When the pool is busy, the
+    query runs the work on its own thread.
+  - Contention-aware degree of parallelism: `ceil(est_cpu_ms / 5 ms)` when
+    the pool is busy; idle workers are used otherwise, with at most 4 for
+    queries under 2 ms (spec STRATA-SYS-01-006/010, 11-008).
+  - Under 8 concurrent clients: lower tail latency and up to 1.6× GROUP BY
+    throughput (`benchmarks/reports/2026-11-26-scan-pool.md`).
+  - Visibility: `stats.scan_workers`, `stats.est_cpu_ms`, EXPLAIN ANALYZE
+    "Parallelism", and `strata_scan_pool_*` metrics.
+  - The background thread is now named `sx-maint`.
 - **Performance measurement system (spec P0, ADR-0026).** These subcommands
   are new; `strata-bench [flags]` (the fixed suite) is unchanged:
   - `strata-bench scenario` runs TOML scenarios

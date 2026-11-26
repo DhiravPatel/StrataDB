@@ -12,7 +12,9 @@ pub mod lexer;
 pub mod page;
 pub mod parser;
 pub mod plan;
+pub mod pool;
 mod vector;
 
 pub use eval::Datum;
 pub use exec::{execute, execute_page, Page, PageRequest, QueryOptions, QueryOutput, QueryStats};
+pub use pool::{configure_scan_pool, scan_pool, PoolStats};

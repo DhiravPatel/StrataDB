@@ -43,8 +43,9 @@ and flushes. Beyond the window/capacity, delivery is at-least-once (ADR-0019).
 
 ## Query response
 `{"columns": [...], "rows": [{col: value}], "explain": null|text, "partial": false, "next_cursor": null|string, "stats": {...}}`.
-`stats` includes the phase decomposition `queue_us`, `parse_us`, `plan_us`
-and `exec_us` (spec VIII.1.4; `queue + parse + plan + exec ≤ elapsed_ms`,
+`stats` includes `scan_workers` (workers that scanned segments) and
+`est_cpu_ms` (the estimate that set the degree of parallelism), and the phase
+decomposition `queue_us`, `parse_us`, `plan_us` and `exec_us` (spec VIII.1.4; `queue + parse + plan + exec ≤ elapsed_ms`,
 and the remainder is serialization). Each successful query is also logged as
 a structured `query` event (target `query`) with these timings, the rows
 scanned and returned, and the bytes read. It contains no SQL text or values.

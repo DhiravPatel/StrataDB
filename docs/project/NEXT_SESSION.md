@@ -49,9 +49,10 @@ a status, edit `docs/project/perf-status.toml` and run
 
 The gates give false verdicts on this laptop (A/A: 9 of 27), so CI runs the
 smoke scenario only. **Next: phase 10, task P1-1**: a bounded scan worker
-pool replacing per-query threads (STRATA-SYS-01-010/006). Measure it with
-the standard scenario's open-loop trace-lookup load, using interleaved CPU
-time.
+pool replacing per-query threads (STRATA-SYS-01-010/006). **Done**: shared
+`sx-work-NN` pool, contention-aware DOP, report 2026-11-26-scan-pool. Next is
+P1-2: thread inventory and naming (tokio runtime threads, `system.threads`
+equivalent). Run benchmarks in the foreground (efficiency-core pitfall).
 
 ## Exact next tasks (priority order)
 1. Query execution follow-ups: intra-segment parallelism; row-selective

@@ -1028,6 +1028,8 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
                     // queue + parse + plan + exec (+ serialize) ≈ elapsed.
                     "queue_us": us(queued), "parse_us": us(s.parse),
                     "plan_us": us(s.plan), "exec_us": us(s.elapsed),
+                    // Degree of parallelism (STRATA-SYS-11-008).
+                    "scan_workers": s.scan_workers, "est_cpu_ms": s.est_cpu_ms,
                 },
             }))
             .into_response();
@@ -1240,6 +1242,18 @@ async fn metrics(State(st): State<AppState>, headers: HeaderMap) -> Response {
     );
     st.metrics.render(&mut out);
     st.metrics.render_stages(&mut out, &s.insert_stages);
+    let p = stratadb_query::scan_pool().stats();
+    out.push_str(&format!(
+        "# HELP strata_scan_pool_workers Threads of the shared scan worker pool.\n\
+         # TYPE strata_scan_pool_workers gauge\nstrata_scan_pool_workers {}\n\
+         # HELP strata_scan_pool_active_tasks Scan tasks queued or running (at most 2 x workers).\n\
+         # TYPE strata_scan_pool_active_tasks gauge\nstrata_scan_pool_active_tasks {}\n\
+         # HELP strata_scan_pool_tasks_total Scan tasks offered to the pool, by result (rejected = run by the query thread because the pool was busy).\n\
+         # TYPE strata_scan_pool_tasks_total counter\n\
+         strata_scan_pool_tasks_total{{result=\"accepted\"}} {}\n\
+         strata_scan_pool_tasks_total{{result=\"rejected\"}} {}\n",
+        p.workers, p.active_tasks, p.submitted, p.rejected
+    ));
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],

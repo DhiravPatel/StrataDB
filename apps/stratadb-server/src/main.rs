@@ -186,6 +186,15 @@ fn serve(r: Resolved) -> Result<()> {
             "no active API tokens; create one with `strata-server token create`"
         );
     }
+    if let Some(n) = r.scan_threads {
+        stratadb_query::configure_scan_pool(n)?;
+    }
+    let pool = stratadb_query::scan_pool();
+    tracing::info!(
+        component = "query",
+        scan_threads = pool.workers(),
+        "scan worker pool started"
+    );
     let engine = Arc::new(Engine::open(r.engine.clone())?);
     let audit = AuditLog::open(&r.data_dir)?;
     audit.record(

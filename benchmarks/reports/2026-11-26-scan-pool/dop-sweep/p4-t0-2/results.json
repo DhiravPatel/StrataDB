@@ -1,0 +1,975 @@
+{
+  "cache": "warm",
+  "description": "Log query suite (spec §27.4) on 200k app-log events, 4 tenants; open-loop ingest + query load",
+  "durability": "group_commit",
+  "hw_profile": "HW-REF-7",
+  "ingest": {
+    "ack_ms": {
+      "max": 27.218249999999998,
+      "mean": 5.986527131249999,
+      "median": 5.96525,
+      "median_ci95": [
+        5.940125,
+        5.987
+      ],
+      "min": 4.3553749999999996,
+      "n": 800,
+      "p95": 7.0812672999999995,
+      "p99": 8.762133659999996,
+      "p999": 14.622047759000344,
+      "stddev": 1.11344397302858
+    },
+    "cpu_ns_per_event": 7400.725,
+    "events": 200000,
+    "events_per_s": 31869.245584446307,
+    "final_flush_ms": 0.000709,
+    "label": "closed-loop bulk load (throughput only). Burst, not sustained: it ends before compaction cycles complete, so it is not publishable as sustained ingest (STRATA-SYS-01-004/005).",
+    "process_cpu_s": 1.480145,
+    "segment_bytes": 12423330,
+    "segments": 16,
+    "wall_s": 6.27564275
+  },
+  "insert_stages": {
+    "batch_size": 1000,
+    "gate_eligible": false,
+    "note": "upper bounds of the histogram bucket holding the quantile; budgets are spec VIII.1.2 targets for HW-REF-1 (1,000-row batches) and gate only on that profile (STRATA-SYS-01-002)",
+    "stages": [
+      {
+        "budget_p50_us": null,
+        "budget_p99_us": null,
+        "count": 800,
+        "mean_us": 0.03403,
+        "p50_upper_bound_us": 1.0,
+        "p99_upper_bound_us": 1.0,
+        "stage": "admission"
+      },
+      {
+        "budget_p50_us": 20.0,
+        "budget_p99_us": 60.0,
+        "count": 800,
+        "mean_us": 74.1102625,
+        "p50_upper_bound_us": 100.0,
+        "p99_upper_bound_us": 500.0,
+        "stage": "wal_encode"
+      },
+      {
+        "budget_p50_us": 3.0,
+        "budget_p99_us": 15.0,
+        "count": 800,
+        "mean_us": 55.24530625,
+        "p50_upper_bound_us": 50.0,
+        "p99_upper_bound_us": 500.0,
+        "stage": "wal_append"
+      },
+      {
+        "budget_p50_us": 250.0,
+        "budget_p99_us": 1500.0,
+        "count": 800,
+        "mean_us": 5785.820415,
+        "p50_upper_bound_us": 10000.0,
+        "p99_upper_bound_us": 10000.0,
+        "stage": "group_commit_wait"
+      },
+      {
+        "budget_p50_us": 30.0,
+        "budget_p99_us": 100.0,
+        "count": 800,
+        "mean_us": 61.93895125000001,
+        "p50_upper_bound_us": 50.0,
+        "p99_upper_bound_us": 250.0,
+        "stage": "memtable_insert"
+      }
+    ]
+  },
+  "label": "measurement only; not a capacity claim. Compare only runs with the same runner_fingerprint, durability and dataset.",
+  "loads": [],
+  "queries": [
+    {
+      "cpu_ns_per_row_scanned": 103.68,
+      "est_cpu_ms": 0.375,
+      "expectation_failures": [],
+      "expectations": {
+        "indexes_used": "contains bloom(trace_id)",
+        "result_rows": ">= 1"
+      },
+      "id": "q01_trace_id_lookup",
+      "indexes_used": [
+        "bloom(trace_id)"
+      ],
+      "plan_us_median": 0.979,
+      "process_cpu": {
+        "max": 2.664,
+        "mean": 2.5846,
+        "median": 2.592,
+        "median_ci95": [
+          2.5370000000000004,
+          2.617
+        ],
+        "min": 2.528,
+        "n": 10,
+        "p95": 2.65275,
+        "p99": 2.66175,
+        "p999": 2.6637750000000002,
+        "stddev": 0.04567080273240463
+      },
+      "process_cpu_ms": [
+        2.5959999999999996,
+        2.639,
+        2.568,
+        2.589,
+        2.664,
+        2.6020000000000003,
+        2.595,
+        2.528,
+        2.528,
+        2.5370000000000004
+      ],
+      "repetitions": 10,
+      "result_rows": 1,
+      "rows_scanned": 25000,
+      "scan_workers": 1,
+      "segments_scanned": 2,
+      "segments_total": 4,
+      "sql": "SELECT event_time, body FROM logs WHERE trace_id = '8d9b9a5f3627f6e55ff25f124592b313'",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 2.719,
+        "mean": 2.6004083000000007,
+        "median": 2.606667,
+        "median_ci95": [
+          2.543292,
+          2.634521
+        ],
+        "min": 2.527291,
+        "n": 10,
+        "p95": 2.6912125,
+        "p99": 2.7134424999999998,
+        "p999": 2.7184442499999997,
+        "stddev": 0.061067727803826286
+      },
+      "wall_ms": [
+        2.617333,
+        2.65725,
+        2.568375,
+        2.6015420000000002,
+        2.719,
+        2.611792,
+        2.630625,
+        2.527291,
+        2.527583,
+        2.543292
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": 114.92,
+      "est_cpu_ms": 0.1875,
+      "expectation_failures": [],
+      "expectations": {
+        "result_rows": ">= 1",
+        "segments_pruned_bloom": ">= 1"
+      },
+      "id": "q02_request_id_lookup",
+      "indexes_used": [
+        "bloom(attributes['request_id'])"
+      ],
+      "plan_us_median": 1.7915,
+      "process_cpu": {
+        "max": 1.787,
+        "mean": 1.4593,
+        "median": 1.4365,
+        "median_ci95": [
+          1.3519999999999999,
+          1.5245000000000002
+        ],
+        "min": 1.3179999999999998,
+        "n": 10,
+        "p95": 1.6933999999999998,
+        "p99": 1.7682799999999999,
+        "p999": 1.7851279999999998,
+        "stddev": 0.1420782648167317
+      },
+      "process_cpu_ms": [
+        1.383,
+        1.403,
+        1.3179999999999998,
+        1.5790000000000002,
+        1.5,
+        1.3519999999999999,
+        1.327,
+        1.474,
+        1.787,
+        1.47
+      ],
+      "repetitions": 10,
+      "result_rows": 1,
+      "rows_scanned": 12500,
+      "scan_workers": 1,
+      "segments_scanned": 1,
+      "segments_total": 4,
+      "sql": "SELECT event_time, body FROM logs WHERE attributes['request_id'] = 'req_df7728bfa81e'",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 1.9375,
+        "mean": 1.5313127,
+        "median": 1.4815,
+        "median_ci95": [
+          1.351709,
+          1.6578335
+        ],
+        "min": 1.3172920000000001,
+        "n": 10,
+        "p95": 1.8893689,
+        "p99": 1.92787378,
+        "p999": 1.936537378,
+        "stddev": 0.21243172307828959
+      },
+      "wall_ms": [
+        1.3993339999999999,
+        1.9375,
+        1.3172920000000001,
+        1.61825,
+        1.569458,
+        1.351709,
+        1.326042,
+        1.4851249999999998,
+        1.8305420000000001,
+        1.477875
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": 119.11999999999998,
+      "est_cpu_ms": 3.3125,
+      "expectation_failures": [],
+      "expectations": {
+        "segments_pruned_time": ">= 1"
+      },
+      "id": "q03_recent_errors",
+      "indexes_used": [],
+      "plan_us_median": 1.0415,
+      "process_cpu": {
+        "max": 1.575,
+        "mean": 1.4965,
+        "median": 1.4889999999999999,
+        "median_ci95": [
+          1.449,
+          1.552
+        ],
+        "min": 1.427,
+        "n": 10,
+        "p95": 1.57275,
+        "p99": 1.57455,
+        "p999": 1.5749549999999999,
+        "stddev": 0.05416692307631618
+      },
+      "process_cpu_ms": [
+        1.57,
+        1.575,
+        1.504,
+        1.449,
+        1.459,
+        1.427,
+        1.446,
+        1.552,
+        1.474,
+        1.509
+      ],
+      "repetitions": 10,
+      "result_rows": 100,
+      "rows_scanned": 12500,
+      "scan_workers": 1,
+      "segments_scanned": 1,
+      "segments_total": 4,
+      "sql": "SELECT event_time, service, body FROM logs WHERE event_time >= TIMESTAMP '2026-11-20T00:03:10.000000000Z' AND severity = 'ERROR' ORDER BY event_time DESC LIMIT 100",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 2.902917,
+        "mean": 1.6380167999999997,
+        "median": 1.4885629999999999,
+        "median_ci95": [
+          1.4489159999999999,
+          1.567375
+        ],
+        "min": 1.426375,
+        "n": 10,
+        "p95": 2.312516999999999,
+        "p99": 2.7848370000000005,
+        "p999": 2.8911089999999993,
+        "stddev": 0.448219099182234
+      },
+      "wall_ms": [
+        1.567375,
+        1.5909170000000001,
+        1.5040419999999999,
+        1.4489159999999999,
+        1.45875,
+        1.426375,
+        1.444292,
+        1.5635000000000001,
+        1.4730839999999998,
+        2.902917
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": 48.82999999999999,
+      "est_cpu_ms": 1.25,
+      "expectation_failures": [],
+      "expectations": {
+        "result_rows": "== 1"
+      },
+      "id": "q04_service_severity",
+      "indexes_used": [],
+      "plan_us_median": 0.8335,
+      "process_cpu": {
+        "max": 2.655,
+        "mean": 2.4378,
+        "median": 2.4414999999999996,
+        "median_ci95": [
+          2.376,
+          2.509
+        ],
+        "min": 2.236,
+        "n": 10,
+        "p95": 2.6117999999999997,
+        "p99": 2.64636,
+        "p999": 2.654136,
+        "stddev": 0.11749118170219315
+      },
+      "process_cpu_ms": [
+        2.655,
+        2.4589999999999996,
+        2.476,
+        2.376,
+        2.385,
+        2.424,
+        2.236,
+        2.477,
+        2.559,
+        2.331
+      ],
+      "repetitions": 10,
+      "result_rows": 1,
+      "rows_scanned": 50000,
+      "scan_workers": 4,
+      "segments_scanned": 4,
+      "segments_total": 4,
+      "sql": "SELECT count(*) FROM logs WHERE service = 'auth' AND severity = 'WARN'",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 0.8584579999999999,
+        "mean": 0.7908876,
+        "median": 0.8206875,
+        "median_ci95": [
+          0.7338430625,
+          0.840334
+        ],
+        "min": 0.638,
+        "n": 10,
+        "p95": 0.85414565,
+        "p99": 0.85759553,
+        "p999": 0.8583717529999999,
+        "stddev": 0.08189077248682472
+      },
+      "wall_ms": [
+        0.803084,
+        0.826125,
+        0.840334,
+        0.797417,
+        0.81525,
+        0.848875,
+        0.638,
+        0.8394999999999999,
+        0.8584579999999999,
+        0.641833
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": 31.719999999999995,
+      "est_cpu_ms": 0.625,
+      "expectation_failures": [],
+      "expectations": {
+        "segments_pruned_time": ">= 1"
+      },
+      "id": "q05_time_range_scan",
+      "indexes_used": [],
+      "plan_us_median": 0.396,
+      "process_cpu": {
+        "max": 0.796,
+        "mean": 0.7934,
+        "median": 0.7929999999999999,
+        "median_ci95": [
+          0.7919999999999999,
+          0.795
+        ],
+        "min": 0.791,
+        "n": 10,
+        "p95": 0.796,
+        "p99": 0.796,
+        "p999": 0.796,
+        "stddev": 0.001955050439815382
+      },
+      "process_cpu_ms": [
+        0.7929999999999999,
+        0.791,
+        0.795,
+        0.795,
+        0.7919999999999999,
+        0.796,
+        0.7929999999999999,
+        0.7919999999999999,
+        0.791,
+        0.796
+      ],
+      "repetitions": 10,
+      "result_rows": 1,
+      "rows_scanned": 25000,
+      "scan_workers": 2,
+      "segments_scanned": 2,
+      "segments_total": 4,
+      "sql": "SELECT count(*) FROM logs WHERE event_time >= TIMESTAMP '2026-11-20T00:01:30.000000000Z' AND event_time < TIMESTAMP '2026-11-20T00:01:50.000000000Z'",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 0.449375,
+        "mean": 0.44595830000000003,
+        "median": 0.44577100000000003,
+        "median_ci95": [
+          0.4445,
+          0.447458
+        ],
+        "min": 0.443208,
+        "n": 10,
+        "p95": 0.448925,
+        "p99": 0.44928500000000005,
+        "p999": 0.44936600000000004,
+        "stddev": 0.0019689119414878285
+      },
+      "wall_ms": [
+        0.447458,
+        0.44499999999999995,
+        0.4445,
+        0.449375,
+        0.44387499999999996,
+        0.44837499999999997,
+        0.44587499999999997,
+        0.44625,
+        0.44566700000000004,
+        0.443208
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": 109.99,
+      "est_cpu_ms": 7.25,
+      "expectation_failures": [],
+      "expectations": {},
+      "id": "q06_message_token_search",
+      "indexes_used": [],
+      "plan_us_median": 2.979,
+      "process_cpu": {
+        "max": 6.8580000000000005,
+        "mean": 5.7543999999999995,
+        "median": 5.4995,
+        "median_ci95": [
+          5.35,
+          6.288
+        ],
+        "min": 5.193,
+        "n": 10,
+        "p95": 6.6843,
+        "p99": 6.82326,
+        "p999": 6.854526000000001,
+        "stddev": 0.5742111884044835
+      },
+      "process_cpu_ms": [
+        5.675000000000001,
+        5.287,
+        5.422,
+        5.193,
+        5.35,
+        6.288,
+        6.8580000000000005,
+        6.472,
+        5.445,
+        5.554
+      ],
+      "repetitions": 10,
+      "result_rows": 1,
+      "rows_scanned": 50000,
+      "scan_workers": 4,
+      "segments_scanned": 4,
+      "segments_total": 4,
+      "sql": "SELECT count(*) FROM logs WHERE body LIKE '%TIMEOUT%'",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 2.222708,
+        "mean": 1.668279,
+        "median": 1.6289375000000001,
+        "median_ci95": [
+          1.484541,
+          1.774625
+        ],
+        "min": 1.452666,
+        "n": 10,
+        "p95": 2.0211268999999996,
+        "p99": 2.18239178,
+        "p999": 2.2186763779999996,
+        "stddev": 0.22745632414011557
+      },
+      "wall_ms": [
+        1.666833,
+        1.45625,
+        1.484541,
+        1.452666,
+        1.601083,
+        1.774625,
+        2.222708,
+        1.77475,
+        1.592542,
+        1.656792
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": 74.24,
+      "est_cpu_ms": 1.25,
+      "expectation_failures": [],
+      "expectations": {
+        "shredded_reads": ">= 1"
+      },
+      "id": "q07_attribute_equality",
+      "indexes_used": [],
+      "plan_us_median": 0.75,
+      "process_cpu": {
+        "max": 3.871,
+        "mean": 3.7262,
+        "median": 3.7119999999999997,
+        "median_ci95": [
+          3.648,
+          3.819
+        ],
+        "min": 3.626,
+        "n": 10,
+        "p95": 3.84895,
+        "p99": 3.86659,
+        "p999": 3.870559,
+        "stddev": 0.09152510281034622
+      },
+      "process_cpu_ms": [
+        3.871,
+        3.771,
+        3.822,
+        3.819,
+        3.626,
+        3.6719999999999997,
+        3.7520000000000002,
+        3.65,
+        3.6310000000000002,
+        3.648
+      ],
+      "repetitions": 10,
+      "result_rows": 1,
+      "rows_scanned": 50000,
+      "scan_workers": 4,
+      "segments_scanned": 4,
+      "segments_total": 4,
+      "sql": "SELECT count(*) FROM logs WHERE attributes['region'] = 'eu-west-1'",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 1.3191249999999999,
+        "mean": 1.2399333000000001,
+        "median": 1.245479,
+        "median_ci95": [
+          1.213,
+          1.280875
+        ],
+        "min": 1.1184999999999998,
+        "n": 10,
+        "p95": 1.3024003,
+        "p99": 1.3157800599999998,
+        "p999": 1.3187905059999998,
+        "stddev": 0.054027566764158076
+      },
+      "wall_ms": [
+        1.281959,
+        1.252,
+        1.24825,
+        1.3191249999999999,
+        1.2119579999999999,
+        1.213,
+        1.280875,
+        1.230958,
+        1.1184999999999998,
+        1.242708
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": 140.1,
+      "est_cpu_ms": 19.25,
+      "expectation_failures": [],
+      "expectations": {
+        "result_rows": "== 10",
+        "shredded_reads": ">= 1"
+      },
+      "id": "q08_high_cardinality_agg",
+      "indexes_used": [],
+      "plan_us_median": 2.6665,
+      "process_cpu": {
+        "max": 7.253,
+        "mean": 6.878100000000001,
+        "median": 7.005,
+        "median_ci95": [
+          6.583,
+          7.091
+        ],
+        "min": 6.275,
+        "n": 10,
+        "p95": 7.18055,
+        "p99": 7.23851,
+        "p999": 7.251551,
+        "stddev": 0.31918314143729104
+      },
+      "process_cpu_ms": [
+        6.473,
+        6.275,
+        6.583,
+        7.0920000000000005,
+        7.253,
+        6.941,
+        7.063,
+        7.005,
+        7.005,
+        7.091
+      ],
+      "repetitions": 10,
+      "result_rows": 10,
+      "rows_scanned": 50000,
+      "scan_workers": 4,
+      "segments_scanned": 4,
+      "segments_total": 4,
+      "sql": "SELECT attributes['user_id'] AS u, count(*) AS n FROM logs GROUP BY attributes['user_id'] ORDER BY n DESC LIMIT 10",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 4.151208,
+        "mean": 3.7838623,
+        "median": 3.7934165,
+        "median_ci95": [
+          3.6782797125,
+          3.8437704999999998
+        ],
+        "min": 3.502417,
+        "n": 10,
+        "p95": 4.03493925,
+        "p99": 4.127954249999999,
+        "p999": 4.148882625,
+        "stddev": 0.1763162788564597
+      },
+      "wall_ms": [
+        3.561916,
+        3.502417,
+        3.811083,
+        3.792125,
+        3.82325,
+        3.742292,
+        3.766791,
+        3.892833,
+        4.151208,
+        3.794708
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": 143.06000000000003,
+      "est_cpu_ms": 6.75,
+      "expectation_failures": [],
+      "expectations": {},
+      "id": "q09_service_time_bucket",
+      "indexes_used": [],
+      "plan_us_median": 0.9165,
+      "process_cpu": {
+        "max": 7.913,
+        "mean": 7.2226,
+        "median": 7.1530000000000005,
+        "median_ci95": [
+          6.962000000000001,
+          7.359999999999999
+        ],
+        "min": 6.933,
+        "n": 10,
+        "p95": 7.7447,
+        "p99": 7.87934,
+        "p999": 7.9096340000000005,
+        "stddev": 0.3030442578605016
+      },
+      "process_cpu_ms": [
+        6.962000000000001,
+        7.24,
+        7.104,
+        7.271,
+        7.125,
+        6.958,
+        7.181,
+        7.539,
+        7.913,
+        6.933
+      ],
+      "repetitions": 10,
+      "result_rows": 48,
+      "rows_scanned": 50000,
+      "scan_workers": 4,
+      "segments_scanned": 4,
+      "segments_total": 4,
+      "sql": "SELECT service, time_bucket(INTERVAL '1 minute', event_time) AS b, count(*) FROM logs GROUP BY service, time_bucket(INTERVAL '1 minute', event_time)",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 3.4365419999999998,
+        "mean": 2.2551169,
+        "median": 2.1210415,
+        "median_ci95": [
+          2.077834,
+          2.198708
+        ],
+        "min": 2.0474590000000004,
+        "n": 10,
+        "p95": 2.9110166999999985,
+        "p99": 3.3314369399999997,
+        "p999": 3.426031493999999,
+        "stddev": 0.41972002972972605
+      },
+      "wall_ms": [
+        2.0474590000000004,
+        2.128708,
+        2.133542,
+        2.096709,
+        2.0755,
+        2.077834,
+        2.113375,
+        2.1727920000000003,
+        2.2687079999999997,
+        3.4365419999999998
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": 34.18,
+      "est_cpu_ms": 19.25,
+      "expectation_failures": [],
+      "expectations": {},
+      "id": "q10_top_error_codes",
+      "indexes_used": [],
+      "plan_us_median": 1.2085,
+      "process_cpu": {
+        "max": 1.777,
+        "mean": 1.7134,
+        "median": 1.709,
+        "median_ci95": [
+          1.681,
+          1.751
+        ],
+        "min": 1.659,
+        "n": 10,
+        "p95": 1.76935,
+        "p99": 1.7754699999999999,
+        "p999": 1.7768469999999998,
+        "stddev": 0.041382229143545265
+      },
+      "process_cpu_ms": [
+        1.777,
+        1.76,
+        1.659,
+        1.712,
+        1.738,
+        1.751,
+        1.684,
+        1.706,
+        1.681,
+        1.666
+      ],
+      "repetitions": 10,
+      "result_rows": 6,
+      "rows_scanned": 50000,
+      "scan_workers": 4,
+      "segments_scanned": 4,
+      "segments_total": 4,
+      "sql": "SELECT attributes['error.code'] AS code, count(*) AS n FROM logs WHERE severity IN ('ERROR', 'FATAL') GROUP BY attributes['error.code'] ORDER BY n DESC LIMIT 10",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 0.513208,
+        "mean": 0.4954249999999999,
+        "median": 0.4952295000000001,
+        "median_ci95": [
+          0.485292,
+          0.508875
+        ],
+        "min": 0.476583,
+        "n": 10,
+        "p95": 0.5114269,
+        "p99": 0.51285178,
+        "p999": 0.513172378,
+        "stddev": 0.01291538249960532
+      },
+      "wall_ms": [
+        0.513208,
+        0.485292,
+        0.476583,
+        0.508875,
+        0.501834,
+        0.5092500000000001,
+        0.483291,
+        0.5010420000000001,
+        0.485458,
+        0.48941700000000005
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": 87.95,
+      "est_cpu_ms": 6.75,
+      "expectation_failures": [],
+      "expectations": {},
+      "id": "q12_historical_wide_range",
+      "indexes_used": [],
+      "plan_us_median": 0.6665000000000001,
+      "process_cpu": {
+        "max": 4.856,
+        "mean": 4.4596,
+        "median": 4.3975,
+        "median_ci95": [
+          4.332,
+          4.584
+        ],
+        "min": 4.273,
+        "n": 10,
+        "p95": 4.81415,
+        "p99": 4.84763,
+        "p999": 4.855163,
+        "stddev": 0.19273712667776283
+      },
+      "process_cpu_ms": [
+        4.273,
+        4.763,
+        4.329000000000001,
+        4.405,
+        4.332,
+        4.413,
+        4.3759999999999994,
+        4.39,
+        4.856,
+        4.4590000000000005
+      ],
+      "repetitions": 10,
+      "result_rows": 5,
+      "rows_scanned": 50000,
+      "scan_workers": 4,
+      "segments_scanned": 4,
+      "segments_total": 4,
+      "sql": "SELECT severity, count(*) FROM logs GROUP BY severity",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 1.443458,
+        "mean": 1.3300707,
+        "median": 1.3314165,
+        "median_ci95": [
+          1.282875,
+          1.3623745
+        ],
+        "min": 1.248583,
+        "n": 10,
+        "p95": 1.4118454999999999,
+        "p99": 1.4371355,
+        "p999": 1.44282575,
+        "stddev": 0.058671227360701336
+      },
+      "wall_ms": [
+        1.248583,
+        1.361625,
+        1.282875,
+        1.3515409999999999,
+        1.2966250000000001,
+        1.443458,
+        1.373208,
+        1.311292,
+        1.360792,
+        1.270708
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": null,
+      "est_cpu_ms": 0.0,
+      "expectation_failures": [],
+      "expectations": {
+        "segments_pruned_ngram": ">= 1"
+      },
+      "id": "q13_absent_substring_search",
+      "indexes_used": [
+        "ngram(body)"
+      ],
+      "plan_us_median": 1.542,
+      "process_cpu": {
+        "max": 0.005,
+        "mean": 0.0045,
+        "median": 0.0045000000000000005,
+        "median_ci95": [
+          0.004,
+          0.005
+        ],
+        "min": 0.004,
+        "n": 10,
+        "p95": 0.005,
+        "p99": 0.005,
+        "p999": 0.005,
+        "stddev": 0.0005270462766947299
+      },
+      "process_cpu_ms": [
+        0.005,
+        0.005,
+        0.005,
+        0.004,
+        0.004,
+        0.004,
+        0.004,
+        0.005,
+        0.004,
+        0.005
+      ],
+      "repetitions": 10,
+      "result_rows": 1,
+      "rows_scanned": 0,
+      "scan_workers": 0,
+      "segments_scanned": 0,
+      "segments_total": 4,
+      "sql": "SELECT count(*) FROM logs WHERE body LIKE '%deadlock detected%'",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 0.004625,
+        "mean": 0.0041458,
+        "median": 0.004021,
+        "median_ci95": [
+          0.004,
+          0.0043335
+        ],
+        "min": 0.003958,
+        "n": 10,
+        "p95": 0.004625,
+        "p99": 0.004625,
+        "p999": 0.004625,
+        "stddev": 0.00025705935328462775
+      },
+      "wall_ms": [
+        0.004625,
+        0.004625,
+        0.004083,
+        0.004125,
+        0.004,
+        0.004,
+        0.004042,
+        0.003958,
+        0.004,
+        0.004
+      ]
+    }
+  ],
+  "results_version": 1,
+  "runner_fingerprint": "0b29fce902bcc9de",
+  "scenario": "standard",
+  "started_at": "2026-11-26T07:57:10.822998000Z",
+  "verdict": {
+    "excluded_client_bound": false,
+    "failures": [],
+    "flags": [],
+    "ok": true
+  }
+}

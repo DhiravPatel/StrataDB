@@ -51,9 +51,12 @@ fn engine(dir: &std::path::Path) -> Engine {
     e
 }
 
+/// `par` workers regardless of the cost estimate (the test data is small,
+/// so the estimate alone would scan sequentially).
 fn opts(par: usize) -> QueryOptions {
     QueryOptions {
         parallelism: par,
+        target_ms_per_worker: 0.0,
         ..QueryOptions::default()
     }
 }
@@ -93,7 +96,23 @@ fn parallel_equals_sequential() {
         "SELECT count(*) FROM logs WHERE service = 'nope'",
     ];
     for sql in exact {
-        let (s, p) = (run(&e, sql, 1), run(&e, sql, 8));
+        let s = run(&e, sql, 1);
+        assert_eq!(s.stats.scan_workers, 1, "{sql}");
+        // The parallel path really ran: pool workers scanned segments. The
+        // pool is shared by concurrently running tests, so a given run may
+        // get fewer helpers; every run must still produce identical rows.
+        let mut p = run(&e, sql, 8);
+        for _ in 0..200 {
+            if p.stats.scan_workers > 1 {
+                break;
+            }
+            assert_eq!(p.rows, s.rows, "{sql}");
+            p = run(&e, sql, 8);
+        }
+        assert!(
+            p.stats.scan_workers > 1,
+            "{sql}: never ran on more than one worker"
+        );
         assert_eq!(p.rows, s.rows, "{sql}");
         assert_eq!(p.columns, s.columns);
         assert_eq!(p.stats.rows_scanned, s.stats.rows_scanned, "{sql}");

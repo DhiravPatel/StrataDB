@@ -98,6 +98,10 @@ pub struct QueryCfg {
     pub vectorized: bool,
     #[serde(default = "yes")]
     pub map_projection: bool,
+    /// CPU ms of estimated scan work per worker (0 = always `parallelism`
+    /// workers); absent = engine default.
+    #[serde(default)]
+    pub target_ms_per_worker: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -293,6 +297,7 @@ const STAT_KEYS: &[&str] = &[
     "shredded_reads",
     "memory_rows_scanned",
     "early_stop",
+    "scan_workers",
 ];
 
 fn stat(s: &QueryStats, result_rows: usize, key: &str) -> f64 {
@@ -318,6 +323,7 @@ fn stat(s: &QueryStats, result_rows: usize, key: &str) -> f64 {
         "shredded_reads" => s.shredded_reads,
         "memory_rows_scanned" => s.memory_rows_scanned,
         "early_stop" => u64::from(s.early_stop),
+        "scan_workers" => s.scan_workers as u64,
         _ => 0,
     }) as f64
 }
@@ -453,6 +459,9 @@ struct QueryResult {
     segments_scanned: usize,
     indexes_used: Vec<String>,
     plan_us_median: f64,
+    /// Workers that scanned segments in the last repetition.
+    scan_workers: usize,
+    est_cpu_ms: f64,
     expectations: BTreeMap<String, String>,
     expectation_failures: Vec<String>,
 }
@@ -540,6 +549,10 @@ pub fn run(text: &str, out_dir: &Path, hw_profile: &str, data_dir: Option<PathBu
         } else {
             sc.query_options.parallelism
         },
+        target_ms_per_worker: sc
+            .query_options
+            .target_ms_per_worker
+            .unwrap_or(QueryOptions::default().target_ms_per_worker),
         ..QueryOptions::default()
     };
     let mut queries = Vec::new();
@@ -582,6 +595,8 @@ pub fn run(text: &str, out_dir: &Path, hw_profile: &str, data_dir: Option<PathBu
             segments_scanned: s.segments_scanned,
             indexes_used: s.indexes_used.clone(),
             plan_us_median: summarize(&plan).median,
+            scan_workers: s.scan_workers,
+            est_cpu_ms: s.est_cpu_ms,
             expectations: q.expect.clone(),
             expectation_failures: check_expectations(&q.expect, s, out.rows.len()),
         });

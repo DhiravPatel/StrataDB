@@ -8,6 +8,15 @@ claim**. Every number comes from HW-REF-7, a shared developer laptop (Apple
 M4, 10 cores, macOS), and is informational. Its main finding is the noise
 floor of this machine, which decides what the gates can and cannot do here.
 
+> **Erratum (2026-11-26, later the same day).** The three archived standard
+> runs were executed as a background process. macOS may schedule those on
+> efficiency cores; a later foreground run measured the same queries 3–30×
+> faster (report 2026-11-26-scan-pool). The absolute query and load numbers
+> below are therefore pessimistic. The noise-floor conclusions (run-to-run
+> drift, A/A false verdicts) were measured under the same conditions and are
+> still valid as a description of this machine, but should be re-measured in
+> the foreground.
+
 ## Setup
 - Build: release profile (fat LTO, `codegen-units = 1`, `panic = "abort"`),
   commit `4dac459e` plus the working-tree changes of this phase. The manifest
