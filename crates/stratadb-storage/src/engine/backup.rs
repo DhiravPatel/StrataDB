@@ -25,7 +25,7 @@
 //! file and directory is fsynced; an interrupted backup never looks complete.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -88,20 +88,14 @@ fn copy_hashed(from: &Path, to: &Path) -> Result<(u64, String)> {
     if let Some(p) = to.parent() {
         fsutil::create_dir_durable(p)?;
     }
-    let mut src = File::open(from).ctx(|| format!("opening {}", from.display()))?;
+    let src = stratadb_common::io::IoFile::open(stratadb_common::io::default_io(), from)?;
     let mut dst = fsutil::create_new_file(to)?;
     let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
     let mut total = 0u64;
-    loop {
-        let n = src
-            .read(&mut buf)
-            .ctx(|| format!("reading {}", from.display()))?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-        dst.write_all(&buf[..n])
+    for (off, n) in chunks(stratadb_common::io::RandomRead::len(&src)) {
+        let buf = src.read_vec(off, n)?;
+        h.update(&buf);
+        dst.write_all(&buf)
             .ctx(|| format!("writing {}", to.display()))?;
         total += n as u64;
     }
@@ -109,19 +103,21 @@ fn copy_hashed(from: &Path, to: &Path) -> Result<(u64, String)> {
     Ok((total, hex(&h.finalize())))
 }
 
+/// `(offset, len)` pieces of at most 1 MiB covering `len` bytes.
+fn chunks(len: u64) -> impl Iterator<Item = (u64, usize)> {
+    const STEP: u64 = 1 << 20;
+    (0..len.div_ceil(STEP)).map(move |i| {
+        let off = i * STEP;
+        (off, (len - off).min(STEP) as usize)
+    })
+}
+
 fn hash_file(p: &Path) -> Result<(u64, String)> {
-    let mut f = File::open(p).ctx(|| format!("opening {}", p.display()))?;
+    let f = stratadb_common::io::IoFile::open(stratadb_common::io::default_io(), p)?;
     let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
     let mut total = 0u64;
-    loop {
-        let n = f
-            .read(&mut buf)
-            .ctx(|| format!("reading {}", p.display()))?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
+    for (off, n) in chunks(stratadb_common::io::RandomRead::len(&f)) {
+        h.update(&f.read_vec(off, n)?);
         total += n as u64;
     }
     Ok((total, hex(&h.finalize())))
@@ -234,8 +230,10 @@ pub fn verify_backup(
     dir: &Path,
     key: Option<&dyn stratadb_crypto::KeyProvider>,
 ) -> Result<BackupManifest> {
-    let raw =
-        fs::read(dir.join(BACKUP_FILE)).ctx(|| format!("reading backup in {}", dir.display()))?;
+    let raw = stratadb_common::io::read_file(
+        &*stratadb_common::io::default_io(),
+        &dir.join(BACKUP_FILE),
+    )?;
     let bm = BackupManifest::decode(&raw)?;
     for f in &bm.files {
         let p = dir.join(&f.path);
@@ -290,7 +288,7 @@ pub fn verify_backup(
                 "segment referenced by MANIFEST is missing from the backup",
             ));
         }
-        open_segment(dir, e, true, k)?;
+        open_segment(dir, e, true, k, &stratadb_common::io::default_io())?;
     }
     Ok(bm)
 }
@@ -383,7 +381,13 @@ impl Shared {
             let (bytes, sha256) = copy_hashed(h.reader.path(), &tmp.join(&rel))?;
             failpoint::hit("backup::after_segment_copy")?;
             // Verify the copy, not just the source.
-            open_segment(&tmp, &h.entry, true, self.keys.as_deref())?;
+            open_segment(
+                &tmp,
+                &h.entry,
+                true,
+                self.keys.as_deref(),
+                &self.opts.io_engine(),
+            )?;
             bytes_total += bytes;
             files.push(BackupFile {
                 path: rel,

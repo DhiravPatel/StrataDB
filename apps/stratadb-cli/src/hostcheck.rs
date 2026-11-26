@@ -30,6 +30,23 @@ fn parse_limit(s: &str) -> Option<u64> {
     }
 }
 
+/// Kernel release (`uname -r`), for hosts without `/proc`.
+pub fn uname_release() -> Option<String> {
+    let out = Command::new("uname").arg("-r").output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (out.status.success() && !s.is_empty()).then_some(s)
+}
+
+/// CPU model on hosts without `/proc/cpuinfo` (macOS `sysctl`).
+pub fn cpu_model() -> Option<String> {
+    let out = Command::new("sysctl")
+        .args(["-n", "machdep.cpu.brand_string"])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (out.status.success() && !s.is_empty()).then_some(s)
+}
+
 /// Physical memory in bytes (Linux `/proc/meminfo`, macOS/BSD `sysctl`).
 pub fn total_memory() -> Option<u64> {
     if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {

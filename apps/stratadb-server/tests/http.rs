@@ -1527,6 +1527,22 @@ async fn metrics_histograms_and_query_outcomes() {
             "stage=\"group_commit_wait\""
         ) > 0.0
     );
+    // Storage I/O engine (STRATA-SYS-04-001, 02-037).
+    assert!(get("strata_io_max_open_files", "") >= 8.0);
+    assert!(get("strata_io_files_open", "") <= get("strata_io_max_open_files", ""));
+    assert_eq!(get("strata_io_read_errors_total", ""), 0.0);
+    get("strata_io_reads_total", "");
+    // Thread inventory (STRATA-SYS-03-014): budget and per-role gauges.
+    assert!(get("strata_thread_budget", "") >= 34.0);
+    assert!(
+        get("strata_threads", "role=\"blk\"") >= 1.0,
+        "sx-blk threads registered"
+    );
+    assert!(get("strata_threads", "role=\"work\"") >= 1.0);
+    assert!(get("strata_thread_cpu_seconds", "role=\"blk\"") >= 0.0);
+    assert!(get("strata_blocking_pool_workers", "") >= 1.0);
+    assert!(get("strata_blocking_pool_workers", "") <= get("strata_blocking_pool_max_workers", ""));
+    assert_eq!(get("strata_blocking_pool_rejected_total", ""), 0.0);
     // Shared scan pool (STRATA-SYS-01-010): fixed workers, bounded tasks.
     assert!(get("strata_scan_pool_workers", "") >= 1.0);
     assert!(get("strata_scan_pool_active_tasks", "") <= 2.0 * get("strata_scan_pool_workers", ""));
@@ -1546,4 +1562,69 @@ async fn metrics_histograms_and_query_outcomes() {
         !text.contains("tenant-a") && !text.contains("tenant-b"),
         "no tenant labels"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_inventory_lists_named_engine_threads() {
+    let s = start(ServerConfig::default()).await;
+    // Work on every pool: an ingest (sx-blk) and a parallel-capable query.
+    let (st, _) = req(
+        &s,
+        "POST",
+        "/api/v1/ingest",
+        Some(&s.a_rw),
+        "application/json",
+        r#"{"service":"t","body":"x"}"#,
+    )
+    .await;
+    assert_eq!(st, 200);
+    assert_eq!(query(&s, &s.a_rw, "SELECT count(*) FROM logs").await.0, 200);
+    // cluster.read is required.
+    let (st, _) = req(
+        &s,
+        "GET",
+        "/api/v1/admin/threads",
+        Some(&s.a_rw),
+        "text/plain",
+        "",
+    )
+    .await;
+    assert_eq!(st, 403);
+    let (st, body) = req(
+        &s,
+        "GET",
+        "/api/v1/admin/threads",
+        Some(&s.metrics),
+        "text/plain",
+        "",
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+    let v = j(&body);
+    let cpus = v["logical_cpus"].as_u64().unwrap();
+    assert_eq!(v["budget"].as_u64().unwrap(), 2 * cpus + 32);
+    let threads = v["threads"].as_array().unwrap();
+    assert_eq!(threads.len() as u64, v["registered"].as_u64().unwrap());
+    for t in threads {
+        let (name, role) = (t["name"].as_str().unwrap(), t["role"].as_str().unwrap());
+        assert!(
+            ["main", "net", "work", "blk", "maint"].contains(&role),
+            "{t}"
+        );
+        if role != "main" {
+            assert!(name.starts_with("sx-") && name.len() <= 15, "{name}");
+        }
+        assert_eq!(t["affinity"], "unpinned");
+        assert!(t["cpu_seconds"].as_f64().unwrap() >= 0.0);
+    }
+    assert!(v["by_role"]["blk"].as_u64().unwrap() >= 1);
+    assert!(v["by_role"]["work"].as_u64().unwrap() >= 1);
+    // (The test harness opens its engine without the sx-maint thread.)
+    let blk = &v["pools"]["blocking"];
+    assert!(blk["workers"].as_u64().unwrap() <= blk["max_workers"].as_u64().unwrap());
+    if cfg!(target_os = "linux") {
+        assert!(v["os_threads"].as_u64().unwrap() >= v["registered"].as_u64().unwrap());
+    } else {
+        assert!(v["os_threads"].is_null());
+    }
 }

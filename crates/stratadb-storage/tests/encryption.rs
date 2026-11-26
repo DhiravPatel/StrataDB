@@ -1,5 +1,5 @@
 //! Encryption at rest through the engine (spec §18.6, §19.4; ADR-0024).
-
+#![allow(clippy::disallowed_methods)] // tests read and corrupt files on purpose, bypassing the I/O engine
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code: panics are failures
 
 use std::path::Path;

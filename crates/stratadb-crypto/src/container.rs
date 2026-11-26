@@ -22,13 +22,12 @@
 //! The header is authenticated by every block, so changing the length, salt,
 //! key id or kind, truncating, or reordering blocks is detected.
 
-use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use ring::aead::{Aad, LessSafeKey};
 use stratadb_common::checksum::crc32c;
-use stratadb_common::{Error, IoResultExt, Result};
+use stratadb_common::io::RandomRead;
+use stratadb_common::{Error, Result};
 
 use crate::{auth_failed, counter_nonce, derive, random, Keyring, SALT_LEN, TAG_LEN};
 
@@ -196,9 +195,10 @@ pub fn open_bytes(keys: &Keyring, data: &[u8], loc: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Random-access reader over a sealed file on disk.
+/// Random-access reader over a sealed file (raw bytes come from any
+/// [`RandomRead`] source, normally an I/O-engine file).
 pub struct SealedFile {
-    file: File,
+    file: Box<dyn RandomRead>,
     header: Header,
     hb: [u8; HEADER_LEN],
     key: LessSafeKey,
@@ -217,13 +217,18 @@ impl std::fmt::Debug for SealedFile {
 impl SealedFile {
     /// Open and validate the header and total length (blocks are
     /// authenticated when read).
-    pub fn open(file: File, keys: &Keyring, path: &Path) -> Result<Self> {
+    pub fn open(file: Box<dyn RandomRead>, keys: &Keyring, path: &Path) -> Result<Self> {
         let loc = path.display().to_string();
         let mut hb = [0u8; HEADER_LEN];
-        file.read_exact_at(&mut hb, 0)
-            .ctx(|| format!("reading header of {loc}"))?;
+        if file.len() < HEADER_LEN as u64 {
+            return Err(Error::corruption(
+                &loc,
+                "sealed file shorter than its header",
+            ));
+        }
+        file.read_exact_at(&mut hb, 0)?;
         let header = Header::decode(&hb, &loc)?;
-        let len = file.metadata().ctx(|| format!("stat {loc}"))?.len();
+        let len = file.len();
         if header.file_len() != Some(len) {
             return Err(Error::corruption(
                 &loc,
@@ -269,9 +274,7 @@ impl SealedFile {
         for i in first..=last {
             let (off, stored, _) = self.header.block_span(i);
             let mut blk = vec![0u8; stored];
-            self.file
-                .read_exact_at(&mut blk, off)
-                .ctx(|| format!("reading {}", self.loc))?;
+            self.file.read_exact_at(&mut blk, off)?;
             let plain = self
                 .key
                 .open_in_place(counter_nonce(i), Aad::from(&self.hb[0..60]), &mut blk)
@@ -338,7 +341,7 @@ mod tests {
             let data: Vec<u8> = (0..len).map(|i| (i * 31 % 256) as u8).collect();
             let p = d.path().join("f");
             std::fs::write(&p, seal_with_block(&k, KIND_SEGMENT, &data, 4096).unwrap()).unwrap();
-            let f = SealedFile::open(File::open(&p).unwrap(), &k, &p).unwrap();
+            let f = SealedFile::open(Box::new(std::fs::File::open(&p).unwrap()), &k, &p).unwrap();
             prop_assert_eq!(f.len(), len as u64);
             for (off, n) in reads {
                 let mut buf = vec![0u8; n];

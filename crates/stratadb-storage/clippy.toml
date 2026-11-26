@@ -1,0 +1,14 @@
+# Data-path crate: storage files are read only through stratadb_common::io
+# (spec STRATA-SYS-04-001), which handles short reads, retries, identity
+# checks and the open-file budget. Writes are not yet routed (KNOWN_LIMITATIONS).
+# Repeats the workspace clippy.toml (a crate-level file replaces it).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+disallowed-methods = [
+    { path = "std::fs::read", reason = "read storage files through stratadb_common::io (STRATA-SYS-04-001)" },
+    { path = "std::fs::read_to_string", reason = "read storage files through stratadb_common::io (STRATA-SYS-04-001)" },
+    { path = "std::fs::File::open", reason = "open storage files through stratadb_common::io (STRATA-SYS-04-001)" },
+    { path = "std::os::unix::fs::FileExt::read_at", reason = "read through stratadb_common::io (STRATA-SYS-04-001)" },
+    { path = "std::os::unix::fs::FileExt::read_exact_at", reason = "read through stratadb_common::io (STRATA-SYS-04-001)" },
+]

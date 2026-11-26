@@ -45,7 +45,7 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 sha2 = "0.10"
 # Safe syscall wrappers (already a transitive dependency via tempfile); used
 # for CPU-time clocks in benchmarks and accounting (ADR-0026).
-rustix = { version = "1", default-features = false, features = ["std", "time"] }
+rustix = { version = "1", default-features = false, features = ["std", "time", "process"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 # Already in the tree via rustls (TLS); reused for encryption at rest (ADR-0024).

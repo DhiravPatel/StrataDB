@@ -20,9 +20,7 @@ mod columns;
 pub mod ngram;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use stratadb_common::checksum::crc32c;
@@ -760,20 +758,32 @@ pub fn write_segment_sealed(
     })
 }
 
-/// Plain file or sealed (encrypted) container.
+/// Plain file or sealed (encrypted) container, both read through the I/O
+/// engine (spec STRATA-SYS-04-001).
 #[derive(Debug)]
 enum Source {
-    Plain(File),
+    Plain(stratadb_common::io::IoFile),
     Sealed(Box<stratadb_crypto::container::SealedFile>),
 }
 
 impl Source {
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64, loc: &str) -> Result<()> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
+        use stratadb_common::io::RandomRead;
         match self {
-            Source::Plain(f) => f
-                .read_exact_at(buf, offset)
-                .ctx(|| format!("reading {loc}")),
+            Source::Plain(f) => f.read_exact_at(buf, offset),
             Source::Sealed(s) => s.read_exact_at(buf, offset),
+        }
+    }
+
+    /// `len` bytes at `offset` in a new buffer (no copy for plain files).
+    fn read_vec(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        match self {
+            Source::Plain(f) => f.read_vec(offset, len),
+            Source::Sealed(s) => {
+                let mut buf = vec![0u8; len];
+                s.read_exact_at(&mut buf, offset)?;
+                Ok(buf)
+            }
         }
     }
 }
@@ -797,11 +807,23 @@ impl SegmentReader {
     }
 
     /// Open a segment; sealed (encrypted) segments are decrypted with `keys`.
+    /// Reads go through the process-wide default I/O engine.
     pub fn open_with(path: &Path, keys: Option<&stratadb_crypto::Keyring>) -> Result<Self> {
+        Self::open_with_io(path, keys, stratadb_common::io::default_io())
+    }
+
+    /// Open a segment, reading through `io`.
+    pub fn open_with_io(
+        path: &Path,
+        keys: Option<&stratadb_crypto::Keyring>,
+        io: std::sync::Arc<dyn stratadb_common::io::IoEngine>,
+    ) -> Result<Self> {
+        use stratadb_common::io::{IoFile, RandomRead};
         let loc = path.display().to_string();
-        let raw = File::open(path).ctx(|| format!("opening segment {loc}"))?;
+        let raw = IoFile::open(io, path)?;
         let mut magic = [0u8; 8];
-        let sealed = raw.read_exact_at(&mut magic, 0).is_ok()
+        let sealed = raw.len() >= 8
+            && raw.read_exact_at(&mut magic, 0).is_ok()
             && stratadb_crypto::container::is_sealed(&magic);
         let file = if sealed {
             let keys = keys.ok_or_else(|| {
@@ -811,20 +833,22 @@ impl SegmentReader {
                 )
             })?;
             Source::Sealed(Box::new(stratadb_crypto::container::SealedFile::open(
-                raw, keys, path,
+                Box::new(raw),
+                keys,
+                path,
             )?))
         } else {
             Source::Plain(raw)
         };
         let file_len = match &file {
-            Source::Plain(f) => f.metadata().ctx(|| format!("stat {loc}"))?.len(),
+            Source::Plain(f) => f.len(),
             Source::Sealed(s) => s.len(),
         };
         if file_len < (HEADER_LEN + TRAILER_LEN) as u64 {
             return Err(Error::corruption(&loc, "file too short to be a segment"));
         }
         let mut header = [0u8; HEADER_LEN];
-        file.read_exact_at(&mut header, 0, &loc)?;
+        file.read_exact_at(&mut header, 0)?;
         if header[0..8] != MAGIC {
             return Err(Error::corruption(&loc, "bad segment header magic"));
         }
@@ -842,7 +866,7 @@ impl SegmentReader {
             )));
         }
         let mut trailer = [0u8; TRAILER_LEN];
-        file.read_exact_at(&mut trailer, file_len - TRAILER_LEN as u64, &loc)?;
+        file.read_exact_at(&mut trailer, file_len - TRAILER_LEN as u64)?;
         if trailer[8..16] != MAGIC {
             return Err(Error::corruption(
                 &loc,
@@ -860,8 +884,7 @@ impl SegmentReader {
             ));
         }
         let footer_off = file_len - (TRAILER_LEN + footer_len) as u64;
-        let mut fb = vec![0u8; footer_len];
-        file.read_exact_at(&mut fb, footer_off, &loc)?;
+        let fb = file.read_vec(footer_off, footer_len)?;
         if crc32c(&fb) != footer_crc {
             return Err(Error::corruption(&loc, "footer checksum mismatch"));
         }
@@ -927,8 +950,7 @@ impl SegmentReader {
     ) -> Result<Vec<u8>> {
         let loc = self.path.display().to_string();
         let len = usize::try_from(len).map_err(|_| Error::corruption(&loc, "chunk too big"))?;
-        let mut buf = vec![0u8; len];
-        self.file.read_exact_at(&mut buf, offset, &loc)?;
+        let mut buf = self.file.read_vec(offset, len)?;
         if crc32c(&buf) != crc {
             return Err(Error::corruption(&loc, format!("{what} checksum mismatch")));
         }

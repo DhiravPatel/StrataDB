@@ -186,9 +186,60 @@ fn serve(r: Resolved) -> Result<()> {
             "no active API tokens; create one with `strata-server token create`"
         );
     }
-    if let Some(n) = r.scan_threads {
-        stratadb_query::configure_scan_pool(n)?;
+    // Thread plan (STRATA-SYS-03-014/015): every engine thread is named
+    // `sx-*` and registered in the inventory (GET /api/v1/admin/threads).
+    let _main_thread = stratadb_common::threads::register(stratadb_common::threads::Role::Main);
+    let plan = r.threads;
+    // Host facts at startup (spec STRATA-SYS-02-003, partial); the full
+    // readiness check is `strata doctor host`.
+    let read = |p: &str| std::fs::read_to_string(p).ok().map(|s| s.trim().to_owned());
+    tracing::info!(
+        component = "server",
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        kernel = read("/proc/sys/kernel/osrelease").unwrap_or_else(|| "unknown".into()),
+        logical_cpus = stratadb_common::threads::logical_cpus(),
+        thp =
+            read("/sys/kernel/mm/transparent_hugepage/enabled").unwrap_or_else(|| "unknown".into()),
+        clocksource = read("/sys/devices/system/clocksource/clocksource0/current_clocksource")
+            .unwrap_or_else(|| "unknown".into()),
+        "host (run `strata doctor host` for the readiness report)"
+    );
+    // File descriptors (STRATA-SYS-02-036/037): raise the soft limit to the
+    // hard limit, then size the segment file cache (half of it by default).
+    match stratadb_common::io::raise_nofile_limit() {
+        Ok((old, new)) if new > old => {
+            tracing::info!(
+                component = "server",
+                old,
+                new,
+                "raised RLIMIT_NOFILE soft limit"
+            )
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(component = "server", error = %e, "could not raise RLIMIT_NOFILE"),
     }
+    if let Some(n) = r.max_open_files {
+        stratadb_common::io::configure_max_open_files(n)?;
+    }
+    let io = stratadb_common::io::default_io();
+    tracing::info!(
+        component = "server",
+        max_open_files = io.stats().max_open_files,
+        backend = io.name(),
+        "storage I/O engine"
+    );
+    stratadb_query::configure_scan_pool(plan.scan)?;
+    tracing::info!(
+        component = "server",
+        logical_cpus = plan.logical_cpus,
+        budget = plan.budget,
+        net = plan.net,
+        scan = plan.scan,
+        blocking = plan.blocking,
+        total = plan.total(),
+        "thread plan"
+    );
     let pool = stratadb_query::scan_pool();
     tracing::info!(
         component = "query",
@@ -206,9 +257,21 @@ fn serve(r: Resolved) -> Result<()> {
         AppState::new(Arc::clone(&engine), tokens, r.server.clone())
             .with_audit(AuditLog::open(&r.data_dir)?),
     );
+    let net_id = std::sync::atomic::AtomicUsize::new(0);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .max_blocking_threads(64)
+        .worker_threads(plan.net)
+        // StrataDB runs blocking work on its own sx-blk pool; tokio's
+        // blocking pool is only a small reserve (counted in the plan).
+        .max_blocking_threads(stratadb_server::TOKIO_BLOCKING_THREADS)
+        .thread_name_fn(move || {
+            let n = net_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stratadb_common::threads::Role::Net.thread_name(n)
+        })
+        .on_thread_start(|| {
+            stratadb_common::threads::register_current(stratadb_common::threads::Role::Net)
+        })
+        .on_thread_park(stratadb_common::threads::update_current_cpu)
         .build()
         .map_err(|e| Error::io("starting runtime", e))?;
     let listen = r.listen;

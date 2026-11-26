@@ -36,7 +36,7 @@ note = "cold runs are refused rather than produced invalidly; dropping caches ne
 
 [req."STRATA-SYS-01-010"]
 status = "IMPLEMENTED"
-evidence = "crates/stratadb-query/src/pool.rs (fixed shared scan pool); exec.rs scan_parallel (no thread creation); tests pool_tests::concurrent_queries_share_a_fixed_set_of_threads; server: tokio tasks per connection, queries on the bounded blocking pool behind max_concurrent_queries"
+evidence = "crates/stratadb-query/src/pool.rs (fixed shared scan pool); exec.rs scan_parallel (no thread creation); tests pool_tests::concurrent_queries_share_a_fixed_set_of_threads; server: tokio tasks per connection, request work on the bounded sx-blk pool (apps/stratadb-server/src/blocking.rs)"
 
 [req."STRATA-SYS-01-006"]
 status = "IMPLEMENTED"
@@ -155,35 +155,30 @@ note = "not audited across all crates"
 status = "IMPLEMENTED"
 evidence = "stage timers are per batch / per query (engine.rs, telemetry.rs); no per-row timing"
 
-[req."STRATA-SYS-02-041"]
-status = "PARTIAL"
-evidence = "apps/stratadb-cli/src/doctor.rs (exit 1 on any fail); tests/doctor.rs"
-note = "`strata doctor` covers fd/memory/disk/TLS/backups; no VIII.2 `doctor host` checklist (THP, governor, sysctls, filesystems)"
-
-[req."STRATA-SYS-02-042"]
-status = "PARTIAL"
-evidence = "apps/stratadb-cli/src/doctor.rs (JSON {checks:[{check,status,detail}]})"
-note = "as for STRATA-SYS-02-041"
-
 [req."STRATA-SYS-03-012"]
 status = "PARTIAL"
 evidence = "crates/stratadb-wal/src/lib.rs wait_durable (lock released during fsync)"
 note = "the manifest mutex is held across flush I/O (it serializes flushes)"
 
 [req."STRATA-SYS-03-015"]
-status = "PARTIAL"
-evidence = "scan pool threads sx-work-NN (crates/stratadb-query/src/pool.rs), background thread sx-maint (crates/stratadb-storage/src/engine.rs)"
-note = "server runtime threads keep tokio's default names; no sx-net/sx-wal yet"
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-common/src/threads.rs (Role::thread_name, <= 15 bytes); sx-net-NN (tokio thread_name_fn), sx-work-NN, sx-blk-NN, sx-maint; thread_inventory_lists_named_engine_threads; real server: 12 OS threads = 12 registered sx-*/main"
+note = "the process main thread keeps the name `main` (renaming it needs pthread_setname_np, i.e. unsafe); no sx-wal/sx-cat/sx-metrics roles exist because those subsystems run on caller threads"
 
 [req."STRATA-SYS-03-010"]
 status = "PARTIAL"
-evidence = "scan pool queue bounded at `workers` tasks (crates/stratadb-query/src/pool.rs)"
-note = "one shared MPMC queue behind a mutex, not per-worker SPSC queues with cache-line padding"
+evidence = "scan pool queue bounded at `workers` tasks (crates/stratadb-query/src/pool.rs); sx-blk queue bounded (apps/stratadb-server/src/blocking.rs)"
+note = "shared MPMC queues behind a mutex, not per-worker SPSC queues with cache-line padding"
 
 [req."STRATA-SYS-03-014"]
+status = "IMPLEMENTED"
+evidence = "apps/stratadb-server/src/lib.rs ThreadPlan (net + scan + blocking + 4 <= 2 x cpus + 32, enforced at config resolution; test thread_plan_respects_the_budget); thread registry crates/stratadb-common/src/threads.rs; GET /api/v1/admin/threads (role, name, CPU time, affinity) + strata_threads metrics"
+note = "inventory is an HTTP endpoint (no SQL system tables yet); CPU time is self-recorded by each thread; affinity is always `unpinned` (no pinning)"
+
+[req."STRATA-SYS-03-002"]
 status = "PARTIAL"
-evidence = "scan pool size fixed at start (<= 256); engine background thread; strata_scan_pool_workers metric"
-note = "no system.threads inventory; tokio blocking threads are bounded by request semaphores, not by this rule directly"
+evidence = "fsync-waiting commits, query execution and admin operations run on sx-blk, never on sx-net runtime threads (apps/stratadb-server/src/blocking.rs)"
+note = "scan workers (sx-work) still do synchronous reads; there is no IoEngine yet (P1-3)"
 
 [req."STRATA-SYS-11-007"]
 status = "PARTIAL"
@@ -196,13 +191,9 @@ evidence = "crates/stratadb-query/src/exec.rs scan_dop + scan_parallel (pool fre
 note = "one class (interactive, 5 ms target); idle workers are used beyond the base formula (deviation with HW-REF-7 evidence, ADR-0006); per-row cost is a fixed calibration, not the VIII.12 cost model"
 
 [req."STRATA-SYS-04-002"]
-status = "PARTIAL"
-evidence = "crates/stratadb-common/src/{failpoint,simfs}.rs; crates/stratadb-storage/tests/{crash,power_loss_sim}.rs"
-note = "failpoints and the power-loss recorder, not an IoEngine sim backend"
-
-[req."STRATA-SYS-04-026"]
 status = "IMPLEMENTED"
-evidence = "crates/stratadb-wal/src/lib.rs (poison on sync error: no further acks); crates/stratadb-storage/tests/crash.rs"
+evidence = "crates/stratadb-common/src/io.rs SimIo (short reads/writes, EIO read/fsync, ENOSPC, latency spikes, crash with reordered and sector-torn unsynced writes); tests write_faults_and_crash_semantics, crash_keeps_durable_data_and_tears_or_reorders_the_rest, short_reads_are_resubmitted_and_eio_is_retried_once"
+note = "engine writes are not yet routed through it (they use failpoints + the simfs power-loss recorder)"
 
 [req."STRATA-SYS-05-001"]
 status = "PARTIAL"
@@ -363,3 +354,103 @@ note = "no serialize/deserialize (needed for projections, MVs, distributed)"
 status = "PARTIAL"
 evidence = "parallel_equals_sequential exercises merge for every aggregate (crates/stratadb-query/tests/parallel.rs)"
 note = "no per-function associativity/commutativity property tests"
+
+# ---------------------------------------------------------------- P1-3 --
+[req."STRATA-SYS-04-001"]
+status = "PARTIAL"
+evidence = "crates/stratadb-common/src/io.rs (IoEngine submit/complete); segment, manifest and backup reads routed (crates/stratadb-segment/src/lib.rs open_with_io, storage manifest/backup); clippy disallowed_methods in crates/stratadb-{segment,storage,query}/clippy.toml"
+note = "write path (segment writer, WAL, manifest commit) and WAL replay reads not yet routed (ADR-0027)"
+
+[req."STRATA-SYS-04-009"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-common/src/io.rs read_loop (short reads resubmitted; EOF only at the known length; a file that shrank is an error) and write_all_at; tests short_reads_are_resubmitted_and_eio_is_retried_once, io_faults::read_faults_are_retried_resubmitted_or_reported"
+
+[req."STRATA-SYS-04-025"]
+status = "PARTIAL"
+evidence = "read retried once, then the query fails with an Io error naming the segment file, offset and length; no partial results (crates/stratadb-query/tests/io_faults.rs)"
+note = "no granule-level unreadable marking, STORAGE_READ_ERROR code or scheduled scrub yet"
+
+[req."STRATA-SYS-04-026"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-wal/src/lib.rs (poison on sync error: no further acks); crates/stratadb-storage/tests/crash.rs; SimIo models fsync EIO dropping dirty data (test write_faults_and_crash_semantics)"
+
+[req."STRATA-SYS-02-036"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-common/src/io.rs raise_nofile_limit (rustix setrlimit, capped at 2^20 with fallbacks); called and logged at strata-server start (apps/stratadb-server/src/main.rs) and by strata; test nofile_limit_can_be_read_and_raised"
+
+[req."STRATA-SYS-02-037"]
+status = "IMPLEMENTED"
+evidence = "PreadEngine LRU (max_open_files, default 50% of RLIMIT_NOFILE; EMFILE/ENFILE recovered by closing cold files; identity-checked reopen); [storage] max_open_files; strata_io_* metrics; tests fd_budget_lru_and_identity, io_faults::many_segments_with_a_small_descriptor_budget"
+note = "applies to segment files; WAL files stay open"
+
+# ---------------------------------------------------------------- P1-4 --
+[req."STRATA-SYS-02-041"]
+status = "IMPLEMENTED"
+evidence = "apps/stratadb-cli/src/doctor_host.rs (strata doctor host; non-zero exit on FAIL); tests/doctor.rs doctor_host_reports_and_exits_non_zero_on_fail"
+
+[req."STRATA-SYS-02-042"]
+status = "IMPLEMENTED"
+evidence = "strata doctor host --json: report_version, host, checks[{id, category, status, value, recommended, detail}], summary; tests check every key"
+
+[req."STRATA-SYS-02-004"]
+status = "IMPLEMENTED"
+evidence = "doctor host only reads /proc and /sys; nothing in the workspace writes sysctls"
+
+[req."STRATA-SYS-02-005"]
+status = "PARTIAL"
+evidence = "packaging/sysctl.d/90-stratadb.conf and packaging/tuned/stratadb/tuned.conf; doctor_host tests build the recommended host from the shipped file (cannot drift)"
+note = "no release pipeline yet that ships them as artifacts"
+
+[req."STRATA-SYS-02-001"]
+status = "IMPLEMENTED"
+evidence = "doctor host kernel check (fail < 5.15, warn < 6.6); unit tests"
+
+[req."STRATA-SYS-02-003"]
+status = "PARTIAL"
+evidence = "strata-server logs os, arch, kernel, logical CPUs, THP and clocksource at start; doctor host reports CPU model, NUMA nodes, devices"
+note = "no io_uring feature set or ISA list in the startup log; no system.build_info/host_info tables"
+
+[req."STRATA-SYS-02-006"]
+status = "IMPLEMENTED"
+evidence = "doctor host transparent_hugepage (warn on always) and defrag checks; tuned profile sets madvise / defer+madvise"
+
+[req."STRATA-SYS-02-010"]
+status = "IMPLEMENTED"
+evidence = "doctor host reports the cpufreq governor (warn unless performance); tuned profile sets performance"
+
+[req."STRATA-SYS-02-014"]
+status = "PARTIAL"
+evidence = "doctor host --data-dir reports queue/write_cache of the data device"
+note = "NVMe identify (power-loss protection) not read: shown as unknown"
+
+[req."STRATA-SYS-02-017"]
+status = "IMPLEMENTED"
+evidence = "doctor host data_dir.filesystem (xfs/ext4 pass, others warn)"
+
+[req."STRATA-SYS-02-018"]
+status = "PARTIAL"
+evidence = "doctor host fails nobarrier, warns without noatime, on discard and ext4 data=writeback"
+note = "XFS logbufs/logbsize/inode64 not checked"
+
+[req."STRATA-SYS-02-022"]
+status = "PARTIAL"
+evidence = "doctor host fails NFS/SMB/FUSE/overlay/9p data directories (test unsafe_filesystems_and_partitions)"
+note = "the server does not yet refuse to start on them (no production mode / allow_unsafe_fs setting)"
+
+[req."STRATA-SYS-02-027"]
+status = "PARTIAL"
+evidence = "doctor host reports cgroup v2 cpu.max, memory.max, memory.high, cpuset"
+note = "thread pools and memory budgets are not yet sized from them automatically"
+
+[req."STRATA-SYS-02-039"]
+status = "IMPLEMENTED"
+evidence = "doctor host clocksource check (warn on hpet/acpi_pm; invariant TSC from cpuinfo flags)"
+
+[req."STRATA-SYS-02-012"]
+status = "PARTIAL"
+evidence = "SMT state in doctor host and benchmark manifests"
+note = "the scheduler does not use SMT sibling topology"
+
+[req."STRATA-SYS-02-013"]
+status = "IMPLEMENTED"
+evidence = "turbo state in doctor host and benchmark manifests (apps/stratadb-bench/src/manifest.rs)"

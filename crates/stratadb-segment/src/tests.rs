@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // tests read and corrupt files on purpose, bypassing the I/O engine
 use super::*;
 use proptest::prelude::*;
 use stratadb_common::ErrorKind;

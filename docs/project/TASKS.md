@@ -58,12 +58,18 @@ Requirement-level status: PERF_INVENTORY.md (generated; `scripts/spec_inventory.
 1. ✅ **P1-1** Shared scan worker pool (`sx-work-NN`, bounded queue,
    caller-runs when busy) and cost-based DOP (SYS-01-010/006, 11-008 partial);
    report 2026-11-26-scan-pool.
-2. ▶ **P1-2** Thread inventory and naming (SYS-03-014/015).
-3. ☐ **P1-3** `IoEngine` trait with a portable backend and the `sim` fault
-   backend (SYS-04-001/002); fd budget and LRU (SYS-02-037).
-4. ☐ **P1-4** `strata doctor host` VIII.2 checklist (SYS-02-*), including
+2. ✅ **P1-2** Thread inventory and naming (SYS-03-014/015):
+   - all engine threads are `sx-*` and registered;
+   - the thread plan is validated against `2 × cpus + 32`;
+   - a bounded `sx-blk` pool replaces `spawn_blocking`;
+   - `GET /api/v1/admin/threads` and `strata_threads` metrics.
+3. ✅ **P1-3** (read path) `IoEngine` trait with a portable backend and the `sim` fault
+   backend (SYS-04-001/002); fd budget and LRU (SYS-02-037). Done for reads
+   (ADR-0027). ☐ **P1-3b** route writes (segment writer, WAL, manifest) and
+   WAL replay through it; in-flight bounds (SYS-04-008).
+4. ✅ **P1-4** `strata doctor host` VIII.2 checklist (SYS-02-*), including
    raising RLIMIT_NOFILE (SYS-02-036).
-5. ☐ **P1-5** Adaptive group-commit delay (SYS-07-004); columnar WAL
+5. ▶ **P1-5** Adaptive group-commit delay (SYS-07-004); columnar WAL
    payload (SYS-07-002, a format change: version bump and fixtures).
 6. ☐ **A0-1** `xtask check-layers` (ARCH-01-001/002); `ScanSource` seam
    (ARCH-01-003).

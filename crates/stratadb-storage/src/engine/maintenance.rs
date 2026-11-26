@@ -203,7 +203,13 @@ impl Shared {
                 state: SegmentState::Committed,
                 lineage: input_ids.iter().copied().collect(),
             };
-            let handle = match open_segment(&self.dir, &entry, true, self.keys.as_deref()) {
+            let handle = match open_segment(
+                &self.dir,
+                &entry,
+                true,
+                self.keys.as_deref(),
+                &self.opts.io_engine(),
+            ) {
                 Ok(h) => h,
                 Err(e) => {
                     let _ = fsutil::remove_if_exists(&path);

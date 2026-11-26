@@ -16,6 +16,15 @@
 | `[limits] max_decompressed_bytes` | — | 32 MiB | gzip bomb protection |
 | `[limits] max_concurrent_ingest` / `max_concurrent_queries` | — | 32 / 16 | excess → 429 |
 | `[limits] scan_threads` | — | logical CPUs | threads of the shared scan worker pool (1–256), fixed at startup; queries scan on their own thread plus pool tasks, never on threads of their own |
+| `[storage] max_open_files` | — | 50% of the soft `RLIMIT_NOFILE` | segment files kept open (LRU; at least 16); cold files are closed and reopened on demand. The server first raises the soft limit to the hard limit |
+| `[limits] net_threads` | — | logical CPUs | async network runtime threads (`sx-net-NN`) |
+| `[limits] blocking_threads` | — | rest of the budget, at most ingest + query permits | maximum `sx-blk-NN` threads running commits, queries and admin operations (started on demand); at least 2 |
+
+**Thread budget (spec STRATA-SYS-03-014).** `net + scan + blocking + 4` (main,
+`sx-maint`, 2 reserved tokio blocking threads) must not exceed
+`2 × logical_cpus + 32`. The server refuses to start otherwise; the effective
+plan is printed at startup and by `strata-server config`, and live
+threads are listed at `GET /api/v1/admin/threads`.
 | `[limits] max_query_timeout_ms` / `max_query_rows` | — | 60 000 / 100 000 | per-request caps |
 | `[storage] memtable_max_bytes` | — | 64 MiB | flush threshold |
 | `[storage] wal_segment_max_bytes` | — | 64 MiB | |

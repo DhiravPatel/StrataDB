@@ -63,6 +63,11 @@ use crate::memtable::{FrozenMemtable, MemRow, Memtable};
 /// Engine configuration. Defaults favour durability (group commit).
 #[derive(Debug, Clone)]
 pub struct EngineOptions {
+    /// Storage read path (spec STRATA-SYS-04-001): segment, manifest and
+    /// backup reads go through this engine. `None`: the process-wide
+    /// portable backend with a bounded LRU of open files (resolved when the
+    /// engine opens, so it can be configured first).
+    pub io: Option<Arc<dyn stratadb_common::io::IoEngine>>,
     pub data_dir: PathBuf,
     pub wal: WalOptions,
     /// Freeze the active memtable when it exceeds this many bytes ...
@@ -116,8 +121,16 @@ pub struct EngineOptions {
 }
 
 impl EngineOptions {
+    /// The configured I/O engine, or the process-wide default.
+    pub fn io_engine(&self) -> Arc<dyn stratadb_common::io::IoEngine> {
+        self.io
+            .clone()
+            .unwrap_or_else(stratadb_common::io::default_io)
+    }
+
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
+            io: None,
             data_dir: data_dir.into(),
             wal: WalOptions::default(),
             memtable_max_bytes: 64 * 1024 * 1024,
@@ -492,16 +505,18 @@ fn open_segment(
     entry: &SegmentEntry,
     full_verify: bool,
     keys: Option<&stratadb_crypto::Keyring>,
+    io: &Arc<dyn stratadb_common::io::IoEngine>,
 ) -> Result<SegmentHandle> {
     let path = segment_path(dir, &entry.tenant, entry.id);
     let loc = path.display().to_string();
-    let reader = SegmentReader::open_with(&path, keys).map_err(|e| match e.kind() {
-        ErrorKind::Io if !path.exists() => Error::corruption(
-            &loc,
-            "segment referenced by the manifest is missing (restore from backup)",
-        ),
-        _ => e,
-    })?;
+    let reader =
+        SegmentReader::open_with_io(&path, keys, Arc::clone(io)).map_err(|e| match e.kind() {
+            ErrorKind::Io if !path.exists() => Error::corruption(
+                &loc,
+                "segment referenced by the manifest is missing (restore from backup)",
+            ),
+            _ => e,
+        })?;
     let f = reader.footer();
     if reader.footer_crc() != entry.footer_crc
         || f.segment_id != entry.id
@@ -566,7 +581,7 @@ impl Engine {
         if fsutil::remove_if_exists(&fsutil::tmp_path(&dir.join(crate::manifest::MANIFEST_FILE)))? {
             report.tmp_files_removed += 1;
         }
-        let mut manifest = match Manifest::load(&dir, k)? {
+        let mut manifest = match Manifest::load_with(&dir, k, &*opts.io_engine())? {
             Some(m) => m,
             None => {
                 if dir_has_files(&dir.join(WAL_DIR))? || dir_has_files(&dir.join(SEGMENTS_DIR))? {
@@ -664,6 +679,7 @@ impl Engine {
                 entry,
                 opts.verify_segments_on_open,
                 k,
+                &opts.io_engine(),
             )?));
         }
         report.segments = handles.len();
@@ -776,7 +792,7 @@ impl Engine {
         if shared.opts.background {
             let s = Arc::clone(&shared);
             let h = std::thread::Builder::new()
-                .name("sx-maint".into())
+                .name(stratadb_common::threads::Role::Maint.thread_name(0))
                 .spawn(move || background_loop(&s))
                 .ctx(|| "spawning background thread".to_owned())?;
             *engine.bg_thread.lock() = Some(h);
@@ -891,6 +907,11 @@ impl Engine {
 
     pub fn stats(&self) -> EngineStats {
         self.shared.stats()
+    }
+
+    /// Storage read-path counters (descriptor budget, retries, short reads).
+    pub fn io_stats(&self) -> stratadb_common::io::IoStats {
+        self.shared.opts.io_engine().stats()
     }
 
     /// Error message if the engine is in the failed (fail-stop) state.
@@ -1311,7 +1332,13 @@ impl Shared {
                     lineage: Vec::new(),
                 };
                 // Read back from disk before publishing (catches write-path corruption).
-                let handle = open_segment(&self.dir, &entry, true, self.keys.as_deref())?;
+                let handle = open_segment(
+                    &self.dir,
+                    &entry,
+                    true,
+                    self.keys.as_deref(),
+                    &self.opts.io_engine(),
+                )?;
                 report.bytes_written += ws.file_bytes;
                 handles.push(Arc::new(handle));
             }
@@ -1467,7 +1494,9 @@ fn background_loop(s: &Shared) {
     let mut last_sync = Instant::now();
     let mut last_retention = Instant::now();
     let mut backoff = Duration::ZERO;
+    let me = stratadb_common::threads::register(stratadb_common::threads::Role::Maint);
     loop {
+        me.update_cpu();
         let flush_requested = {
             let mut g = s.bg.lock();
             if !g.shutdown && !g.flush_requested {

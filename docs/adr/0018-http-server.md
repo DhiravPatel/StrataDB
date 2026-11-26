@@ -15,9 +15,19 @@
 ## Decision
 `axum` with `default-features = false` (http1, json, tokio only). The storage
 engine stays synchronous (ADR-0017); handlers call it through
-`tokio::task::spawn_blocking`, with a runtime cap on blocking threads and
-**semaphores bounding concurrent ingest and query requests** (excess requests
-get `429` + `Retry-After` immediately instead of queueing without bound).
+a blocking pool, and **semaphores bound concurrent ingest and query
+requests** (excess requests get `429` + `Retry-After` immediately instead of
+queueing without bound).
+
+*Update 2026-11-26 (spec STRATA-SYS-03-014/015, ADR-0026):*
+- The blocking pool is StrataDB's own `sx-blk-NN` pool (`[limits]
+  blocking_threads`): threads start on demand up to a fixed maximum, and its
+  queue holds every admitted request.
+- `tokio::task::spawn_blocking` is no longer used; tokio's blocking pool is
+  capped at 2 threads.
+- Runtime threads are named `sx-net-NN` (`[limits] net_threads`).
+- net + scan + blocking + 4 fixed threads must fit the budget
+  `2 × logical_cpus + 32`, and the server refuses configurations that do not.
 
 ## Security defaults
 - Every data endpoint requires a bearer API token; there is **no

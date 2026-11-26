@@ -1,12 +1,14 @@
 //! StrataDB HTTP API (spec §21; ADR-0018). Normative reference: docs/api/http.md.
 //!
 //! Every data endpoint authenticates a bearer token and derives the tenant
-//! from it. The synchronous storage engine is called through
-//! `spawn_blocking`, admitted by semaphores so overload yields `429` rather
-//! than unbounded queueing.
+//! from it. The synchronous storage engine is called on the bounded `sx-blk`
+//! pool ([`blocking`]), admitted by semaphores so overload yields `429` rather
+//! than unbounded queueing. All engine threads follow a budgeted plan
+//! ([`ThreadPlan`]) and are listed at `GET /api/v1/admin/threads`.
 
 pub mod audit;
 pub mod auth;
+pub mod blocking;
 pub mod config;
 pub mod telemetry;
 pub mod tls;
@@ -56,6 +58,9 @@ pub struct ServerConfig {
     pub token_reload_interval: Duration,
     /// Per-tenant ingestion rate and storage quotas (spec §3.4).
     pub quotas: Quotas,
+    /// Threads of the `sx-blk` pool that runs blocking request work
+    /// (commits, queries, admin operations); counted in the thread budget.
+    pub blocking_threads: usize,
 }
 
 /// Limits for one tenant; `None` = unlimited.
@@ -103,6 +108,7 @@ impl Default for ServerConfig {
             max_decompressed_bytes: 32 * 1024 * 1024,
             token_reload_interval: Duration::from_secs(2),
             quotas: Quotas::default(),
+            blocking_threads: ThreadPlan::default_for(32, 16).blocking,
         }
     }
 }
@@ -126,6 +132,7 @@ pub struct AppState {
     auth_limiter: Arc<std::sync::Mutex<AuthLimiter>>,
     audit: Option<Arc<audit::AuditLog>>,
     metrics: Arc<telemetry::ServerMetrics>,
+    blk: Arc<blocking::BlockingPool>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -249,6 +256,11 @@ impl AppState {
                 window: Instant::now(),
                 failures: 0,
             })),
+            blk: Arc::new(blocking::BlockingPool::start(
+                cfg.blocking_threads,
+                // Every admitted request fits, plus headroom for admin calls.
+                cfg.max_concurrent_ingest + cfg.max_concurrent_queries + 16,
+            )),
             cfg: Arc::new(cfg),
             audit: None,
             metrics: Arc::default(),
@@ -312,6 +324,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/admin/compaction", post(admin_compaction))
         .route("/api/v1/admin/backup", post(admin_backup))
+        .route("/api/v1/admin/threads", get(admin_threads))
         .route(
             "/api/v1/retention",
             get(get_retention)
@@ -427,12 +440,100 @@ fn authenticate(
     }
 }
 
-async fn blocking<T: Send + 'static>(
-    f: impl FnOnce() -> stratadb_common::Result<T> + Send + 'static,
-) -> stratadb_common::Result<T> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| Error::internal(format!("worker task failed: {e}")))?
+/// The engine threads a server runs, checked against the budget
+/// `2 × logical_cpus + 32` (spec STRATA-SYS-03-014).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadPlan {
+    pub logical_cpus: usize,
+    pub budget: usize,
+    /// Async runtime threads (`sx-net-NN`).
+    pub net: usize,
+    /// Scan workers (`sx-work-NN`).
+    pub scan: usize,
+    /// Blocking request workers (`sx-blk-NN`).
+    pub blocking: usize,
+}
+
+/// Threads outside the configurable pools: the main thread, the engine's
+/// background thread (`sx-maint`), and up to 2 tokio blocking threads
+/// (`max_blocking_threads`; StrataDB itself runs blocking work on `sx-blk`).
+pub const FIXED_THREADS: usize = 4;
+
+/// tokio blocking-pool threads allowed (counted in [`FIXED_THREADS`]).
+pub const TOKIO_BLOCKING_THREADS: usize = 2;
+
+impl ThreadPlan {
+    /// Total engine threads of this plan.
+    pub fn total(&self) -> usize {
+        FIXED_THREADS + self.net + self.scan + self.blocking
+    }
+
+    /// Plan for this host. Defaults: one net and one scan thread per logical
+    /// CPU; blocking threads fill the rest of the budget, up to one per
+    /// admitted ingest + query request. Fails if the result exceeds the
+    /// budget or leaves fewer than 2 blocking threads.
+    pub fn new(
+        net: Option<usize>,
+        scan: Option<usize>,
+        blocking: Option<usize>,
+        max_ingest: usize,
+        max_queries: usize,
+    ) -> stratadb_common::Result<Self> {
+        Self::for_cpus(
+            stratadb_common::threads::logical_cpus(),
+            net,
+            scan,
+            blocking,
+            max_ingest,
+            max_queries,
+        )
+    }
+
+    pub fn for_cpus(
+        cpus: usize,
+        net: Option<usize>,
+        scan: Option<usize>,
+        blocking: Option<usize>,
+        max_ingest: usize,
+        max_queries: usize,
+    ) -> stratadb_common::Result<Self> {
+        let budget = stratadb_common::threads::thread_budget(cpus);
+        let net = net.unwrap_or(cpus);
+        let scan = scan.unwrap_or(cpus);
+        let room = budget.saturating_sub(FIXED_THREADS + net + scan);
+        let blocking = blocking.unwrap_or_else(|| room.min(max_ingest + max_queries).max(2));
+        let plan = Self {
+            logical_cpus: cpus,
+            budget,
+            net,
+            scan,
+            blocking,
+        };
+        if blocking < 2 || plan.total() > budget {
+            return Err(Error::invalid_input(format!(
+                "thread plan exceeds the budget of {budget} threads for {cpus} logical CPUs \
+                 (2 x cpus + 32): {} total = {FIXED_THREADS} fixed + {net} net + {scan} scan + \
+                 {blocking} blocking (at least 2); lower limits.net_threads, \
+                 limits.scan_threads or limits.blocking_threads",
+                plan.total()
+            )));
+        }
+        Ok(plan)
+    }
+
+    /// Defaults for this host, falling back to 2 blocking threads if the
+    /// budget is already exhausted (only possible with explicit settings).
+    pub fn default_for(max_ingest: usize, max_queries: usize) -> Self {
+        Self::new(None, None, None, max_ingest, max_queries).unwrap_or(Self {
+            logical_cpus: stratadb_common::threads::logical_cpus(),
+            budget: stratadb_common::threads::thread_budget(
+                stratadb_common::threads::logical_cpus(),
+            ),
+            net: 1,
+            scan: 1,
+            blocking: 2,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -534,11 +635,13 @@ async fn commit(
     st.check_quota(&principal.tenant, n)?;
     let engine = Arc::clone(&st.engine);
     let tenant = principal.tenant.clone();
-    let receipt = blocking(move || {
-        let _permit = permit;
-        engine.write_batch_idempotent(&tenant, events, idem)
-    })
-    .await?;
+    let receipt = st
+        .blk
+        .run(move || {
+            let _permit = permit;
+            engine.write_batch_idempotent(&tenant, events, idem)
+        })
+        .await?;
     let accepted = if receipt.duplicate {
         receipt.accepted
     } else {
@@ -979,28 +1082,31 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
     let engine = Arc::clone(&st.engine);
     let tenant = principal.tenant.clone();
     let started = Instant::now();
-    let res = blocking(move || {
-        let queued = started.elapsed();
-        let _permit = permit;
-        let _guard = guard;
-        let opts = QueryOptions {
-            timeout,
-            max_result_rows: max_rows,
-            cancel: Some(cancel),
-            ..QueryOptions::default()
-        };
-        let snap = engine.snapshot(&tenant);
-        if req.page_size.is_some() || req.cursor.is_some() {
-            let page = PageRequest {
-                page_size: req.page_size.unwrap_or(max_rows).min(max_rows),
-                cursor: req.cursor,
+    let res = st
+        .blk
+        .run(move || {
+            let queued = started.elapsed();
+            let _permit = permit;
+            let _guard = guard;
+            let opts = QueryOptions {
+                timeout,
+                max_result_rows: max_rows,
+                cancel: Some(cancel),
+                ..QueryOptions::default()
             };
-            execute_page(&snap, &req.query, &opts, &page).map(|p| (p.output, p.next_cursor, queued))
-        } else {
-            execute(&snap, &req.query, &opts).map(|o| (o, None, queued))
-        }
-    })
-    .await;
+            let snap = engine.snapshot(&tenant);
+            if req.page_size.is_some() || req.cursor.is_some() {
+                let page = PageRequest {
+                    page_size: req.page_size.unwrap_or(max_rows).min(max_rows),
+                    cursor: req.cursor,
+                };
+                execute_page(&snap, &req.query, &opts, &page)
+                    .map(|p| (p.output, p.next_cursor, queued))
+            } else {
+                execute(&snap, &req.query, &opts).map(|o| (o, None, queued))
+            }
+        })
+        .await;
     match res {
         Ok((out, next_cursor, queued)) => {
             use telemetry::QueryStage;
@@ -1242,6 +1348,115 @@ async fn metrics(State(st): State<AppState>, headers: HeaderMap) -> Response {
     );
     st.metrics.render(&mut out);
     st.metrics.render_stages(&mut out, &s.insert_stages);
+    {
+        use stratadb_common::threads::{self, Role};
+        let inv = threads::inventory();
+        out.push_str(&format!(
+            "# HELP strata_thread_budget Engine thread budget (2 x logical CPUs + 32).\n\
+             # TYPE strata_thread_budget gauge\nstrata_thread_budget {}\n\
+             # HELP strata_threads Registered engine threads by role.\n# TYPE strata_threads gauge\n",
+            threads::thread_budget(threads::logical_cpus())
+        ));
+        for r in Role::ALL {
+            out.push_str(&format!(
+                "strata_threads{{role=\"{}\"}} {}\n",
+                r.as_str(),
+                inv.iter().filter(|t| t.role == r).count()
+            ));
+        }
+        out.push_str("# HELP strata_thread_cpu_seconds CPU time of live registered threads by role, as last recorded by each thread.\n# TYPE strata_thread_cpu_seconds gauge\n");
+        for r in Role::ALL {
+            out.push_str(&format!(
+                "strata_thread_cpu_seconds{{role=\"{}\"}} {}\n",
+                r.as_str(),
+                inv.iter()
+                    .filter(|t| t.role == r)
+                    .map(|t| t.cpu_seconds)
+                    .sum::<f64>()
+            ));
+        }
+        let b = st.blk.stats();
+        out.push_str(&format!(
+            "# HELP strata_blocking_pool_workers Started sx-blk threads (grow on demand up to the maximum).\n\
+             # TYPE strata_blocking_pool_workers gauge\nstrata_blocking_pool_workers {}\n\
+             # HELP strata_blocking_pool_max_workers Maximum sx-blk threads (thread plan).\n\
+             # TYPE strata_blocking_pool_max_workers gauge\nstrata_blocking_pool_max_workers {}\n\
+             # HELP strata_blocking_pool_busy Blocking jobs running.\n\
+             # TYPE strata_blocking_pool_busy gauge\nstrata_blocking_pool_busy {}\n\
+             # HELP strata_blocking_pool_queued Blocking jobs waiting for a thread.\n\
+             # TYPE strata_blocking_pool_queued gauge\nstrata_blocking_pool_queued {}\n\
+             # HELP strata_blocking_pool_rejected_total Blocking jobs refused because the queue was full.\n\
+             # TYPE strata_blocking_pool_rejected_total counter\nstrata_blocking_pool_rejected_total {}\n",
+            b.workers, b.max_workers, b.busy, b.queued, b.rejected
+        ));
+    }
+    let io = st.engine.io_stats();
+    for (name, kind, help, v) in [
+        (
+            "io_max_open_files",
+            "gauge",
+            "Segment file descriptor budget (LRU).",
+            io.max_open_files,
+        ),
+        (
+            "io_files_open",
+            "gauge",
+            "Segment files held open by the I/O engine.",
+            io.files_open,
+        ),
+        (
+            "io_reads_total",
+            "counter",
+            "Storage reads completed.",
+            io.reads,
+        ),
+        (
+            "io_read_bytes_total",
+            "counter",
+            "Bytes read from storage.",
+            io.bytes_read,
+        ),
+        (
+            "io_short_reads_total",
+            "counter",
+            "Short reads whose remainder was resubmitted.",
+            io.short_reads_resubmitted,
+        ),
+        (
+            "io_read_retries_total",
+            "counter",
+            "Failed reads retried once.",
+            io.read_retries,
+        ),
+        (
+            "io_read_errors_total",
+            "counter",
+            "Reads that failed after the retry (queries failed).",
+            io.read_errors,
+        ),
+        (
+            "io_file_opens_total",
+            "counter",
+            "Segment file opens (including reopens after eviction).",
+            io.opens,
+        ),
+        (
+            "io_file_evictions_total",
+            "counter",
+            "Files closed to stay within the descriptor budget.",
+            io.evictions,
+        ),
+        (
+            "io_emfile_recoveries_total",
+            "counter",
+            "EMFILE on open recovered by closing cold files.",
+            io.emfile_recoveries,
+        ),
+    ] {
+        out.push_str(&format!(
+            "# HELP strata_{name} {help}\n# TYPE strata_{name} {kind}\nstrata_{name} {v}\n"
+        ));
+    }
     let p = stratadb_query::scan_pool().stats();
     out.push_str(&format!(
         "# HELP strata_scan_pool_workers Threads of the shared scan worker pool.\n\
@@ -1273,6 +1488,49 @@ pub fn parse_permissions(s: &str) -> stratadb_common::Result<BTreeSet<Permission
 // ---------------------------------------------------------------------------
 // Administration (spec §2.4, §16, §19)
 
+/// `GET /api/v1/admin/threads` (cluster.read): the thread inventory, the
+/// spec's `system.threads` (STRATA-SYS-03-014). It lists every registered
+/// engine thread with role, name, CPU time (as last recorded by the thread
+/// itself) and affinity, the budget `2 × logical_cpus + 32`, and on Linux
+/// the OS thread count, so untracked threads are visible.
+async fn admin_threads(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authenticate(&st, &headers, Permission::ClusterRead) {
+        return r;
+    }
+    use stratadb_common::threads::{self, Role};
+    let inv = threads::inventory();
+    let cpus = threads::logical_cpus();
+    let budget = threads::thread_budget(cpus);
+    let os = threads::os_thread_count();
+    let mut by_role = serde_json::Map::new();
+    for r in Role::ALL {
+        let n = inv.iter().filter(|t| t.role == r).count();
+        by_role.insert(r.as_str().to_owned(), json!(n));
+    }
+    let scan = stratadb_query::scan_pool().stats();
+    let blk = st.blk.stats();
+    Json(json!({
+        "logical_cpus": cpus,
+        "budget": budget,
+        "registered": inv.len(),
+        "os_threads": os,
+        "untracked": os.map(|o| o.saturating_sub(inv.len())),
+        "within_budget": os.unwrap_or(inv.len()) <= budget,
+        "by_role": by_role,
+        "pools": {
+            "scan": {"workers": scan.workers, "active_tasks": scan.active_tasks},
+            "blocking": {"workers": blk.workers, "max_workers": blk.max_workers,
+                         "busy": blk.busy, "queued": blk.queued,
+                         "queue_capacity": blk.queue_capacity, "rejected": blk.rejected},
+        },
+        "threads": inv.iter().map(|t| json!({
+            "name": t.name, "role": t.role.as_str(), "cpu_seconds": t.cpu_seconds,
+            "cpu_age_ms": t.cpu_age_ms, "affinity": t.affinity,
+        })).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
 async fn admin_compaction(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let p = match authenticate(&st, &headers, Permission::ClusterAdmin) {
         Ok(p) => p,
@@ -1282,24 +1540,26 @@ async fn admin_compaction(State(st): State<AppState>, headers: HeaderMap) -> Res
         return error_response(&Error::unavailable(format!("audit log unavailable: {e}")));
     }
     let engine = Arc::clone(&st.engine);
-    let res = blocking(move || {
-        let (mut groups, mut inputs, mut deleted) = (0, 0, 0);
-        // Bounded number of passes; each pass merges at most one group per tenant.
-        for _ in 0..100 {
-            let r = engine.compact()?;
-            groups += r.groups;
-            inputs += r.inputs;
-            deleted += r.obsolete_deleted;
-            if r.groups == 0 {
-                break;
+    let res = st
+        .blk
+        .run(move || {
+            let (mut groups, mut inputs, mut deleted) = (0, 0, 0);
+            // Bounded number of passes; each pass merges at most one group per tenant.
+            for _ in 0..100 {
+                let r = engine.compact()?;
+                groups += r.groups;
+                inputs += r.inputs;
+                deleted += r.obsolete_deleted;
+                if r.groups == 0 {
+                    break;
+                }
             }
-        }
-        Ok(
-            json!({"groups": groups, "inputs_merged": inputs, "obsolete_deleted": deleted,
+            Ok(
+                json!({"groups": groups, "inputs_merged": inputs, "obsolete_deleted": deleted,
                   "segments_now": engine.stats().segments}),
-        )
-    })
-    .await;
+            )
+        })
+        .await;
     match res {
         Ok(v) => Json(v).into_response(),
         Err(e) => error_response(&e),
@@ -1340,7 +1600,10 @@ async fn admin_backup(State(st): State<AppState>, headers: HeaderMap, body: Byte
         return error_response(&Error::unavailable(format!("audit log unavailable: {e}")));
     }
     let engine = Arc::clone(&st.engine);
-    let res = blocking(move || engine.backup(&root.join(&req.name))).await;
+    let res = st
+        .blk
+        .run(move || engine.backup(&root.join(&req.name)))
+        .await;
     match res {
         Ok(r) => Json(json!({
             "name": r.path.file_name().map(|n| n.to_string_lossy().into_owned()),
@@ -1410,7 +1673,11 @@ async fn put_retention(State(st): State<AppState>, headers: HeaderMap, body: Byt
         max_age_ms: ms,
         hold: req.hold,
     };
-    match blocking(move || engine.set_retention(&tenant, Some(policy))).await {
+    match st
+        .blk
+        .run(move || engine.set_retention(&tenant, Some(policy)))
+        .await
+    {
         Ok(()) => Json(
             json!({"tenant": p.tenant.as_str(), "policy": {"max_age_ms": ms, "hold": req.hold},
                               "note": "applied by the background retention task"}),
@@ -1430,7 +1697,11 @@ async fn delete_retention(State(st): State<AppState>, headers: HeaderMap) -> Res
     }
     let engine = Arc::clone(&st.engine);
     let tenant = p.tenant.clone();
-    match blocking(move || engine.set_retention(&tenant, None)).await {
+    match st
+        .blk
+        .run(move || engine.set_retention(&tenant, None))
+        .await
+    {
         Ok(()) => Json(json!({"tenant": p.tenant.as_str(), "policy": null})).into_response(),
         Err(e) => error_response(&e),
     }

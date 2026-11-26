@@ -27,7 +27,7 @@ service, and transmit no data. Licenses verified with `cargo metadata` on 2026-1
 | rcgen (dev) | 0.14 | MIT OR Apache-2.0 | test certificates | dev-only |
 | flate2 | 1 (server, SDK) | MIT OR Apache-2.0 | gzip request bodies; `rust_backend` (miniz_oxide, pure Rust) | |
 | toml | 0.9 (server, bench) | MIT OR Apache-2.0 | config file; benchmark scenarios | parse + serde only |
-| rustix | 1 (`std`, `time`; common) | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | safe `clock_gettime(CLOCK_{PROCESS,THREAD}_CPUTIME_ID)` for CPU-time accounting (ADR-0026) without our own `unsafe` | already in the lockfile via tempfile and fs4; no new crates |
+| rustix | 1 (`std`, `time`, `process`; common) | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | safe `clock_gettime(CLOCK_{PROCESS,THREAD}_CPUTIME_ID)` for CPU-time accounting (ADR-0026) and `getrlimit`/`setrlimit(RLIMIT_NOFILE)` (ADR-0027) without our own `unsafe` | already in the lockfile via tempfile and fs4; no new crates |
 | ureq | 3.5 (SDK) | MIT OR Apache-2.0 | blocking HTTP client with pooling; rustls + ring | SDK only |
 | tempfile (dev) | 3 | MIT OR Apache-2.0 | test directories | dev-only |
 | proptest (dev) | 1 | MIT OR Apache-2.0 | property tests | dev-only |

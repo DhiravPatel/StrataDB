@@ -23,9 +23,13 @@
 //! max_query_timeout_ms = 60000
 //! max_query_rows = 100000
 //! scan_threads = 8          # shared scan worker pool (default: logical CPUs)
+//! net_threads = 8           # async network runtime (default: logical CPUs)
+//! blocking_threads = 24     # blocking request workers (default: rest of the budget)
+//! # net + scan + blocking + 4 must not exceed 2 x logical CPUs + 32
 //!
 //! [storage]
 //! memtable_max_bytes = 67108864
+//! max_open_files = 4096     # segment file descriptor budget (default: 50% of RLIMIT_NOFILE)
 //! wal_segment_max_bytes = 67108864
 //! disk_reserve_bytes = 536870912
 //! disk_reserve_ratio = 0.02
@@ -124,6 +128,11 @@ pub struct LimitsSection {
     pub max_query_rows: Option<usize>,
     /// Threads of the shared scan worker pool (1..=256; default: logical CPUs).
     pub scan_threads: Option<usize>,
+    /// Async runtime threads (default: logical CPUs).
+    pub net_threads: Option<usize>,
+    /// Blocking request workers (default: the rest of the thread budget, up
+    /// to one per admitted ingest + query request).
+    pub blocking_threads: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -137,6 +146,8 @@ pub struct StorageSection {
     pub bloom_attribute_keys: Option<Vec<String>>,
     pub ngram_index: Option<bool>,
     pub ngram_attribute_keys: Option<Vec<String>>,
+    /// Open segment file budget (LRU; default 50% of the soft RLIMIT_NOFILE).
+    pub max_open_files: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -184,6 +195,10 @@ pub struct Resolved {
     pub engine: EngineOptions,
     /// Scan worker pool size (`None`: one per logical CPU).
     pub scan_threads: Option<usize>,
+    /// Thread plan checked against the budget (STRATA-SYS-03-014).
+    pub threads: crate::ThreadPlan,
+    /// Segment file descriptor budget (`None`: 50% of RLIMIT_NOFILE).
+    pub max_open_files: Option<usize>,
 }
 
 /// Values from flags/environment that override the file (None = not given).
@@ -308,6 +323,8 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
         server.max_query_rows = v;
     }
     let scan_threads = positive("limits.scan_threads", l.scan_threads)?;
+    let net_threads = positive("limits.net_threads", l.net_threads)?;
+    let blocking_threads = positive("limits.blocking_threads", l.blocking_threads)?;
     if let Some(n) = scan_threads {
         if n > stratadb_query::pool::MAX_WORKERS {
             return Err(Error::invalid_input(format!(
@@ -373,6 +390,12 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
             k,
         )));
     }
+    let max_open_files = positive("storage.max_open_files", s.max_open_files)?;
+    if max_open_files.is_some_and(|n| n < 16) {
+        return Err(Error::invalid_input(
+            "storage.max_open_files must be at least 16",
+        ));
+    }
     if let Some(v) = positive("storage.memtable_max_bytes", s.memtable_max_bytes)? {
         engine.memtable_max_bytes = v;
     }
@@ -420,9 +443,21 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
         durability,
         tls,
         insecure_allow_remote_without_tls: insecure,
+        threads: {
+            let plan = crate::ThreadPlan::new(
+                net_threads,
+                scan_threads,
+                blocking_threads,
+                server.max_concurrent_ingest,
+                server.max_concurrent_queries,
+            )?;
+            server.blocking_threads = plan.blocking;
+            plan
+        },
         server,
         engine,
         scan_threads,
+        max_open_files,
     })
 }
 
@@ -442,12 +477,14 @@ impl Resolved {
                 "max_concurrent_queries": self.server.max_concurrent_queries,
                 "max_query_timeout_ms": self.server.max_query_timeout.as_millis() as u64,
                 "max_query_rows": self.server.max_query_rows,
-                "scan_threads": self.scan_threads.unwrap_or_else(|| {
-                    std::thread::available_parallelism().map_or(1, |n| n.get())
-                }),
+                "scan_threads": self.threads.scan,
+                "net_threads": self.threads.net,
+                "blocking_threads": self.threads.blocking,
+                "thread_budget": self.threads.budget,
             },
             "storage": {
                 "memtable_max_bytes": self.engine.memtable_max_bytes,
+                "max_open_files": self.max_open_files,
                 "wal_segment_max_bytes": self.engine.wal.segment_max_bytes,
                 "disk_reserve_bytes": self.engine.disk_reserve_bytes,
                 "disk_reserve_ratio": self.engine.disk_reserve_ratio,
@@ -530,6 +567,53 @@ mod tests {
             !shown.contains(secret.trim()),
             "key material must never be displayed"
         );
+    }
+
+    #[test]
+    fn thread_plan_respects_the_budget() {
+        use crate::ThreadPlan;
+        // 10 CPUs: budget 52; defaults 10 net + 10 scan + 4 fixed, blocking
+        // fills the rest up to one per admitted request.
+        let p = ThreadPlan::for_cpus(10, None, None, None, 32, 16).unwrap();
+        assert_eq!((p.budget, p.net, p.scan, p.blocking), (52, 10, 10, 28));
+        assert_eq!(p.total(), 52);
+        let small = ThreadPlan::for_cpus(10, None, None, None, 4, 2).unwrap();
+        assert_eq!(small.blocking, 6, "no more than admitted requests");
+        assert!(ThreadPlan::for_cpus(10, Some(40), None, None, 32, 16).is_err());
+        assert!(
+            ThreadPlan::for_cpus(10, None, None, Some(1), 32, 16).is_err(),
+            ">= 2 blocking"
+        );
+        assert!(ThreadPlan::for_cpus(10, None, None, Some(40), 32, 16).is_err());
+        let one = ThreadPlan::for_cpus(1, None, None, None, 32, 16).unwrap();
+        assert!(one.total() <= one.budget && one.blocking >= 2);
+        let r = |s: &str| resolve(&parse(s).unwrap(), &Overrides::default());
+        let base = "config_version = 1\ndata_dir = \"/d\"\n";
+        let ok = r(&format!(
+            "{base}[limits]\nnet_threads = 2\nscan_threads = 2\nblocking_threads = 5\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            (ok.threads.net, ok.threads.scan, ok.threads.blocking),
+            (2, 2, 5)
+        );
+        assert_eq!(ok.server.blocking_threads, 5);
+        let e = r(&format!("{base}[limits]\nblocking_threads = 5000\n")).unwrap_err();
+        assert!(e.to_string().contains("budget"), "{e}");
+    }
+
+    #[test]
+    fn max_open_files_setting() {
+        let r = |s: &str| resolve(&parse(s).unwrap(), &Overrides::default());
+        let base = "config_version = 1\ndata_dir = \"/d\"\n";
+        assert_eq!(r(base).unwrap().max_open_files, None);
+        assert_eq!(
+            r(&format!("{base}[storage]\nmax_open_files = 512\n"))
+                .unwrap()
+                .max_open_files,
+            Some(512)
+        );
+        assert!(r(&format!("{base}[storage]\nmax_open_files = 4\n")).is_err());
     }
 
     #[test]

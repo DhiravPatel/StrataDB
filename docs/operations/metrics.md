@@ -30,6 +30,34 @@ stages are not lost.
 | `strata_insert_stage_seconds{stage}` | in pipeline order: `auth`, `decode` (body decompress, UTF-8, JSON framing), `validate` (event mapping and limits), `admission` (flush-backlog backpressure wait), `wal_encode` (batch encoding), `wal_append` (frame + CRC + write, including WAL lock wait), `group_commit_wait` (written → durable; sync modes), `memtable_insert`, `ack` (response construction). Server stages cover `/api/v1/ingest`; engine stages cover every write path |
 | `strata_query_stage_seconds{stage}` | `queue` (waiting for an execution thread), `parse`, `plan`, `exec`, `serialize`; successful queries only |
 
+## Storage I/O (spec STRATA-SYS-04-001, 02-037; ADR-0027)
+| Series | Meaning |
+|--------|---------|
+| `strata_io_max_open_files` / `strata_io_files_open` | segment file descriptor budget and files currently open |
+| `strata_io_reads_total` / `strata_io_read_bytes_total` | storage reads and bytes |
+| `strata_io_short_reads_total` | short reads whose remainder was resubmitted |
+| `strata_io_read_retries_total` / `strata_io_read_errors_total` | failed reads retried once / failed after the retry (the query failed, naming the file) |
+| `strata_io_file_opens_total` / `strata_io_file_evictions_total` | opens (including reopens) and files closed to stay within the budget |
+| `strata_io_emfile_recoveries_total` | `EMFILE` on open recovered by closing cold files |
+
+A steadily rising eviction rate means the budget is small for the working set
+(raise `[storage] max_open_files` or the service's `LimitNOFILE`). Any
+`read_errors` means storage returned errors twice in a row: check the device
+and `strata doctor`.
+
+## Threads (spec STRATA-SYS-03-014/015)
+| Series | Meaning |
+|--------|---------|
+| `strata_thread_budget` | `2 × logical_cpus + 32` |
+| `strata_threads{role}` | registered engine threads: `main`, `net` (`sx-net-NN`), `work` (`sx-work-NN`), `blk` (`sx-blk-NN`), `maint` (`sx-maint`) |
+| `strata_thread_cpu_seconds{role}` | CPU time of live threads, as last recorded by each thread (after a task or when parking) |
+| `strata_blocking_pool_workers` / `_max_workers` / `_busy` / `_queued` | blocking request pool: started threads (grow on demand), maximum, running and waiting jobs |
+| `strata_blocking_pool_rejected_total` | blocking jobs refused because the queue was full (requests got `resource_exhausted`) |
+
+`GET /api/v1/admin/threads` (cluster.read) lists every thread with its role,
+name, CPU time and its age, and affinity (`unpinned`). On Linux it also
+reports the OS thread count and the number of untracked threads.
+
 ## Scan worker pool
 | Series | Meaning |
 |--------|---------|

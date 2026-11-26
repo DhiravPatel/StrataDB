@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use stratadb_common::checksum::crc32c;
-use stratadb_common::{fsutil, Error, IoResultExt, Result, TenantId};
+use stratadb_common::{fsutil, Error, Result, TenantId};
 
 pub const MANIFEST_FILE: &str = "MANIFEST";
 pub const MANIFEST_FORMAT_VERSION: u32 = 1;
@@ -221,11 +221,20 @@ impl Manifest {
     /// Load `<dir>/MANIFEST`; `Ok(None)` if it does not exist. A sealed
     /// (encrypted) manifest needs `keys`.
     pub fn load(dir: &Path, keys: Option<&stratadb_crypto::Keyring>) -> Result<Option<Self>> {
+        Self::load_with(dir, keys, &*stratadb_common::io::default_io())
+    }
+
+    /// [`Manifest::load`] reading through `io`.
+    pub fn load_with(
+        dir: &Path,
+        keys: Option<&stratadb_crypto::Keyring>,
+        io: &dyn stratadb_common::io::IoEngine,
+    ) -> Result<Option<Self>> {
         let p = dir.join(MANIFEST_FILE);
-        match std::fs::read(&p) {
+        match stratadb_common::io::read_file(io, &p) {
             Ok(b) => Self::decode_any(&b, keys).map(Some),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(Error::io(format!("reading {}", p.display()), e)),
+            Err(e) if stratadb_common::io::is_not_found(&e) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -276,7 +285,7 @@ pub fn tenant_dir(data_dir: &Path, tenant: &TenantId) -> PathBuf {
 /// Read a manifest file's raw bytes (diagnostics).
 pub fn read_raw(dir: &Path) -> Result<Vec<u8>> {
     let p = dir.join(MANIFEST_FILE);
-    std::fs::read(&p).ctx(|| format!("reading {}", p.display()))
+    stratadb_common::io::read_file(&*stratadb_common::io::default_io(), &p)
 }
 
 #[cfg(test)]

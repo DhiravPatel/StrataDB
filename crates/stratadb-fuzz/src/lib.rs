@@ -291,7 +291,7 @@ pub fn fuzz_sealed(data: &[u8]) {
     let p = dir.path().join("f");
     std::fs::write(&p, data).unwrap();
     if let Ok(f) = std::fs::File::open(&p) {
-        if let Ok(s) = container::SealedFile::open(f, keys, &p) {
+        if let Ok(s) = container::SealedFile::open(Box::new(f), keys, &p) {
             let len = s.len();
             for (off, n) in [(0, 16), (len / 2, 100), (len.saturating_sub(16), 16)] {
                 let mut buf = vec![0u8; n.min(4096)];

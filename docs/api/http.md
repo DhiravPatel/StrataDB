@@ -98,3 +98,16 @@ Every response carries `x-request-id` (a client-supplied id matching
 JSON logs to stderr (`STRATADB_LOG`, default `info`): engine events plus one
 `access` line per request (method, path, status, latency, request id; never
 headers, bodies or credentials).
+
+### `GET /api/v1/admin/threads` (cluster.read)
+The thread inventory, StrataDB's equivalent of the spec's `system.threads`
+(STRATA-SYS-03-014). Response fields:
+- `logical_cpus` and `budget` (`2 × logical_cpus + 32`);
+- `registered`;
+- `os_threads` and `untracked` (Linux only, otherwise `null`);
+- `within_budget` and `by_role`;
+- `pools.scan` and `pools.blocking`;
+- `threads`: a list of `{name, role, cpu_seconds, cpu_age_ms, affinity}`.
+
+Each thread records its own CPU time, so `cpu_age_ms` gives the age of the
+figure.

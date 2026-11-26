@@ -725,6 +725,28 @@
         ],
         "x-permission": "retention.manage"
       }
+    },
+    "/api/v1/admin/threads": {
+      "get": {
+        "summary": "Thread inventory: every engine thread with role, name, CPU time and affinity; budget and pool state (spec STRATA-SYS-03-014)",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-permission": "cluster.read"
+      }
     }
   }
 }

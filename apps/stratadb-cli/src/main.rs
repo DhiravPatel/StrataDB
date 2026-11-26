@@ -11,6 +11,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod doctor;
+mod doctor_host;
 mod export;
 mod hostcheck;
 #[cfg(feature = "parquet")]
@@ -170,9 +171,14 @@ enum Cmd {
         skip_backup: bool,
     },
     /// Read-only health and integrity diagnostics (exit 1 on any failure).
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Doctor {
-        #[arg(long)]
-        data_dir: PathBuf,
+        /// `host`: check the host (kernel, sysctls, THP, CPU, filesystem,
+        /// device, limits) instead of a data directory.
+        #[command(subcommand)]
+        sub: Option<DoctorCmd>,
+        #[arg(long, required = true)]
+        data_dir: Option<PathBuf>,
         /// Server configuration file: also check TLS, backups and memory sizing.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -249,6 +255,25 @@ enum BackupCmd {
         path: PathBuf,
         #[arg(long)]
         data_dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum DoctorCmd {
+    /// Host readiness (spec VIII.2): kernel, sysctl baseline, THP, CPU
+    /// frequency and clocksource, filesystem and device of --data-dir,
+    /// rlimits, cgroup limits. Reports only; exits non-zero on FAIL.
+    Host {
+        /// Also check the filesystem and block device holding this directory.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Machine-readable report with stable keys.
+        #[arg(long)]
+        json: bool,
+        /// Read /proc and /sys under this directory instead of / (testing,
+        /// inspecting a mounted host image).
+        #[arg(long, hide = true, default_value = "/")]
+        root: PathBuf,
     },
 }
 
@@ -856,11 +881,39 @@ fn run(cli: Cli) -> Result<bool> {
         Cmd::Keys { cmd } => return keys(cmd),
         Cmd::Indexes { cmd } => return indexes(cmd),
         Cmd::Doctor {
+            sub:
+                Some(DoctorCmd::Host {
+                    data_dir,
+                    json,
+                    root,
+                }),
+            ..
+        } => {
+            let host = if root == std::path::Path::new("/") {
+                doctor_host::Host::real()
+            } else {
+                doctor_host::Host::at(&root)
+            };
+            let r = doctor_host::run(&host, data_dir.as_deref());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&r.to_json()).unwrap_or_default()
+                );
+            } else {
+                print!("{}", r.to_text());
+            }
+            return Ok(!r.has_fail());
+        }
+        Cmd::Doctor {
+            sub: None,
             data_dir,
             config,
             deep,
             max_backup_age_hours,
         } => {
+            let data_dir =
+                data_dir.ok_or_else(|| Error::invalid_input("--data-dir is required"))?;
             let opts = doctor::Options {
                 config,
                 deep,
@@ -1037,6 +1090,9 @@ fn keys(cmd: KeysCmd) -> Result<bool> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Spec STRATA-SYS-02-036: raise the soft descriptor limit to the hard
+    // limit (the segment file cache takes half of it). Best effort.
+    let _ = stratadb_common::io::raise_nofile_limit();
     let key = cli
         .key_file
         .clone()

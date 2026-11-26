@@ -2,6 +2,43 @@
 
 ## Unreleased (0.0.1)
 ### Added
+- **`strata doctor host`** (spec VIII.2): host readiness report.
+  - Checks: kernel, transparent huge pages, the 27-value sysctl baseline,
+    CPU governor and clocksource, rlimits and cgroup limits, and, with
+    `--data-dir`, the data filesystem, mount options and block device.
+  - `--json` gives stable keys; the exit code is non-zero on FAIL.
+  - Ships `packaging/sysctl.d/90-stratadb.conf` and a `tuned` profile.
+  - The server logs host facts at startup.
+- **Storage I/O engine (ADR-0027).** Segment, manifest and backup reads go
+  through `stratadb_common::io`:
+  - Open segment files are cached in an LRU under a descriptor budget
+    (`[storage] max_open_files`, default 50% of `RLIMIT_NOFILE`), so the
+    segment count is no longer limited by open files.
+  - `EMFILE` is recovered by closing cold files, and reopens are
+    identity-checked.
+  - Short reads are resubmitted. A failed read is retried once and then
+    fails the query naming the segment file.
+  - The server and CLI raise the soft `RLIMIT_NOFILE` to the hard limit.
+  - New `strata_io_*` metrics.
+  - A deterministic `SimIo` backend injects short reads/writes, EIO, ENOSPC,
+    latency and crash reordering/tearing for tests.
+  - Direct file reads are banned by a lint in the data-path crates.
+- `strata doctor`'s descriptor check accounts for the segment file cache:
+  a low limit now warns about reopen churn instead of failing.
+- **Thread inventory and budget (spec STRATA-SYS-03-014/015).**
+  - Every engine thread is named `sx-net-NN`, `sx-work-NN`, `sx-blk-NN` or
+    `sx-maint` and registered with its role and CPU time.
+  - `GET /api/v1/admin/threads` lists them, along with the budget and pool
+    state.
+  - New metrics: `strata_threads{role}`, `strata_thread_budget`,
+    `strata_thread_cpu_seconds{role}` and `strata_blocking_pool_*`.
+  - New settings `[limits] net_threads` and `blocking_threads`. The server
+    refuses thread plans above `2 × logical_cpus + 32`.
+### Changed
+- Blocking request work (commits, queries, admin operations) runs on a
+  bounded `sx-blk` pool that starts threads on demand up to its maximum,
+  instead of tokio's `spawn_blocking` (formerly up to 64 extra threads). A
+  full queue fails fast with `resource_exhausted`.
 - **Shared scan worker pool.** Queries no longer create scan threads.
   - Pool: one fixed pool of `sx-work-NN` threads (`[limits] scan_threads`)
     with a bounded queue (≤ 2 × workers active). When the pool is busy, the

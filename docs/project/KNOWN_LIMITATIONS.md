@@ -49,6 +49,14 @@
   they give false verdicts: the A/A test found 9 of 27. CI runs only the
   smoke scenario until a dedicated runner exists. The ledger records CPU ns,
   not cycles.
+- `strata doctor host` reports but never enforces. The server still starts
+  on NFS/overlay data directories (no `allow_unsafe_fs` production mode).
+  NIC/IRQ placement, NVMe power-loss protection and C-states are not
+  checked, and the checks apply to Linux only.
+- The thread inventory is an HTTP endpoint, not a SQL `system.threads`
+  table. CPU time is recorded by each thread itself (after tasks and when
+  parking), threads are not pinned to cores, and the OS thread
+  cross-check is Linux-only.
 - Scans run on a shared, fixed pool with cost-based parallelism.
   - The unit of parallel work is a whole segment, not a granule morsel
     (STRATA-SYS-11-007).
@@ -71,8 +79,12 @@
   memtable and the final merge are sequential; float `sum`/`avg` may differ in
   the last bits from a sequential scan. Whole-map predicates (`attributes = …`) use the scalar path. Memtable
   snapshots copy `Arc` handles of the tenant's rows (O(memtable rows) per query).
-- Every committed segment keeps an open file descriptor (`strata doctor`
-  checks the open-file limit against segment + WAL count).
+- Segment reads go through the I/O engine and a bounded file cache
+  (ADR-0027). **Writes do not yet.** The segment writer, WAL appends and
+  fsync, and manifest commits use `std::fs`, tested with failpoints and the
+  power-loss recorder. WAL replay also reads directly. There is no io_uring
+  backend and no in-flight I/O bound (STRATA-SYS-04-008). Every WAL file
+  keeps a descriptor.
 - `strata doctor` has no cluster connectivity or peer clock-skew checks
   (single node); its memory check is an upper bound on engine budgets, not a
   measurement; `--deep` costs a full scan.

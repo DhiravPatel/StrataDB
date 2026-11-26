@@ -291,3 +291,79 @@ fn doctor_checks_host_tls_backups_and_indexes() {
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(status_of(&v, "fd_limit"), "fail", "{v:#}");
 }
+
+/// `strata doctor host` (spec VIII.2): text contract, `--json` with stable
+/// keys, non-zero exit on FAIL (STRATA-SYS-02-041/042).
+#[test]
+fn doctor_host_reports_and_exits_non_zero_on_fail() {
+    let put = |root: &Path, rel: &str, v: &str| {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, format!("{v}\n")).unwrap();
+    };
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path();
+    put(root, "proc/sys/kernel/osrelease", "6.6.1");
+    put(root, "proc/sys/vm/swappiness", "60");
+    put(
+        root,
+        "sys/kernel/mm/transparent_hugepage/enabled",
+        "[always] madvise never",
+    );
+    let bin = env!("CARGO_BIN_EXE_strata");
+    let run = |args: &[&str]| Command::new(bin).args(args).output().unwrap();
+    let r = root.to_str().unwrap();
+    let o = run(&["doctor", "host", "--root", r, "--json"]);
+    assert_ne!(o.status.code(), Some(0), "FAIL item -> non-zero exit");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["report_version"], 1);
+    assert_eq!(v["summary"]["assessed"], true);
+    assert_eq!(v["summary"]["ready"], false);
+    let find = |id: &str| {
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{id}"))
+    };
+    assert_eq!(find("vm.swappiness")["status"], "fail");
+    assert_eq!(find("vm.swappiness")["value"], "60");
+    assert_eq!(find("transparent_hugepage")["status"], "warn");
+    let text = String::from_utf8(run(&["doctor", "host", "--root", r]).stdout).unwrap();
+    assert!(text.starts_with("StrataDB host readiness report"), "{text}");
+    assert!(
+        text.contains("[FAIL] vm.swappiness=60  -> recommend 1"),
+        "{text}"
+    );
+    // Fixed: exit 0.
+    put(root, "proc/sys/vm/swappiness", "1");
+    let o = run(&["doctor", "host", "--root", r, "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let fails = v["summary"]["fail"].as_u64().unwrap();
+    // The real process rlimits are checked too; only they may fail here.
+    assert_eq!(o.status.code() == Some(0), fails == 0, "{}", v["summary"]);
+    // The real host: structure only (values depend on the machine).
+    let o = run(&["doctor", "host", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["summary"]["assessed"], cfg!(target_os = "linux"));
+    if cfg!(target_os = "linux") {
+        assert_ne!(find_status(&v, "kernel"), "skip");
+    }
+    // The data-directory form keeps working.
+    let d = tempfile::tempdir().unwrap();
+    let dd = d.path().join("data");
+    assert_eq!(strata(&["init", "--data-dir", dd.to_str().unwrap()]).0, 0);
+    assert_eq!(strata(&["doctor", "--data-dir", dd.to_str().unwrap()]).0, 0);
+}
+
+fn find_status(v: &serde_json::Value, id: &str) -> String {
+    v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id)
+        .map(|c| c["status"].as_str().unwrap().to_owned())
+        .unwrap_or_default()
+}

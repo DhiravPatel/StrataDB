@@ -185,9 +185,13 @@ const DAY_MS: i64 = 86_400_000;
 const QUERY_MEMORY: u64 = 256 << 20;
 
 fn check_fd(segments: usize, wal_segments: usize, r: &mut Report) {
-    // One descriptor per committed segment and WAL segment, plus sockets,
-    // the lock file, logs and headroom.
-    let need = (segments + wal_segments + 256) as u64;
+    // Segment files are cached in an LRU limited to half the soft limit
+    // (spec STRATA-SYS-02-037): a low limit causes reopen churn, not
+    // failures. Hard floor: WAL files, sockets, the lock file, logs and a
+    // minimal segment cache. The server raises the soft limit to the hard
+    // limit at startup (STRATA-SYS-02-036).
+    let floor = (wal_segments + 128) as u64;
+    let comfortable = 2 * (segments + wal_segments + 256) as u64;
     match crate::hostcheck::open_file_limit() {
         None => r.add(
             "fd_limit",
@@ -200,9 +204,9 @@ fn check_fd(segments: usize, wal_segments: usize, r: &mut Report) {
             } else {
                 l.to_string()
             };
-            let status = if l < need {
+            let status = if l < floor {
                 "fail"
-            } else if l < need.saturating_mul(4) {
+            } else if l < comfortable {
                 "warn"
             } else {
                 "ok"
@@ -211,7 +215,7 @@ fn check_fd(segments: usize, wal_segments: usize, r: &mut Report) {
                 "fd_limit",
                 status,
                 format!(
-                    "soft limit {shown} for processes started from this environment; {segments} segments + {wal_segments} WAL files keep one descriptor each (need ≥ {need}). The service manager may set its own limit (systemd unit: LimitNOFILE=65536)"
+                    "soft limit {shown} for processes started from this environment (the server raises it to the hard limit); {segments} segments share a file cache of half the limit, {wal_segments} WAL files stay open (fail below {floor}; below {comfortable} cold segment files are closed and reopened). The service manager may set its own limit (systemd unit: LimitNOFILE=65536)"
                 ),
             );
         }

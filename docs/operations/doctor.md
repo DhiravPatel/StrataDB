@@ -58,3 +58,51 @@ and from monitoring (for example daily with `--config`, alerting on `warn`).
 - **Not checked (single-node build):** cluster connectivity and clock skew
   against peers. Both arrive with distributed mode (Phases 7–8). The `clock`
   check only detects local time moving backwards.
+
+## `strata doctor host`: host readiness (spec VIII.2)
+
+```
+strata doctor host [--data-dir D] [--json]
+```
+
+This checks the machine, not a data directory, and only reports: StrataDB
+never changes sysctls (STRATA-SYS-02-004). The exit code is non-zero if any
+item is `FAIL` (STRATA-SYS-02-041). With `--json` the output is
+`{report_version, host, checks: [{id, category, status, value, recommended,
+detail}], summary: {fail, warn, pass, info, skip, assessed, ready}}` with
+stable `id`s (STRATA-SYS-02-042). The text output follows the spec's format:
+
+```
+StrataDB host readiness report  (kernel 6.6.32, x86_64, ..., 64 logical CPUs, 1 NUMA node(s))
+[PASS] kernel=6.6.32  (supported kernel)
+[WARN] transparent_hugepage=always  -> recommend madvise  (...)
+[FAIL] vm.swappiness=60  -> recommend 1  (...)
+...
+Summary: 1 FAIL, 3 WARN. Production readiness: NOT READY (fix FAIL items)
+```
+
+| Area | Checks | FAIL when |
+|---|---|---|
+| kernel | release ≥ 5.15 (warn below 6.6), io_uring availability (info: this build uses the portable backend) | kernel < 5.15 |
+| memory | transparent huge pages `madvise` (warn on `always`), defrag, swap devices | — |
+| sysctl | the 27 values of the VIII.2.2 baseline (`packaging/sysctl.d/90-stratadb.conf`), plus busy-poll as info | `vm.swappiness` > 10 |
+| cpu | cpufreq governor `performance`, SMT and turbo state (info, recorded by benchmarks), clocksource `tsc`/`arch_sys_counter` (warn on `hpet`/`acpi_pm`) | — |
+| limits | `RLIMIT_NOFILE` ≥ 1,048,576 (warn ≥ 65,536), `RLIMIT_NPROC`, `RLIMIT_CORE`; cgroup v2 `cpu.max`, `memory.max`, `memory.high`, cpuset (info) | `RLIMIT_NOFILE` < 65,536 |
+| storage (with `--data-dir`) | filesystem `xfs`/`ext4`; mount options `noatime`, no `discard`, ext4 `data=ordered`; device rotational, I/O scheduler `none`, `read_ahead_kb` ≤ 512, volatile write cache (info; power-loss protection is shown as unknown) | NFS/SMB/FUSE/overlay/9p filesystem (STRATA-SYS-02-022); `nobarrier` |
+
+**Platforms.** The checks target Linux production hosts. Elsewhere (for
+example macOS development machines) most items are `skip` and the summary
+says `NOT ASSESSED`.
+
+**Applying the baseline:**
+- sysctls: `cp packaging/sysctl.d/90-stratadb.conf /etc/sysctl.d/ && sysctl --system`;
+- the full profile (sysctls, governor, THP): `cp -r packaging/tuned/stratadb /etc/tuned/ && tuned-adm profile stratadb`.
+
+Review the network values (`bbr` needs the `tcp_bbr` module) and size
+`vm.min_free_kbytes` to the host (at least 1% of RAM, at most 4 GiB).
+
+**Not checked yet:**
+- NIC speed, RSS queues and IRQ placement (VIII.2.7);
+- NVMe power-loss protection (needs NVMe identify);
+- the C-state configuration;
+- io_uring opcodes (no io_uring backend yet).

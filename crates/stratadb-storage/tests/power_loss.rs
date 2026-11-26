@@ -8,7 +8,7 @@
 //!
 //! Superseded by the full simulation in `power_loss_sim.rs` (reordering,
 //! torn sectors, lost un-fsynced renames); kept as a fast regression test.
-
+#![allow(clippy::disallowed_methods)] // tests read and corrupt files on purpose, bypassing the I/O engine
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code: panics are failures
 
 use std::collections::BTreeSet;

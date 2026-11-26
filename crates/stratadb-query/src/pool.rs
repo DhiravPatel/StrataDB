@@ -104,7 +104,7 @@ impl ScanPool {
             let (rx, active, panicked) =
                 (Arc::clone(&rx), Arc::clone(&active), Arc::clone(&panicked));
             let spawned = std::thread::Builder::new()
-                .name(format!("sx-work-{i:02}"))
+                .name(stratadb_common::threads::Role::Work.thread_name(i))
                 .spawn(move || worker(&rx, &active, &panicked));
             if spawned.is_ok() {
                 started += 1;
@@ -164,6 +164,7 @@ impl ScanPool {
 }
 
 fn worker(rx: &Mutex<Receiver<Job>>, active: &AtomicUsize, panicked: &AtomicUsize) {
+    let me = stratadb_common::threads::register(stratadb_common::threads::Role::Work);
     loop {
         let job = {
             let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -176,6 +177,7 @@ fn worker(rx: &Mutex<Receiver<Job>>, active: &AtomicUsize, panicked: &AtomicUsiz
             panicked.fetch_add(1, Ordering::Relaxed);
         }
         active.fetch_sub(1, Ordering::Relaxed);
+        me.update_cpu();
     }
 }
 

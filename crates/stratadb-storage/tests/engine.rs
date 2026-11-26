@@ -1,5 +1,5 @@
 //! End-to-end storage engine behaviour (Phase 1 exit criteria).
-
+#![allow(clippy::disallowed_methods)] // tests read and corrupt files on purpose, bypassing the I/O engine
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code: panics are failures
 
 use std::collections::BTreeSet;

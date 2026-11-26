@@ -38,3 +38,4 @@ its decision; it is superseded by a new ADR. Status meanings:
 | [0024](0024-encryption-at-rest.md) | Encryption at rest | Accepted |
 | [0025](0025-parquet-import-export.md) | Parquet import/export (CLI) | Accepted |
 | [0026](0026-performance-architecture-adoption.md) | Adopting spec Parts IV–IX: phase plan, conflicts, hardware honesty | Accepted |
+| [0027](0027-io-engine.md) | Storage I/O engine (pread + sim backends), segment file cache under a descriptor budget | Accepted (read path) |

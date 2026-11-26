@@ -1,6 +1,6 @@
 //! Backup / restore drills (spec §19.4). "A backup feature is not complete
 //! until restore drills pass."
-
+#![allow(clippy::disallowed_methods)] // tests read and corrupt files on purpose, bypassing the I/O engine
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code: panics are failures
 
 use std::collections::BTreeSet;
