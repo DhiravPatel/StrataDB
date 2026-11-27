@@ -1,0 +1,13 @@
+{
+  "dir": "/private/tmp/claude-501/-Users-dhiravpatel-Documents-Project2-StrataDB/63b47b97-b205-462b-93af-adff98b3412c/scratchpad",
+  "fdatasync_us": {
+    "max": 7442.2919999999995,
+    "mean": 3603.473,
+    "p50": 3863.875,
+    "p99": 4598.0
+  },
+  "implied_max_commits_per_s_single_writer": 258.8075442399146,
+  "iterations": 1000,
+  "note": "a group commit makes N writers durable with one fsync, so throughput scales with group size; the adaptive group delay waits at most min(fsync latency, max_delay)",
+  "write_bytes": 4096
+}

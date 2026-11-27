@@ -1078,6 +1078,7 @@ async fn per_tenant_rate_and_storage_quotas() {
             ingest_events_per_sec: Some(5.0),
             ingest_burst_events: Some(10.0),
             storage_bytes: None,
+            query_memory_bytes: None,
         },
         ..Default::default()
     };

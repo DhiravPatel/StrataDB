@@ -1,0 +1,10 @@
+memtable, final code, 3 pairs: best-of-3 run medians, process CPU ms
+  m01_trace_id_lookup        5.293   5.083  1.04x  True
+  m02_recent_errors          1.508   1.258  1.20x  True
+  m03_old_time_range         0.860   0.787  1.09x  True
+  m04_service_count          2.184   1.565  1.40x  True
+  m05_fatal_only             2.784   2.843  0.98x  True
+  m06_limit_scan             0.559   0.555  1.01x  True
+geomean: 1.111
+dataset load base: events/s [55545, 52047, 54297] cpu ns/event [4659, 6178, 5168]
+dataset load new: events/s [53848, 56484, 55814] cpu ns/event [5647, 4234, 4015]

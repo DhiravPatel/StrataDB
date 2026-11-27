@@ -7,6 +7,7 @@
 pub mod ast;
 pub mod eval;
 pub mod exec;
+pub mod fingerprint;
 mod groups;
 pub mod lexer;
 pub mod page;
@@ -15,6 +16,10 @@ pub mod plan;
 pub mod pool;
 mod vector;
 
+pub use ast::Table;
 pub use eval::Datum;
-pub use exec::{execute, execute_page, Page, PageRequest, QueryOptions, QueryOutput, QueryStats};
+pub use exec::{
+    execute, execute_page, Catalog, Page, PageRequest, QueryOptions, QueryOutput, QueryStats,
+};
+pub use fingerprint::{fingerprint, Fingerprint};
 pub use pool::{configure_scan_pool, scan_pool, PoolStats};

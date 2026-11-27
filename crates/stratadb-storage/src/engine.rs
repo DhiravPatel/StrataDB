@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex, RwLock};
 use stratadb_common::{failpoint, fsutil, time, Error, ErrorKind, IoResultExt, Result, TenantId};
 use stratadb_schema::codec::{decode_batch, encode_batch, DecodeLimits};
+use stratadb_schema::column::EventColumns;
 use stratadb_schema::Event;
 use stratadb_segment::{RowRef, SegmentReader};
 use stratadb_wal::{Durability, RecordType, RecoveryReport, Wal, WalOptions, WalStats};
@@ -58,7 +59,7 @@ pub use maintenance::{
 use crate::idempotency::{self, BatchMeta, DedupIndex, IdempotencyKey, Reservation};
 use crate::manifest::RetentionPolicy;
 use crate::manifest::{segment_path, tenant_dir, Manifest, SegmentEntry, SegmentState};
-use crate::memtable::{FrozenMemtable, MemRow, Memtable};
+use crate::memtable::{FrozenMemtable, MemView, Memtable};
 
 /// Engine configuration. Defaults favour durability (group commit).
 #[derive(Debug, Clone)]
@@ -118,6 +119,21 @@ pub struct EngineOptions {
     /// set, new segments, the manifest and WAL segments are encrypted; an
     /// encrypted data directory cannot be opened without it.
     pub encryption: Option<Arc<dyn stratadb_crypto::KeyProvider>>,
+    /// Index in the background thread's name (`sx-maint-NN`), so that several
+    /// engines in one process (e.g. the query log's) are told apart.
+    pub maint_thread_index: usize,
+    /// Ingest memory region (spec VIII.5.2, ARCH-01-006): memtable bytes are
+    /// reserved here before the WAL append and released when flushed. When
+    /// it is full, writers request a flush and wait up to
+    /// `write_stall_timeout`, then fail with a retryable `ResourceExhausted`.
+    pub memory: Option<Arc<stratadb_common::memory::MemoryTracker>>,
+    /// Cache memory region: decoded Bloom and trigram filters are tracked
+    /// here (not evictable yet, so tracked without a limit check).
+    pub cache_memory: Option<Arc<stratadb_common::memory::MemoryTracker>>,
+    /// Background memory region (compaction, retention and upgrade
+    /// rewrites): a rewrite reserves its input rows here first; compaction
+    /// is postponed while the region is full.
+    pub background_memory: Option<Arc<stratadb_common::memory::MemoryTracker>>,
 }
 
 impl EngineOptions {
@@ -159,6 +175,10 @@ impl EngineOptions {
             segment_compression: true,
             segment_shredding: true,
             encryption: None,
+            maint_thread_index: 0,
+            memory: None,
+            cache_memory: None,
+            background_memory: None,
         }
     }
 }
@@ -214,8 +234,30 @@ pub struct OpenReport {
 pub struct SegmentHandle {
     pub entry: SegmentEntry,
     pub reader: SegmentReader,
-    bloom: std::sync::OnceLock<Option<stratadb_segment::bloom::BloomSet>>,
-    ngram: std::sync::OnceLock<Option<stratadb_segment::ngram::NgramSet>>,
+    bloom: std::sync::OnceLock<Option<Charged<stratadb_segment::bloom::BloomSet>>>,
+    ngram: std::sync::OnceLock<Option<Charged<stratadb_segment::ngram::NgramSet>>>,
+    /// Where decoded filters are accounted.
+    cache: Option<Arc<stratadb_common::memory::MemoryTracker>>,
+}
+
+/// A decoded structure and its tracked memory (released with it).
+#[derive(Debug)]
+struct Charged<T> {
+    value: T,
+    _charge: Option<stratadb_common::memory::Reservation>,
+}
+
+impl<T> Charged<T> {
+    fn new(
+        value: T,
+        bytes: usize,
+        cache: Option<&Arc<stratadb_common::memory::MemoryTracker>>,
+    ) -> Self {
+        Self {
+            value,
+            _charge: cache.map(|c| stratadb_common::memory::Reservation::forced(c, bytes as u64)),
+        }
+    }
 }
 
 impl SegmentHandle {
@@ -227,7 +269,7 @@ impl SegmentHandle {
             .get_or_init(|| {
                 let x = self.reader.footer().extension(stratadb_segment::bloom::EXT_BLOOM)?;
                 match stratadb_segment::bloom::BloomSet::decode(&x.data) {
-                    Ok(b) => Some(b),
+                    Ok(b) => Some(Charged::new(b, x.data.len(), self.cache.as_ref())),
                     Err(e) => {
                         tracing::warn!(segment = self.entry.id, error = %e, "ignoring undecodable bloom filters");
                         None
@@ -235,6 +277,7 @@ impl SegmentHandle {
                 }
             })
             .as_ref()
+            .map(|c| &c.value)
     }
 
     /// The segment's trigram filters, decoded on first use (`None`: absent
@@ -244,7 +287,7 @@ impl SegmentHandle {
             .get_or_init(|| {
                 let x = self.reader.footer().extension(stratadb_segment::ngram::EXT_NGRAM)?;
                 match stratadb_segment::ngram::NgramSet::decode(&x.data) {
-                    Ok(n) => Some(n),
+                    Ok(n) => Some(Charged::new(n, x.data.len(), self.cache.as_ref())),
                     Err(e) => {
                         tracing::warn!(segment = self.entry.id, error = %e, "ignoring undecodable ngram filters");
                         None
@@ -252,6 +295,7 @@ impl SegmentHandle {
                 }
             })
             .as_ref()
+            .map(|c| &c.value)
     }
 }
 
@@ -328,7 +372,9 @@ pub struct EngineStats {
 pub struct Snapshot {
     tenant: TenantId,
     segments: Vec<Arc<SegmentHandle>>,
-    memory: Vec<MemRow>,
+    /// Memtable rows visible at the snapshot instant: chunk pointers and
+    /// counts (frozen memtables first, then the active one).
+    memory: Vec<MemView>,
 }
 
 impl Snapshot {
@@ -340,7 +386,35 @@ impl Snapshot {
         &self.segments
     }
 
-    pub fn memory_rows(&self) -> &[MemRow] {
+    /// The committed segments as executor scan sources (spec
+    /// STRATA-ARCH-01-003).
+    pub fn sources(&self) -> Vec<Arc<dyn crate::scan::ScanSource>> {
+        self.segments
+            .iter()
+            .map(|s| Arc::clone(s) as Arc<dyn crate::scan::ScanSource>)
+            .collect()
+    }
+
+    /// The visible memtable rows as scan sources of at most `rows` rows
+    /// each (windows of column chunks; each carries its chunk's zone map).
+    pub fn memory_chunks(&self, rows: usize) -> impl Iterator<Item = crate::scan::MemChunk<'_>> {
+        let w = rows.max(1);
+        self.memory.iter().flat_map(move |v| {
+            v.chunks().flat_map(move |(c, n)| {
+                (0..n).step_by(w).map(move |from| {
+                    crate::scan::MemChunk::new(v.tenant(), c, from, (from + w).min(n))
+                })
+            })
+        })
+    }
+
+    /// Memtable rows visible to this snapshot.
+    pub fn memory_row_count(&self) -> usize {
+        self.memory.iter().map(MemView::rows).sum()
+    }
+
+    /// The visible memtable rows of each memtable (frozen ones first).
+    pub fn memory_views(&self) -> &[MemView] {
         &self.memory
     }
 
@@ -350,7 +424,7 @@ impl Snapshot {
     /// were committed after it.
     pub fn max_visible_seq(&self) -> u64 {
         let seg = self.segments.iter().map(|s| s.entry.max_seq).max();
-        let mem = self.memory.iter().map(|r| r.seq).max();
+        let mem = self.memory.iter().map(MemView::max_seq).max();
         seg.max(mem).unwrap_or(0)
     }
 
@@ -368,11 +442,9 @@ impl Snapshot {
                 out.push((r.seq, r.idx, r.event));
             }
         }
-        out.extend(
-            self.memory
-                .iter()
-                .map(|r| (r.seq, r.idx, (*r.event).clone())),
-        );
+        for v in &self.memory {
+            out.extend(v.materialize()?);
+        }
         out.sort_by_key(|(s, i, e)| (e.event_time, *s, *i));
         Ok(out)
     }
@@ -439,6 +511,42 @@ struct Shared {
     _lock_file: File,
     /// Encryption keyring (ADR-0024); `None` for a plaintext directory.
     keys: Option<Arc<stratadb_crypto::Keyring>>,
+    /// Memtable bytes reserved on the ingest tracker (released on flush and
+    /// when the engine is dropped).
+    ingest: IngestAccount,
+}
+
+/// Bytes this engine holds on the ingest memory tracker.
+#[derive(Debug, Default)]
+struct IngestAccount {
+    tracker: Option<Arc<stratadb_common::memory::MemoryTracker>>,
+    held: AtomicU64,
+}
+
+impl IngestAccount {
+    fn release(&self, bytes: u64) {
+        if let Some(t) = &self.tracker {
+            let prev = self
+                .held
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |h| {
+                    Some(h.saturating_sub(bytes))
+                })
+                .unwrap_or(0);
+            t.release(prev.min(bytes));
+        }
+    }
+
+    fn add(&self, bytes: u64) {
+        self.held.fetch_add(bytes, Ordering::AcqRel);
+    }
+}
+
+impl Drop for IngestAccount {
+    fn drop(&mut self) {
+        if let Some(t) = &self.tracker {
+            t.release(*self.held.get_mut());
+        }
+    }
 }
 
 /// The storage engine. Cheap to share by reference across threads.
@@ -460,6 +568,9 @@ const WAL_DIR: &str = "wal";
 const SEGMENTS_DIR: &str = "segments";
 const QUARANTINE_DIR: &str = "quarantine";
 
+// The LOCK file only carries an advisory lock (no data), so it is opened
+// directly rather than through the I/O engine.
+#[allow(clippy::disallowed_methods)]
 fn acquire_lock(dir: &Path) -> Result<File> {
     let p = dir.join(LOCK_FILE);
     let f = OpenOptions::new()
@@ -538,7 +649,19 @@ fn open_segment(
         reader,
         bloom: std::sync::OnceLock::new(),
         ngram: std::sync::OnceLock::new(),
+        cache: None,
     })
+}
+
+impl SegmentHandle {
+    /// Account this segment's decoded filters on `cache`.
+    pub(crate) fn tracked(
+        mut self,
+        cache: Option<&Arc<stratadb_common::memory::MemoryTracker>>,
+    ) -> Self {
+        self.cache = cache.cloned();
+        self
+    }
 }
 
 impl Engine {
@@ -592,7 +715,7 @@ impl Engine {
                     ));
                 }
                 let m = Manifest::initial();
-                m.commit(&dir, k)?;
+                m.commit_with(&dir, k, &*opts.io_engine())?;
                 report.created = true;
                 m
             }
@@ -611,7 +734,7 @@ impl Engine {
             }
             manifest.version += 1;
             manifest.obsolete_segments.clear();
-            manifest.commit(&dir, k)?;
+            manifest.commit_with(&dir, k, &*opts.io_engine())?;
         }
         report.manifest_version = manifest.version;
 
@@ -674,13 +797,16 @@ impl Engine {
         }
         let mut handles = Vec::with_capacity(manifest.segments.len());
         for entry in &manifest.segments {
-            handles.push(Arc::new(open_segment(
-                &dir,
-                entry,
-                opts.verify_segments_on_open,
-                k,
-                &opts.io_engine(),
-            )?));
+            handles.push(Arc::new(
+                open_segment(
+                    &dir,
+                    entry,
+                    opts.verify_segments_on_open,
+                    k,
+                    &opts.io_engine(),
+                )?
+                .tracked(opts.cache_memory.as_ref()),
+            ));
         }
         report.segments = handles.len();
 
@@ -703,34 +829,43 @@ impl Engine {
             &dir.join(WAL_DIR),
             WalOptions {
                 keys: keys.clone(),
+                io: Some(opts.wal.io.clone().unwrap_or_else(|| opts.io_engine())),
                 ..opts.wal.clone()
             },
             manifest.flushed_through_seq,
             |seq, rtype, payload| {
-                let (events, meta) = match rtype {
-                    RecordType::EventBatch => (
-                        decode_batch(payload, &lim).map_err(|e| corrupt(seq, e))?,
-                        None,
-                    ),
-                    RecordType::IdempotentEventBatch => {
+                // Row (types 1, 2) or columnar (types 3, 4) batch body, into
+                // columns: columnar records need no row intermediate
+                // (spec STRATA-SYS-07-002).
+                let decode = |b: &[u8]| match rtype {
+                    RecordType::EventBatch | RecordType::IdempotentEventBatch => {
+                        decode_batch(b, &lim).and_then(EventColumns::from_events)
+                    }
+                    RecordType::ColumnarEventBatch | RecordType::IdempotentColumnarEventBatch => {
+                        stratadb_schema::columnar::decode_columns(b, &lim)
+                    }
+                };
+                let (cols, meta) = match rtype {
+                    RecordType::EventBatch | RecordType::ColumnarEventBatch => {
+                        (decode(payload).map_err(|e| corrupt(seq, e))?, None)
+                    }
+                    RecordType::IdempotentEventBatch | RecordType::IdempotentColumnarEventBatch => {
                         let (key, digest, committed_ms, rest) =
                             idempotency::decode_record(payload).map_err(|e| corrupt(seq, e))?;
-                        let events = decode_batch(rest, &lim).map_err(|e| corrupt(seq, e))?;
+                        let cols = decode(rest).map_err(|e| corrupt(seq, e))?;
                         let meta = BatchMeta {
                             key,
                             digest,
                             commit_seq: seq,
-                            accepted: events.len() as u32,
+                            accepted: cols.len() as u32,
                             committed_ms,
                         };
-                        if let Some(first) = events.first() {
-                            metas.push((first.tenant_id.clone(), meta.clone()));
-                        }
-                        (events, Some(meta))
+                        metas.push((cols.tenant.clone(), meta.clone()));
+                        (cols, Some(meta))
                     }
                 };
-                recovered_rows += events.len() as u64;
-                active.insert_batch(seq, events, meta);
+                recovered_rows += cols.len() as u64;
+                active.insert_columns(seq, cols, meta);
                 Ok(())
             },
         )?;
@@ -783,8 +918,21 @@ impl Engine {
             }),
             _lock_file: lock_file,
             keys,
+            ingest: IngestAccount {
+                tracker: opts.memory.clone(),
+                held: AtomicU64::new(0),
+            },
             opts,
         });
+        // Rows replayed from the WAL are in memory already: track them
+        // without a limit check (writers stall until they are flushed).
+        if let Some(t) = &shared.ingest.tracker {
+            let st = shared.state.lock();
+            let bytes =
+                (st.active.bytes() + st.frozen.iter().map(|f| f.bytes).sum::<usize>()) as u64;
+            t.force_reserve(bytes);
+            shared.ingest.add(bytes);
+        }
         let engine = Engine {
             bg_thread: Mutex::new(None),
             shared: Arc::clone(&shared),
@@ -792,7 +940,7 @@ impl Engine {
         if shared.opts.background {
             let s = Arc::clone(&shared);
             let h = std::thread::Builder::new()
-                .name(stratadb_common::threads::Role::Maint.thread_name(0))
+                .name(stratadb_common::threads::Role::Maint.thread_name(s.opts.maint_thread_index))
                 .spawn(move || background_loop(&s))
                 .ctx(|| "spawning background thread".to_owned())?;
             *engine.bg_thread.lock() = Some(h);
@@ -1087,6 +1235,28 @@ impl Shared {
         self.bg_cv.notify_all();
     }
 
+    /// Reserve `bytes` of ingest memory. When the region is full, ask for a
+    /// flush (which releases memtable memory) and wait up to the stall
+    /// timeout. Returns the bytes reserved (0 without a tracker).
+    fn reserve_ingest(&self, bytes: u64) -> Result<u64> {
+        let Some(t) = &self.ingest.tracker else {
+            return Ok(0);
+        };
+        if t.try_reserve(bytes).is_err() {
+            self.counters.stalls.fetch_add(1, Ordering::Relaxed);
+            self.request_flush();
+            if let Err(e) = t.reserve_wait(bytes, self.opts.write_stall_timeout) {
+                self.counters.rejections.fetch_add(1, Ordering::Relaxed);
+                return Err(Error::resource_exhausted(format!(
+                    "write stalled: ingest memory is full; retry with backoff ({})",
+                    e.to_string().trim_start_matches("resource_exhausted: ")
+                )));
+            }
+        }
+        self.ingest.add(bytes);
+        Ok(bytes)
+    }
+
     fn active_over_threshold(&self, active: &Memtable) -> bool {
         active.bytes() >= self.opts.memtable_max_bytes
             || active.rows() >= self.opts.memtable_max_rows
@@ -1156,16 +1326,50 @@ impl Shared {
             }
         }
         let encoding = Instant::now();
-        let batch = encode_batch(&events);
-        let (rtype, payload) = match &key {
-            Some(k) => (
+        // WAL v3 writes the columnar batch (spec STRATA-SYS-07-002); v2 (the
+        // rollback window) the row batch.
+        let columnar = self.opts.wal.format_version >= 3;
+        let batch = if columnar {
+            match stratadb_schema::columnar::encode_batch(&events) {
+                Ok(b) => b,
+                Err(e) => {
+                    if let Some(k) = &key {
+                        self.dedup.lock().abort(tenant, k);
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            encode_batch(&events)
+        };
+        let (rtype, payload) = match (&key, columnar) {
+            (Some(k), true) => (
+                RecordType::IdempotentColumnarEventBatch,
+                idempotency::encode_record(k, now_ms, &batch),
+            ),
+            (Some(k), false) => (
                 RecordType::IdempotentEventBatch,
                 idempotency::encode_record(k, now_ms, &batch),
             ),
-            None => (RecordType::EventBatch, batch),
+            (None, true) => (RecordType::ColumnarEventBatch, batch),
+            (None, false) => (RecordType::EventBatch, batch),
         };
         self.stage_encode.observe_duration(encoding.elapsed());
+        // Ingest memory (spec VIII.5.2): reserved before the WAL append, so a
+        // write is refused before it is durable, never after.
+        let reserved = match self.reserve_ingest(crate::memtable::batch_bytes(&events) as u64) {
+            Ok(b) => b,
+            Err(e) => {
+                if let Some(k) = &key {
+                    self.dedup.lock().abort(tenant, k);
+                }
+                return Err(e);
+            }
+        };
         let committed = self.commit(rtype, &payload, events, n, key.as_ref(), now_ms);
+        if committed.is_err() {
+            self.ingest.release(reserved);
+        }
         let (seq, active, meta) = match committed {
             Ok(v) => v,
             Err(e) => {
@@ -1220,7 +1424,14 @@ impl Shared {
         });
         let inserting = Instant::now();
         let active = Arc::clone(&self.state.lock().active);
-        active.insert_batch(seq, events, meta.clone());
+        if let Err(e) = active.insert_batch(seq, events, meta.clone()) {
+            // The record is durable but not in memory: fail stop; recovery
+            // replays it.
+            let e =
+                Error::indeterminate(format!("memtable insert failed after the WAL append: {e}"));
+            self.fail(&e);
+            return Err(e);
+        }
         self.stage_memtable.observe_duration(inserting.elapsed());
         Ok((seq, active, meta))
     }
@@ -1236,8 +1447,11 @@ impl Shared {
             return Ok(());
         }
         let through = self.wal.last_seq();
-        let frozen = st.active.freeze(through);
-        st.frozen.push_back(Arc::new(frozen));
+        // O(1): swap in an empty memtable; queries and flush read the old
+        // one concurrently (spec STRATA-ARCH-02-014).
+        let old = std::mem::replace(&mut st.active, Arc::new(Memtable::new()));
+        st.frozen
+            .push_back(Arc::new(FrozenMemtable::new(old, through)));
         drop(st);
         failpoint::hit("flush::after_freeze")
     }
@@ -1276,25 +1490,27 @@ impl Shared {
         frozen: &Arc<FrozenMemtable>,
         report: &mut FlushReport,
     ) -> Result<()> {
-        let mut by_tenant: BTreeMap<&TenantId, Vec<RowRef<'_>>> = BTreeMap::new();
-        for (tenant, rows) in &frozen.by_tenant {
-            by_tenant.insert(
-                tenant,
-                rows.iter()
-                    .map(|r| RowRef {
-                        seq: r.seq,
-                        idx: r.idx,
-                        event: &r.event,
-                    })
-                    .collect(),
-            );
-        }
+        let tenants = frozen.tenants();
         let mut next_id = man.next_segment_id;
         let mut written: Vec<PathBuf> = Vec::new();
         let mut handles = Vec::new();
         let created_ms = time::now_unix_millis();
         let result = (|| -> Result<()> {
-            for (tenant, mut rows) in by_tenant {
+            for tenant in &tenants {
+                // One tenant at a time: its rows are materialized for the
+                // segment writer and dropped before the next tenant.
+                let Some(view) = frozen.view(tenant) else {
+                    continue;
+                };
+                let owned = view.materialize()?;
+                let mut rows: Vec<RowRef<'_>> = owned
+                    .iter()
+                    .map(|(seq, idx, event)| RowRef {
+                        seq: *seq,
+                        idx: *idx,
+                        event,
+                    })
+                    .collect();
                 let id = next_id;
                 next_id += 1;
                 let tdir = tenant_dir(&self.dir, tenant);
@@ -1303,7 +1519,8 @@ impl Shared {
                 written.push(path.clone());
                 let metas = frozen.metas.get(tenant).map_or(&[][..], Vec::as_slice);
                 let extensions = self.segment_extensions(&rows, metas);
-                let ws = stratadb_segment::write_segment_sealed(
+                let ws = stratadb_segment::write_segment_io(
+                    &*self.opts.io_engine(),
                     &path,
                     id,
                     tenant,
@@ -1338,7 +1555,8 @@ impl Shared {
                     true,
                     self.keys.as_deref(),
                     &self.opts.io_engine(),
-                )?;
+                )?
+                .tracked(self.opts.cache_memory.as_ref());
                 report.bytes_written += ws.file_bytes;
                 handles.push(Arc::new(handle));
             }
@@ -1360,7 +1578,7 @@ impl Shared {
         next.flushed_through_seq = frozen.through_seq;
         next.segments
             .extend(handles.iter().map(|h| h.entry.clone()));
-        if let Err(e) = next.commit(&self.dir, self.keys.as_deref()) {
+        if let Err(e) = next.commit_with(&self.dir, self.keys.as_deref(), &*self.opts.io_engine()) {
             // The manifest may or may not be durable now: fail stop.
             let e = Error::indeterminate(format!("manifest commit failed: {e}"));
             self.fail(&e);
@@ -1378,6 +1596,7 @@ impl Shared {
             match st.frozen.front() {
                 Some(f) if Arc::ptr_eq(f, frozen) => {
                     st.frozen.pop_front();
+                    self.ingest.release(frozen.bytes as u64);
                 }
                 _ => {
                     return Err(Error::internal(
@@ -1411,11 +1630,13 @@ impl Shared {
             .filter(|s| &s.entry.tenant == tenant)
             .cloned()
             .collect();
-        let mut memory = Vec::new();
-        for f in &st.frozen {
-            f.tenant_rows(tenant, &mut memory);
-        }
-        st.active.tenant_rows(tenant, &mut memory);
+        // O(chunks): views copy chunk pointers and a published count.
+        let memory = st
+            .frozen
+            .iter()
+            .filter_map(|f| f.view(tenant))
+            .chain(st.active.view(tenant))
+            .collect();
         Snapshot {
             tenant: tenant.clone(),
             segments,

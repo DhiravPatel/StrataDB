@@ -42,6 +42,48 @@
 - Fsync failures poison the WAL by design; recovery requires restart.
 
 ## Performance
+- **Typed columns (ADR-0034):**
+  - Only string columns are typed (plain or dictionary). Numeric and value
+    columns are still vectors, with no null bitmaps for values.
+  - Memtable strings are plain, so the dictionary kernels apply to segments
+    only.
+  - Selections live within the single scan operator; there is no
+    multi-operator pipeline.
+- **Commit wake-ups and in-flight I/O (ADR-0032):**
+  - Group-commit wake-ups are handed off writer to writer (about 0.3 ms
+    mean at 128 writers on HW-REF-7); a single futex word is not
+    implemented.
+  - The per-device in-flight default (128) is not derived from a measured
+    queue depth.
+- **WAL v3 (ADR-0031):**
+  - A directory with a v3 WAL segment cannot be opened by releases older
+    than v3; use `wal_format_version = 2` for a rollback window.
+  - Columnar encoding and LZ4 add about 100 ns of ingest CPU per event.
+  - Replay still decodes into row events, because the memtable is row-based.
+- **Memory accounting (ADR-0030):**
+  - Sizes are estimates from metadata and approximate sizes, not exact
+    allocator figures; the RSS gap metric measures the difference.
+  - Queries cannot spill, so a query that needs more memory than its
+    limits fails.
+  - Decoded filters are tracked but cannot be evicted, so the cache share
+    is not enforced.
+  - Nothing is accounted to the control region.
+  - Segment-encoding buffers during flush are not reserved.
+  - Outside Linux, RSS is read with `ps`.
+- **Query log (ADR-0029):**
+  - Each tenant sees only its own entries; there is no cluster-admin view.
+  - Entries buffered within `query_log_flush_ms` are lost in a crash, and
+    entries are dropped (and counted) when the queue is full.
+  - The query log is not included in backups.
+  - The fingerprint re-tokenizes the query, about 1.75 µs.
+  - There are no per-operator row estimates (SYS-12-004).
+- **Architecture (ADR-0028):**
+  - `stratadb-query` still holds both the executor (L3) and the
+    parser/planner (L4).
+  - Column batches are row-major `Value` vectors: no physical-typed
+    vectors, null bitmaps or selection vectors.
+  - Memtable chunks are never pruned.
+  - There are no standalone L1 microbenchmarks.
 - Only developer-laptop (HW-REF-7) measurements exist (`benchmarks/reports/`). **No performance claims are made**, and there are no competitor comparisons. No spec Part VIII level is achieved (RELEASE_DECLARATION.md).
 - Of the 416 spec Part VIII–IX requirements, most are MISSING
   (PERF_INVENTORY.md; phase plan in ADR-0026).
@@ -78,13 +120,18 @@
   aggregate queries are parallel (ADR-0006); unsorted `LIMIT` scans, the
   memtable and the final merge are sequential; float `sum`/`avg` may differ in
   the last bits from a sequential scan. Whole-map predicates (`attributes = …`) use the scalar path. Memtable
-  snapshots copy `Arc` handles of the tenant's rows (O(memtable rows) per query).
-- Segment reads go through the I/O engine and a bounded file cache
-  (ADR-0027). **Writes do not yet.** The segment writer, WAL appends and
-  fsync, and manifest commits use `std::fs`, tested with failpoints and the
-  power-loss recorder. WAL replay also reads directly. There is no io_uring
-  backend and no in-flight I/O bound (STRATA-SYS-04-008). Every WAL file
-  keeps a descriptor.
+  snapshots copy chunk pointers (O(chunks), ADR-0033). Memtable chunks prune by time and
+  severity only (no Bloom or key filters), and flush materializes each tenant's rows for the
+  segment writer.
+- Group commit is adaptive (one fsync in flight per WAL). Waking the
+  writers of a group uses a condition variable's `notify_all`, not O(1)
+  syscalls (STRATA-SYS-07-006). The fsync latency and arrival-rate
+  estimates are per process and start cold after a restart.
+- Storage file data (segments, WAL, manifest, backups) is read and written
+  through the I/O engine (ADR-0027). Only the portable `pread`/`pwrite`
+  backend exists: no io_uring and no in-flight I/O bound
+  (STRATA-SYS-04-008). Namespace operations (rename, directory fsync,
+  unlink) go through `fsutil`. Every open WAL file keeps a descriptor.
 - `strata doctor` has no cluster connectivity or peer clock-skew checks
   (single node); its memory check is an upper bound on engine budgets, not a
   measurement; `--deep` costs a full scan.

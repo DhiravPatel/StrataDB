@@ -1,0 +1,9 @@
+per query: best-of-3 run medians (process CPU ms and wall ms), rows scanned, memtable chunk windows pruned
+  m01_trace_id_lookup    cpu   6.300 ->   5.389 (  1.2x)  wall   6.299 ->   5.390  rows_scanned 60000 -> 60000  pruned 0  same_results True
+  m02_recent_errors      cpu   4.928 ->   1.563 (  3.2x)  wall   4.927 ->   1.562  rows_scanned 50000 -> 17296  pruned 13  same_results True
+  m03_old_time_range     cpu   2.741 ->   0.874 (  3.1x)  wall   2.743 ->   0.874  rows_scanned 50000 -> 16384  pruned 14  same_results True
+  m04_service_count      cpu   2.712 ->   2.221 (  1.2x)  wall   2.711 ->   2.220  rows_scanned 60000 -> 60000  pruned 0  same_results True
+  m05_fatal_only         cpu   3.417 ->   2.887 (  1.2x)  wall   3.417 ->   2.889  rows_scanned 60000 -> 59808  pruned 2  same_results True
+  m06_limit_scan         cpu   0.744 ->   0.575 (  1.3x)  wall   0.744 ->   0.575  rows_scanned 20 -> 20  pruned 0  same_results True
+dataset load base: events/s [62482, 61952, 62175] cpu ns/event [1802, 1777, 1741]
+dataset load columnar: events/s [61729, 60195, 62663] cpu ns/event [1848, 1874, 2078]

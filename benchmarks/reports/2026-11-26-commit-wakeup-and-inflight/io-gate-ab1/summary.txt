@@ -1,0 +1,17 @@
+best-of-3 run medians, process CPU ms: base / gates / ratio  (plans identical)
+  q01_trace_id_lookup                 2.833    2.888  1.019  True
+  q02_request_id_lookup               1.649    1.711  1.037  True
+  q03_recent_errors                   1.471    1.531  1.041  True
+  q04_service_severity                4.801    5.335  1.111  True
+  q05_time_range_scan                 1.324    1.340  1.012  True
+  q06_message_token_search           11.099   11.226  1.011  True
+  q07_attribute_equality              6.445    6.388  0.991  True
+  q08_high_cardinality_agg            3.906    3.997  1.023  True
+  q09_service_time_bucket             4.335    4.373  1.009  True
+  q10_top_error_codes                27.058   27.889  1.031  True
+  q12_historical_wide_range           2.581    2.688  1.042  True
+  q13_absent_substring_search         0.003    0.002  0.667  True
+geomean (excl. q13): 1.029
+A/A spread within base (max/min), median over queries: 1.161
+dataset load base: events/s [49734, 50301, 50259] cpu ns/event [4516, 4803, 4797]
+dataset load gates: events/s [51461, 45375, 51019] cpu ns/event [4652, 7080, 5093]

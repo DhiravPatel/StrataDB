@@ -54,10 +54,72 @@ pool replacing per-query threads (STRATA-SYS-01-010/006). **Done**: shared
 inventory, budget, `sx-blk` pool, `/api/v1/admin/threads`) is **done** too.
 P1-3 (read path: I/O
 engine, segment file cache, sim faults, ADR-0027) is **done**. P1-4 (`strata
-doctor host`, shipped sysctl.d and tuned profiles) is **done**. Next is
-P1-5: adaptive group-commit delay (STRATA-SYS-07-004; measure fsync latency
-and arrival rate, flush immediately when idle). Then P1-3b: routing writes
-through `IoEngine`. Run benchmarks in the foreground (efficiency-core pitfall).
+doctor host`, shipped sysctl.d and tuned profiles) is **done**. P1-5 (adaptive group commit, `strata doctor storage`) is **done**: +50%
+ingest throughput, and commit wait close to fsync latency. P1-3b (the write path through `IoEngine`, write-fault tests) is **done**.
+A0-1 is **done**:
+- `scripts/check_layers.py` checks the crate graph against
+  `docs/architecture/layers.toml` in check.sh and CI;
+- the executor reads only through `stratadb_storage::ScanSource` (ADR-0028).
+
+A0-2 is **done** (ADR-0029):
+- `SELECT ... FROM system.query_log` returns the tenant's own queries;
+- entries live in a second engine at `<data_dir>/system/query_log`, recorded
+  without blocking (a bounded queue, writer `sx-maint-02`);
+- each entry has a fingerprint, `cpu_us` and the phase timings;
+- the timing headers are `x-stratadb-*-us`.
+
+`execute` takes a `Catalog`, and a bare `Snapshot` still works.
+
+P1-6 is **done** (ADR-0030):
+- the memory tracker hierarchy lives in `stratadb_common::memory`;
+- the server's regions are in `apps/stratadb-server/src/memory.rs`;
+- `EngineOptions.memory` / `cache_memory` / `background_memory` attach the
+  engine, and `QueryOptions.memory` / `memory_wait` attach queries;
+- the bench's `[engine] memory_accounting` toggle is there for A/B runs.
+
+P1-7 is **done** (ADR-0031): WAL v3 writes columnar, LZ4-compressed batch
+payloads (record types 3–4; `stratadb_schema::columnar`).
+- `[storage] wal_format_version = 2` keeps the row format for a rollback
+  window.
+- Fixtures: `tests/fixtures/wal-v3` and `storage-wal-v3`.
+- Measured: 3.3× fewer WAL bytes and +19% ingest CPU, with LZ4 the bulk of
+  it.
+
+P1-8 is **done** (ADR-0032):
+- **One fsync in flight per WAL:** a rotation-during-sync bug was found and
+  fixed.
+- **Wake-ups:** broadcast and sharded designs were measured slower, so
+  parking_lot is kept and the wake histogram is new.
+- **In-flight I/O:** a per-device gate (`io_max_inflight_per_device`).
+
+The harness is `crates/stratadb-wal/tests/commit_wakeup.rs`. When
+benchmarking, check `uptime` and the top processes first: external load
+invalidated one A/B this session.
+
+Phase 10 is complete apart from ☐ follow-ups.
+
+A1-1 is **done** (ADR-0033): a columnar memtable.
+- Column chunks with a published row count, snapshots at O(chunks), and
+  zone-map pruning (`QueryStats.memory_chunks_pruned`).
+- Replay goes straight into columns.
+- Benchmark: `benchmarks/scenarios/memtable.toml`. The dataset knobs
+  `max_flushes` and `final_flush` keep rows unflushed.
+
+A1-2 is **done** (ADR-0034):
+- **`StrColumn`:** plain or dictionary.
+- **Kernels:** the dictionary filter and group-key kernels.
+- **Selections:** per-chunk selections (`Selected`) and the `count(*)` fast
+  path.
+
+Evidence for changes like this one comes from the ledger (`strata-bench
+ledger --path X --write`, interleaved base and new runs); it is far steadier
+than the scenarios.
+
+**Next is A1-3**: state-machine metrics `strata_state_seconds` (ARCH-22-*).
+
+Before benchmarking, check `uptime`: this session saw external load as high
+as 88 and a machine sleep. Disk is tight: `target/debug/incremental` grew to
+20 GB and was cleared. Run benchmarks in the foreground (efficiency-core pitfall).
 
 ## Exact next tasks (priority order)
 1. Query execution follow-ups: intra-segment parallelism; row-selective

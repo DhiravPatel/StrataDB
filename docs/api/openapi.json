@@ -747,6 +747,28 @@
         ],
         "x-permission": "cluster.read"
       }
+    },
+    "/api/v1/admin/memory": {
+      "get": {
+        "summary": "Memory budget, regions (control, ingest, cache, background, query) and the live accounting tree with per-tenant and per-query usage (spec VIII.5.2)",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-permission": "cluster.read"
+      }
     }
   }
 }

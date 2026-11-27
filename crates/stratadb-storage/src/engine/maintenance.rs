@@ -57,6 +57,8 @@ pub struct CompactionReport {
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub obsolete_deleted: usize,
+    /// Groups postponed because the background memory region was full.
+    pub deferred_for_memory: usize,
 }
 
 /// Result of [`Shared::upgrade`].
@@ -120,6 +122,27 @@ struct Rewritten {
     rows_dropped: u64,
 }
 
+/// Memory a rewrite holds: every input row decoded (encoded payload with
+/// header overhead, plus the row structs).
+fn rewrite_memory_estimate(inputs: &[Arc<SegmentHandle>]) -> u64 {
+    inputs
+        .iter()
+        .map(|h| {
+            let f = h.reader.footer();
+            let payload: u64 = f.columns.iter().map(|c| c.raw_len).sum::<u64>()
+                + f.shredded.iter().map(|c| c.raw_len).sum::<u64>();
+            payload.saturating_mul(3).saturating_add(
+                f.row_count
+                    .saturating_mul(std::mem::size_of::<StoredRow>() as u64),
+            )
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+fn is_memory_limit(e: &Error) -> bool {
+    e.to_string().contains("MEMORY_LIMIT_EXCEEDED")
+}
+
 impl Shared {
     /// Rewrite `inputs` (one tenant, all currently committed) into at most one
     /// segment holding the rows for which `keep` is true. Caller holds the
@@ -142,6 +165,16 @@ impl Shared {
                 "rewrite inputs must be committed segments of one tenant",
             ));
         }
+        // Every input row is held in memory during the rewrite: reserve it on
+        // the background region first (spec VIII.5.2 merge_memory_limit).
+        let _mem = match &self.opts.background_memory {
+            Some(t) => Some(stratadb_common::memory::Reservation::new(
+                t,
+                rewrite_memory_estimate(inputs),
+                Duration::ZERO,
+            )?),
+            None => None,
+        };
         let mut rows: Vec<StoredRow> = Vec::new();
         let mut metas = Vec::new();
         for h in inputs {
@@ -174,7 +207,8 @@ impl Shared {
                 .collect();
             let extensions = self.segment_extensions(&refs, &metas);
             let created_ms = now_ms;
-            let ws = stratadb_segment::write_segment_sealed(
+            let ws = stratadb_segment::write_segment_io(
+                &*self.opts.io_engine(),
                 &path,
                 id,
                 tenant,
@@ -210,7 +244,7 @@ impl Shared {
                 self.keys.as_deref(),
                 &self.opts.io_engine(),
             ) {
-                Ok(h) => h,
+                Ok(h) => h.tracked(self.opts.cache_memory.as_ref()),
                 Err(e) => {
                     let _ = fsutil::remove_if_exists(&path);
                     return Err(e);
@@ -226,7 +260,7 @@ impl Shared {
                 id: h.entry.id,
                 tenant: tenant.clone(),
             }));
-        if let Err(e) = next.commit(&self.dir, self.keys.as_deref()) {
+        if let Err(e) = next.commit_with(&self.dir, self.keys.as_deref(), &*self.opts.io_engine()) {
             let e = Error::indeterminate(format!("manifest commit failed during rewrite: {e}"));
             self.fail(&e);
             return Err(e);
@@ -288,7 +322,7 @@ impl Shared {
         let mut next = man.clone();
         next.version += 1;
         next.obsolete_segments.retain(|o| !gone.contains(&o.id));
-        if let Err(e) = next.commit(&self.dir, self.keys.as_deref()) {
+        if let Err(e) = next.commit_with(&self.dir, self.keys.as_deref(), &*self.opts.io_engine()) {
             let e = Error::indeterminate(format!("manifest commit failed after deletion: {e}"));
             self.fail(&e);
             return Err(e);
@@ -349,7 +383,15 @@ impl Shared {
                 tracing::warn!(error = %e, "skipping compaction: not enough disk space");
                 continue;
             }
-            let r = self.rewrite(&mut man, &tenant, &group, &|_| true)?;
+            let r = match self.rewrite(&mut man, &tenant, &group, &|_| true) {
+                Ok(r) => r,
+                Err(e) if e.kind() == ErrorKind::ResourceExhausted && is_memory_limit(&e) => {
+                    tracing::debug!(error = %e, "compaction deferred: background memory is full");
+                    report.deferred_for_memory += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             report.groups += 1;
             report.inputs += group.len();
             report.rows += r.rows_kept;
@@ -494,7 +536,7 @@ impl Shared {
                 next.retention.remove(tenant);
             }
         }
-        if let Err(e) = next.commit(&self.dir, self.keys.as_deref()) {
+        if let Err(e) = next.commit_with(&self.dir, self.keys.as_deref(), &*self.opts.io_engine()) {
             let e = Error::indeterminate(format!("manifest commit failed: {e}"));
             self.fail(&e);
             return Err(e);

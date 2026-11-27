@@ -22,6 +22,8 @@ jobs:
       # Modules for the official-OTel-exporter interop test (built offline in the test).
       - run: cd tools/otlp-interop && go mod download
       - run: cargo fmt --all -- --check
+      - name: layer check (STRATA-ARCH-01-002)
+        run: python3 scripts/check_layers.py --self-test && python3 scripts/check_layers.py
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes crash matrix, power-loss model, restore drills, stable mutation fuzzing,
       # and Rust/Python/Go SDK conformance against a real server.

@@ -13,6 +13,14 @@
    interrupted run can simply be re-run).
 7. Start the server with the new binary; check `/api/v1/ready` and `strata doctor`.
 
+**Keeping a rollback window (WAL).** Since WAL v3 (columnar payloads),
+releases that predate it cannot open a directory that holds a v3 WAL segment.
+To upgrade with a way back:
+1. Set `[storage] wal_format_version = 2` before starting the new binary.
+   It then writes v2 WAL segments, which the old binary reads.
+2. Once the upgrade is final, remove the setting (or set it to 3) and
+   restart. New WAL segments are v3 from then on.
+
 **Rollback:** older binaries cannot read segments in newer formats. Roll back by
 stopping the server and `strata backup restore /backups/pre-upgrade --data-dir NEW`
 with the old binary, accepting the loss of writes made after the backup.

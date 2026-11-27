@@ -25,9 +25,8 @@ evidence = "apps/stratadb-bench/src/scenario.rs load_dataset label"
 note = "bulk loads are labelled burst / not publishable; no sustained mode spanning compaction cycles yet"
 
 [req."STRATA-SYS-01-007"]
-status = "PARTIAL"
-evidence = "crates/stratadb-query/src/exec.rs QueryStats.parse/plan; apps/stratadb-server/src/lib.rs (stats.plan_us/exec_us/queue_us, `query` log line); tests/http.rs"
-note = "no system.query_log table yet; reported in API response, query log line and strata_query_stage_seconds"
+status = "IMPLEMENTED"
+evidence = "system.query_log attributes plan_us / exec_us (apps/stratadb-server/src/query_log.rs Entry::to_event); also response stats, x-stratadb-plan-us header, query log line, strata_query_stage_seconds; tests/query_log.rs"
 
 [req."STRATA-SYS-01-009"]
 status = "PARTIAL"
@@ -143,8 +142,8 @@ evidence = "crates/stratadb-common/src/fsutil.rs atomic_write/fsync_dir; docs/te
 
 [req."STRATA-SYS-02-035"]
 status = "PARTIAL"
-evidence = "crates/stratadb-query QueryOptions.max_memory_bytes (queries fail with resource_exhausted)"
-note = "estimates, not a tracker hierarchy (VIII.5)"
+evidence = "tracker hierarchy (crates/stratadb-common/src/memory.rs; ADR-0030): queries fail with MEMORY_LIMIT_EXCEEDED at the query, tenant or pool limit, ingest writes stall then fail before the WAL append, all within a budget of 0.80 x the cgroup/physical limit; tests in query/storage/server tests/memory.rs"
+note = "estimated sizes, not allocator-exact; decoded filters are tracked without a limit (not evictable); untracked memory is measured (strata_memory_untracked_bytes) but not bounded"
 
 [req."STRATA-SYS-02-038"]
 status = "PARTIAL"
@@ -208,10 +207,6 @@ evidence = "crates/stratadb-wal (u64 sequence numbers; durable prefix); crates/s
 status = "PARTIAL"
 evidence = "crc32c crate (SSE4.2 / ARMv8 CRC with software fallback); perf/cpr_ledger.toml crc32c entry"
 note = "throughput target unverified (HW-REF-7 only)"
-
-[req."STRATA-SYS-07-005"]
-status = "IMPLEMENTED"
-evidence = "crates/stratadb-wal/src/lib.rs wait_durable (single leader fsync); test concurrent_sync_appends"
 
 [req."STRATA-SYS-07-009"]
 status = "IMPLEMENTED"
@@ -294,6 +289,29 @@ status = "PARTIAL"
 evidence = "docs/adr/0026-performance-architecture-adoption.md; recent work (pruning, projection, raw group keys) followed it"
 note = "process rule, not mechanically checked"
 
+[req."STRATA-ARCH-01-001"]
+status = "IMPLEMENTED"
+evidence = "docs/architecture/layers.toml (layer of every crate); scripts/check_layers.py rejects upward and skip-level edges; one spec-sanctioned exception (server -> storage, IX.1.4 INSERT flow); stratadb_storage::scan::ScanSource is defined in L2 and consumed by L3"
+
+[req."STRATA-ARCH-01-002"]
+status = "IMPLEMENTED"
+evidence = "scripts/check_layers.py (cargo metadata graph vs layers.toml; 10 self-tests incl. upward, skip-level, forbidden, root and stale-rule cases) run by scripts/check.sh and the CI check job"
+note = "a Python checker beside spec_inventory.py rather than a Rust xtask crate (no extra build on the gate)"
+
+[req."STRATA-ARCH-01-003"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-storage/src/scan.rs (ScanSource for segments and memtable chunks: prune, read -> ColumnBatch; tenant re-check); stratadb-query has no segment/WAL dependency (forbidden in layers.toml); tests/scan_source.rs; report 2026-11-26-scan-source-seam (identical plans, no measurable cost)"
+
+[req."STRATA-ARCH-01-004"]
+status = "PARTIAL"
+evidence = "layers.toml: stratadb-common, -crypto and -schema depend on nothing above L1 (checked)"
+note = "no standalone L1 microbenchmarks yet; fuzz targets live in a harness that links every layer"
+
+[req."STRATA-ARCH-11-001"]
+status = "PARTIAL"
+evidence = "crates/stratadb-schema/src/column.rs: ColumnId, ColumnData, Scope, RawValues, EventColumns, StrColumn (plain / dictionary, Arc'd immutable buffers) used by segment, storage and query; no other crate defines a column type; ADR-0034"
+note = "numeric and value columns are still Vec-based; no null bitmap for values; no vector pool"
+
 [req."STRATA-ARCH-01-005"]
 status = "IMPLEMENTED"
 evidence = "single strata-server process; no helper processes (deployments/)"
@@ -357,10 +375,9 @@ note = "no per-function associativity/commutativity property tests"
 
 # ---------------------------------------------------------------- P1-3 --
 [req."STRATA-SYS-04-001"]
-status = "PARTIAL"
-evidence = "crates/stratadb-common/src/io.rs (IoEngine submit/complete); segment, manifest and backup reads routed (crates/stratadb-segment/src/lib.rs open_with_io, storage manifest/backup); clippy disallowed_methods in crates/stratadb-{segment,storage,query}/clippy.toml"
-note = "write path (segment writer, WAL, manifest commit) and WAL replay reads not yet routed (ADR-0027)"
-
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-common/src/io.rs (IoEngine submit/complete reads, WriteFile writes); WAL appends/fsync/rotation/truncation/replay, segment writes, manifest commits, backup copies routed (ADR-0027 update 2026-11-26); clippy disallowed_methods for reads and writes in crates/stratadb-{wal,segment,storage,query}/clippy.toml"
+note = "namespace operations (rename, directory fsync, unlink) go through fsutil by design; the advisory LOCK file is opened directly"
 [req."STRATA-SYS-04-009"]
 status = "IMPLEMENTED"
 evidence = "crates/stratadb-common/src/io.rs read_loop (short reads resubmitted; EOF only at the known length; a file that shrank is an error) and write_all_at; tests short_reads_are_resubmitted_and_eio_is_retried_once, io_faults::read_faults_are_retried_resubmitted_or_reported"
@@ -454,3 +471,101 @@ note = "the scheduler does not use SMT sibling topology"
 [req."STRATA-SYS-02-013"]
 status = "IMPLEMENTED"
 evidence = "turbo state in doctor host and benchmark manifests (apps/stratadb-bench/src/manifest.rs)"
+
+# ---------------------------------------------------------------- P1-5 --
+[req."STRATA-SYS-07-004"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-wal/src/lib.rs gather (EWMA arrival rate x EWMA fsync latency < 1 -> no wait; else <= min(fsync latency, max_delay), early exit at the previous group size or group_bytes); tests adaptive_group_commit::*; report 2026-11-26-adaptive-group-commit (1.5x throughput, p50 5.9-6.4 -> 3.6-3.9 ms at low rate)"
+
+[req."STRATA-SYS-07-008"]
+status = "IMPLEMENTED"
+evidence = "apps/stratadb-cli/src/doctor_storage.rs (strata doctor storage: 4 KiB write + fdatasync x N, p50/p99/max, implied commit rate); test measures_and_cleans_up"
+note = "named `doctor storage --dir` (no wal_dir setting exists: the WAL lives in <data-dir>/wal)"
+
+# ---------------------------------------------------------------- A0-2 --
+[req."STRATA-SYS-11-006"]
+status = "IMPLEMENTED"
+evidence = "queue_us (wait for an sx-blk worker) separate from exec_us in system.query_log, the response body and the x-stratadb-queue-us header (also on error responses); apps/stratadb-server/src/lib.rs query_inner; tests/query_log.rs"
+
+[req."STRATA-SYS-13-009"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-query/src/fingerprint.rs (token-normalized: literals -> ?, lists collapsed, subscript keys kept, case/whitespace/comments ignored; FNV-1a 64, pinned); stored per entry in system.query_log with cpu_us (executing thread + scan-pool helpers); top-N by CPU per fingerprint via SELECT ... GROUP BY attributes['fingerprint']; tests fingerprint::tests, tests/query_log.rs"
+
+# ---------------------------------------------------------------- P1-6 --
+[req."STRATA-SYS-02-029"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-common/src/memory.rs detect_memory_limit (cgroup v2 memory.max / v1 limit_in_bytes, else physical memory); apps/stratadb-server/src/memory.rs MemorySettings::plan (budget = max_server_memory_ratio, default 0.80, or max_server_memory_bytes); startup log and GET /api/v1/admin/memory; unit tests"
+
+[req."STRATA-SYS-05-005"]
+status = "PARTIAL"
+evidence = "column batches are reserved before they are read (ScanSource::estimated_read_bytes, exec Ctx::scan); ingest batches before the WAL append (Engine::reserve_ingest); compaction rewrites before reading inputs; leaf-to-root all-or-nothing reservations (MemoryTracker::try_reserve); tests query/storage tests/memory.rs"
+note = "batch sizes are metadata estimates; result rows and aggregation groups are reserved at budget checks after they grow (batched), not before each allocation; segment encoding buffers during flush are not reserved"
+
+[req."STRATA-SYS-05-006"]
+status = "IMPLEMENTED"
+evidence = "stratadb_common::memory::Accountant: each scan worker reserves in 1 MiB batches (exact near a limit), touching shared atomics only when crossing a batch; error bounded by 1 MiB x workers; 1 ns per in-batch update (primitive_cost); tests accountant_batches_and_enforces_usage_not_batches"
+note = "per worker context rather than a thread_local, which gives the same bound without a global per-thread registry"
+
+[req."STRATA-SYS-05-007"]
+status = "PARTIAL"
+evidence = "on a failed reservation a query waits up to memory_wait_timeout_ms ([memory], default 0 = fail fast), then fails with MEMORY_LIMIT_EXCEEDED naming the tracker path, requested bytes, usage, limit and the top 5 consumers (other tenants shown as <other>); tests memory::tests, query tests/memory.rs, server tests/memory.rs"
+note = "no spill-capable operators exist yet (step 1); the error kind is resource_exhausted with MEMORY_LIMIT_EXCEEDED in the message"
+
+[req."STRATA-SYS-05-009"]
+status = "IMPLEMENTED"
+evidence = "apps/stratadb-server/src/memory.rs ServerMemory::sample every 10 s (RSS from /proc/self/statm, ps elsewhere): strata_memory_resident_bytes, strata_memory_untracked_bytes, warning when untracked > untracked_warn_ratio of RSS (64 MiB floor) or > 4 GiB, at most every 5 min; tests"
+
+[req."STRATA-ARCH-01-006"]
+status = "PARTIAL"
+evidence = "separate regions under the process budget: control, ingest (memtables), cache (filters), background (rewrites), query pool (tenants -> queries); a runaway query is refused at its query/tenant/pool node and cannot take ingest memory (storage tests/memory.rs replayed_rows_are_tracked_and_regions_are_independent)"
+note = "the control region is reserved but nothing is accounted to it yet (catalog, sessions); cache is tracked without enforcing its share"
+
+# ---------------------------------------------------------------- P1-7 --
+[req."STRATA-SYS-07-002"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-schema/src/columnar.rs (columnar batch v1, LZ4 >= 16 KiB; decode_columns); WAL v3 record types 3-4; replay appends EventColumns straight into memtable column chunks (engine.rs open, Memtable::insert_columns) with no row intermediate; fixtures wal-v3, storage-wal-v3; reports 2026-11-26-columnar-wal, 2026-11-27-columnar-memtable"
+
+# ---------------------------------------------------------------- P1-8 --
+[req."STRATA-SYS-07-005"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-wal/src/lib.rs append: rotation waits until no sync leader runs (one fsync in flight per WAL); test crates/stratadb-wal/tests/commit_wakeup.rs one_fsync_in_flight_and_groups_are_shared (found 2 before the fix, 1 after); ADR-0032"
+
+[req."STRATA-SYS-07-006"]
+status = "PARTIAL"
+evidence = "parking_lot notify_all: the sync leader makes one wake call per group, waiters are handed off in user space; commit_wake_seconds histogram (strata_wal_commit_wake_seconds); broadcast and sharded designs measured slower (report 2026-11-26-commit-wakeup-and-inflight)"
+note = "total wake-ups are still N (one hand-off per waiter); a futex-word design with decoupled leader election needs measurement on HW-REF-1"
+
+[req."STRATA-SYS-04-008"]
+status = "PARTIAL"
+evidence = "crates/stratadb-common/src/io.rs DeviceGates: every pread/pwrite/fsync of PreadEngine holds a per-device permit ([storage] io_max_inflight_per_device, default 128); per-worker in-flight is 1 by construction (synchronous backend); tests device_gate_bounds_concurrent_calls, engine_reads_writes_and_syncs_share_the_device_bound; strata_io_inflight* metrics"
+note = "the default is fixed at 128, not derived from a measured saturation queue depth; an async backend must add a per-worker bound"
+
+# ------------------------------------------------------------- A1-1 --
+[req."STRATA-ARCH-02-012"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-storage/src/memtable.rs: per-tenant append-only column chunks (atomics / write-once cells), capacity doubling 64 -> 65,536 then a new chunk; no per-row node allocation; tests rows_round_trip_across_growing_chunks; ADR-0033"
+
+[req."STRATA-ARCH-02-013"]
+status = "PARTIAL"
+evidence = "scan::MemChunk: chunk windows scanned as tiny unsorted parts through ScanSource, pruned by per-chunk zone maps (min/max event time, min/max seq, severity set) widened on append; QueryStats.memory_chunks_pruned; benchmarks/scenarios/memtable.toml asserts pruning; report 2026-11-27-columnar-memtable (3.1-3.2x on time/severity filters)"
+note = "zone maps are updated per row with atomic min/max, not vectorized; no key or Bloom filters per chunk"
+
+[req."STRATA-ARCH-02-014"]
+status = "IMPLEMENTED"
+evidence = "engine.rs freeze_active: std::mem::replace of the active Arc<Memtable> (O(1)); FrozenMemtable wraps the frozen memtable, read by flush and snapshots concurrently"
+
+[req."STRATA-ARCH-04-002"]
+status = "PARTIAL"
+evidence = "memtable.rs TenantMem: writer stores cells then published.store(rows, Release); readers load(Acquire) and read only [0, rows); test concurrent_readers_see_whole_batches"
+note = "the published count is per tenant (making multi-chunk batches atomic); readers take the tenant map and chunk-list reader locks once per snapshot to copy pointers (no lock per row or chunk)"
+
+# ------------------------------------------------------------- A1-2 --
+[req."STRATA-ARCH-03-005"]
+status = "PARTIAL"
+evidence = "StrColumn buffers are reference-counted and immutable (O(1) clone); segment OptStr/DictStr decode without per-row allocation; ADR-0034, report 2026-11-27-typed-columns-selection"
+note = "numeric/value columns are owned Vecs; no vector pool; no operator slices batches yet, so zero-copy slicing is not exercised"
+
+[req."STRATA-ARCH-03-006"]
+status = "PARTIAL"
+evidence = "exec.rs Ctx::select / Selected: per-chunk selections (dense range or indices) from the vectorized filter and page bound; downstream work visits selected rows only, rows are never compacted; global count(*) adds selection sizes; tests: query equivalence suites, pagination; ledger count 2.01x"
+note = "the selection lives within one operator (no multi-operator pipeline yet, ARCH-03-001); no compaction threshold because nothing compacts"

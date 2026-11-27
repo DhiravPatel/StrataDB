@@ -30,6 +30,14 @@ stages are not lost.
 | `strata_insert_stage_seconds{stage}` | in pipeline order: `auth`, `decode` (body decompress, UTF-8, JSON framing), `validate` (event mapping and limits), `admission` (flush-backlog backpressure wait), `wal_encode` (batch encoding), `wal_append` (frame + CRC + write, including WAL lock wait), `group_commit_wait` (written → durable; sync modes), `memtable_insert`, `ack` (response construction). Server stages cover `/api/v1/ingest`; engine stages cover every write path |
 | `strata_query_stage_seconds{stage}` | `queue` (waiting for an execution thread), `parse`, `plan`, `exec`, `serialize`; successful queries only |
 
+## Group commit
+`strata_wal_group_delay_seconds` (µs buckets) is the time the WAL sync leader
+waited to gather a group. With adaptive group commit it is about 0 at low
+load and at most min(fsync latency, max delay) under load. Read it together
+with `stratadb_wal_group_commit_records` (group size) and
+`stratadb_wal_sync_seconds` (fsync latency). `strata doctor storage --dir
+<data>/wal` measures the device's fdatasync latency directly.
+
 ## Storage I/O (spec STRATA-SYS-04-001, 02-037; ADR-0027)
 | Series | Meaning |
 |--------|---------|
@@ -82,6 +90,42 @@ histogram_quantile(0.99, rate(stratadb_ingest_ack_seconds_bucket{endpoint="inges
 histogram_quantile(0.95, rate(stratadb_query_seconds_bucket[5m]))
 rate(stratadb_wal_group_commit_records_sum[5m]) / rate(stratadb_wal_group_commit_records_count[5m])
 ```
+
+## In-flight I/O (spec STRATA-SYS-04-008)
+| Series | Meaning |
+|--------|---------|
+| `strata_io_max_inflight_per_device` | the per-device limit |
+| `strata_io_inflight` | I/O calls in flight now |
+| `strata_io_inflight_peak` | highest in flight on one device since start (at the limit = the bound binds) |
+| `strata_io_inflight_waits_total` | calls that waited for a permit |
+
+`strata_wal_commit_wake_seconds` (histogram): the time from a group commit's
+durability being published to a covered writer resuming. It grows with the
+number of concurrent writers (ADR-0032).
+
+## WAL volume
+| Series | Meaning |
+|--------|---------|
+| `strata_wal_bytes_total` | WAL frame bytes appended (headers + payloads); divide by events for bytes per event (about 70 B with WAL v3 on the app-logs profile, about 230 B with v2) |
+| `strata_wal_records_total` | WAL records appended (one per committed batch) |
+
+## Memory (spec VIII.5.2, ADR-0030)
+| Series | Meaning |
+|--------|---------|
+| `strata_memory_tracked_bytes{region}` | bytes reserved now, by region: `control`, `ingest`, `cache`, `background`, `query` |
+| `strata_memory_limit_bytes{region}` | each region's limit (`cache` is a target share, not enforced) |
+| `strata_memory_peak_bytes{region}` | peak reserved since start |
+| `strata_memory_budget_bytes` | process budget (`max_server_memory`) |
+| `strata_memory_resident_bytes` | RSS at the last 10 s sample |
+| `strata_memory_untracked_bytes` | RSS not covered by tracked memory. Alert when it grows: untracked memory is what gets a process OOM-killed |
+
+## Query log (`system.query_log`)
+| Series | Meaning |
+|--------|---------|
+| `strata_query_log_entries_total` | queries recorded (ok and failed) |
+| `strata_query_log_written_total` | entries written to storage |
+| `strata_query_log_dropped_total` | entries dropped because the queue was full (alert if it grows) |
+| `strata_query_log_write_errors_total` | entries lost to storage write errors, e.g. a full disk |
 
 ## Query counters
 | Series | Meaning |

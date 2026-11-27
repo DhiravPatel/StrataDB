@@ -102,15 +102,34 @@ pub struct IoStats {
     pub syncs: u64,
     /// Descriptor budget of the file cache (0 = not applicable).
     pub max_open_files: u64,
+    /// I/O calls allowed in flight per device (0 = not bounded; spec
+    /// STRATA-SYS-04-008).
+    pub max_inflight_per_device: u64,
+    /// I/O calls in flight now, all devices.
+    pub inflight: u64,
+    /// Highest number in flight on any one device.
+    pub inflight_peak: u64,
+    /// Calls that waited because their device was at the limit.
+    pub inflight_waits: u64,
 }
 
-/// A file being written.
-pub trait WriteFile: Send + std::fmt::Debug {
+/// A file being written. Methods take `&self`: positioned writes and
+/// fsync on one descriptor are safe from several threads (the WAL writes
+/// under its lock while the sync leader fsyncs without it).
+pub trait WriteFile: Send + Sync + std::fmt::Debug {
+    fn path(&self) -> &Path;
     /// Write some prefix of `data` at `offset`; returns bytes written
     /// (callers loop: see [`write_all_at`]).
-    fn write_at(&mut self, data: &[u8], offset: u64) -> Result<usize>;
-    /// Make every written byte durable (data and the length).
-    fn sync(&mut self) -> Result<()>;
+    fn write_at(&self, data: &[u8], offset: u64) -> Result<usize>;
+    /// Make written bytes durable: data only (`fdatasync`) or data and
+    /// metadata (`fsync`).
+    fn sync(&self, data_only: bool) -> Result<()>;
+    /// Truncate or extend to `len` bytes (not durable until [`Self::sync`]).
+    fn set_len(&self, len: u64) -> Result<()>;
+    fn len(&self) -> Result<u64>;
+    fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
 }
 
 /// The storage I/O interface (STRATA-SYS-04-001).
@@ -122,9 +141,14 @@ pub trait IoEngine: Send + Sync + std::fmt::Debug {
     fn submit(&self, reqs: Vec<ReadReq>) -> Submission;
     /// Wait for a submission; one result per request, in order.
     fn complete(&self, s: Submission) -> Vec<Result<Vec<u8>>>;
-    /// Create (or truncate) `path` for writing.
-    fn create(&self, path: &Path) -> Result<Box<dyn WriteFile>>;
+    /// Create `path`, which must not exist (owner-only permissions).
+    fn create_new(&self, path: &Path) -> Result<Arc<dyn WriteFile>>;
+    /// Open an existing `path` for writing.
+    fn open_write(&self, path: &Path) -> Result<Arc<dyn WriteFile>>;
     fn stats(&self) -> IoStats;
+    /// Drop any cached descriptor of `file` (after one-shot whole-file reads,
+    /// so a later unlink frees the space immediately).
+    fn forget(&self, _file: &FileRef) {}
 }
 
 /// Random-access read source (used by layered formats such as sealed
@@ -208,20 +232,56 @@ pub fn read_exact_at(
         .unwrap_or_else(|| Err(Error::internal("I/O engine returned no completion")))
 }
 
+/// Crash-safe replace of `path` with `contents` through `io`: write a
+/// temporary file, fsync it, rename it over `path`, fsync the directory
+/// (STRATA-SYS-02-020). Failpoints `<prefix>::before_rename` and
+/// `<prefix>::after_rename` mark the crash points, as in
+/// [`crate::fsutil::atomic_write`].
+pub fn atomic_write(
+    io: &dyn IoEngine,
+    path: &Path,
+    contents: &[u8],
+    failpoint_prefix: &str,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::internal(format!("{} has no parent", path.display())))?;
+    let tmp = crate::fsutil::tmp_path(path);
+    crate::fsutil::remove_if_exists(&tmp)?;
+    let f = io.create_new(&tmp)?;
+    write_all_at(&*f, contents, 0)?;
+    f.sync(false)?;
+    drop(f);
+    crate::failpoint::hit(&format!("{failpoint_prefix}::before_rename"))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        Error::io(
+            format!("renaming {} to {}", tmp.display(), path.display()),
+            e,
+        )
+    })?;
+    crate::failpoint::hit(&format!("{failpoint_prefix}::after_rename"))?;
+    crate::fsutil::fsync_dir(parent)
+}
+
 /// Read a whole file (small metadata files: manifests, backup manifests).
 pub fn read_file(io: &dyn IoEngine, path: &Path) -> Result<Vec<u8>> {
     let f = io.open(path)?;
     let len = usize::try_from(f.len()).map_err(|_| Error::invalid_input("file too large"))?;
-    read_exact_at(io, &f, 0, len)
+    let r = read_exact_at(io, &f, 0, len);
+    io.forget(&f);
+    r
 }
 
 /// Write all of `data` at `offset`, resubmitting after short writes.
-pub fn write_all_at(f: &mut dyn WriteFile, data: &[u8], offset: u64) -> Result<()> {
+pub fn write_all_at(f: &dyn WriteFile, data: &[u8], offset: u64) -> Result<()> {
     let mut done = 0usize;
     while done < data.len() {
         let n = f.write_at(&data[done..], offset + done as u64)?;
         if n == 0 {
-            return Err(Error::new(ErrorKind::Io, "write made no progress"));
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!("write to {} made no progress", f.path().display()),
+            ));
         }
         done += n;
     }
@@ -327,8 +387,119 @@ impl Counters {
             writes: l(&self.writes),
             bytes_written: l(&self.bytes_written),
             syncs: l(&self.syncs),
-            max_open_files: 0,
+            ..IoStats::default()
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In-flight bound per device (STRATA-SYS-04-008)
+
+/// Default bound on I/O calls in flight per device. Typical NVMe saturates
+/// at a queue depth of 128-256; the portable backend issues one call per
+/// thread, so it binds only with many concurrent threads.
+pub const DEFAULT_MAX_INFLIGHT_PER_DEVICE: usize = 128;
+
+/// Counting gate per device (`st_dev`): an I/O call holds a permit while it
+/// runs. Below the limit a permit is one compare-and-swap and its release
+/// one atomic subtraction; the mutex and condition variable are used only
+/// while a caller waits.
+#[derive(Debug)]
+struct DeviceGates {
+    limit: usize,
+    gates: Mutex<HashMap<u64, Arc<Gate>>>,
+    inflight: AtomicU64,
+    peak: AtomicU64,
+    waits: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct Gate {
+    /// Permits held.
+    n: AtomicU64,
+    /// Callers waiting for a permit (releasers notify only when > 0).
+    waiters: AtomicU64,
+    lock: Mutex<()>,
+    cv: std::sync::Condvar,
+}
+
+impl Gate {
+    fn try_take(&self, limit: u64) -> bool {
+        let mut cur = self.n.load(Ordering::SeqCst);
+        while cur < limit {
+            match self
+                .n
+                .compare_exchange_weak(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return true,
+                Err(now) => cur = now,
+            }
+        }
+        false
+    }
+}
+
+/// A permit; released on drop.
+struct Permit<'a> {
+    gate: Arc<Gate>,
+    owner: &'a DeviceGates,
+}
+
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        self.owner.inflight.fetch_sub(1, Ordering::Relaxed);
+        self.gate.n.fetch_sub(1, Ordering::SeqCst);
+        // SeqCst pairs with the waiter's increment of `waiters` before its
+        // re-check: either it sees this release or this sees it waiting.
+        if self.gate.waiters.load(Ordering::SeqCst) > 0 {
+            drop(self.gate.lock.lock().unwrap_or_else(|e| e.into_inner()));
+            self.gate.cv.notify_one();
+        }
+    }
+}
+
+impl DeviceGates {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            gates: Mutex::new(HashMap::new()),
+            inflight: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            waits: AtomicU64::new(0),
+        }
+    }
+
+    fn gate(&self, dev: u64) -> Arc<Gate> {
+        let mut g = self.gates.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(g.entry(dev).or_default())
+    }
+
+    /// Wait until `gate` has room, then take a permit.
+    fn acquire(&self, gate: &Arc<Gate>) -> Permit<'_> {
+        let limit = self.limit as u64;
+        if !gate.try_take(limit) {
+            self.waits.fetch_add(1, Ordering::Relaxed);
+            let mut g = gate.lock.lock().unwrap_or_else(|e| e.into_inner());
+            gate.waiters.fetch_add(1, Ordering::SeqCst);
+            while !gate.try_take(limit) {
+                g = gate.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+            gate.waiters.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.peak
+            .fetch_max(gate.n.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.inflight.fetch_add(1, Ordering::Relaxed);
+        Permit {
+            gate: Arc::clone(gate),
+            owner: self,
+        }
+    }
+
+    fn fill(&self, s: &mut IoStats) {
+        s.max_inflight_per_device = self.limit as u64;
+        s.inflight = self.inflight.load(Ordering::Relaxed);
+        s.inflight_peak = self.peak.load(Ordering::Relaxed);
+        s.inflight_waits = self.waits.load(Ordering::Relaxed);
     }
 }
 
@@ -341,6 +512,8 @@ pub struct PreadEngine {
     max_open: usize,
     cache: Mutex<FdCache>,
     stats: Counters,
+    wstats: Arc<Counters>,
+    gates: Arc<DeviceGates>,
 }
 
 #[derive(Debug, Default)]
@@ -383,17 +556,40 @@ fn is_emfile(e: &std::io::Error) -> bool {
 }
 
 impl PreadEngine {
-    /// An engine keeping at most `max_open_files` files open (at least 8).
+    /// An engine keeping at most `max_open_files` files open (at least 8),
+    /// with [`DEFAULT_MAX_INFLIGHT_PER_DEVICE`] calls in flight per device.
     pub fn new(max_open_files: usize) -> Self {
+        Self::with_inflight_limit(max_open_files, DEFAULT_MAX_INFLIGHT_PER_DEVICE)
+    }
+
+    /// Like [`PreadEngine::new`] with at most `max_inflight_per_device` I/O
+    /// calls (reads, writes, fsyncs) in flight on each device (at least 1).
+    pub fn with_inflight_limit(max_open_files: usize, max_inflight_per_device: usize) -> Self {
         Self {
             max_open: max_open_files.max(8),
             cache: Mutex::new(FdCache::default()),
             stats: Counters::default(),
+            wstats: Arc::new(Counters::default()),
+            gates: Arc::new(DeviceGates::new(max_inflight_per_device)),
         }
     }
 
     pub fn max_open_files(&self) -> usize {
         self.max_open
+    }
+
+    fn write_file(&self, f: File, path: &Path) -> Result<Arc<dyn WriteFile>> {
+        let dev = f
+            .metadata()
+            .map_err(|e| Error::io(format!("stat {}", path.display()), e))?
+            .dev();
+        Ok(Arc::new(PwriteFile {
+            f,
+            path: path.to_path_buf(),
+            stats: Arc::clone(&self.wstats),
+            gate: self.gates.gate(dev),
+            gates: Arc::clone(&self.gates),
+        }))
     }
 
     /// `File::open` that recovers from descriptor exhaustion by closing
@@ -478,17 +674,30 @@ impl IoEngine for PreadEngine {
 
     fn submit(&self, reqs: Vec<ReadReq>) -> Submission {
         // Portable backend: the batch completes on the submitting thread.
+        let mut last_gate: Option<(u64, Arc<Gate>)> = None;
         let results = reqs
             .into_iter()
             .map(|q| {
                 let f = self.file(&q.file)?;
+                // Usually one device per batch: look its gate up once.
+                let gate = match &last_gate {
+                    Some((dev, g)) if *dev == q.file.dev => Arc::clone(g),
+                    _ => {
+                        let g = self.gates.gate(q.file.dev);
+                        last_gate = Some((q.file.dev, Arc::clone(&g)));
+                        g
+                    }
+                };
                 read_loop(
                     &q.file.path,
                     q.file.len,
                     q.offset,
                     q.len,
                     &self.stats,
-                    |b, o| f.read_at(b, o),
+                    |b, o| {
+                        let _permit = self.gates.acquire(&gate);
+                        f.read_at(b, o)
+                    },
                 )
             })
             .collect();
@@ -499,17 +708,27 @@ impl IoEngine for PreadEngine {
         s.results
     }
 
-    fn create(&self, path: &Path) -> Result<Box<dyn WriteFile>> {
+    fn forget(&self, file: &FileRef) {
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .files
+            .remove(file);
+    }
+
+    fn create_new(&self, path: &Path) -> Result<Arc<dyn WriteFile>> {
+        // Through fsutil: owner-only mode, and the power-loss recorder
+        // (`simfs`) sees the new inode.
+        let f = crate::fsutil::create_new_file(path)?;
+        self.write_file(f, path)
+    }
+
+    fn open_write(&self, path: &Path) -> Result<Arc<dyn WriteFile>> {
         let f = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
             .open(path)
-            .map_err(|e| Error::io(format!("creating {}", path.display()), e))?;
-        Ok(Box::new(PwriteFile {
-            f,
-            path: path.to_path_buf(),
-        }))
+            .map_err(|e| Error::io(format!("opening {} for writing", path.display()), e))?;
+        self.write_file(f, path)
     }
 
     fn stats(&self) -> IoStats {
@@ -521,6 +740,11 @@ impl IoEngine for PreadEngine {
             .len() as u64;
         let mut s = self.stats.snapshot(open);
         s.max_open_files = self.max_open as u64;
+        self.gates.fill(&mut s);
+        let w = self.wstats.snapshot(0);
+        s.writes = w.writes;
+        s.bytes_written = w.bytes_written;
+        s.syncs = w.syncs;
         s
     }
 }
@@ -529,23 +753,52 @@ impl IoEngine for PreadEngine {
 struct PwriteFile {
     f: File,
     path: PathBuf,
+    stats: Arc<Counters>,
+    gate: Arc<Gate>,
+    gates: Arc<DeviceGates>,
 }
 
 impl WriteFile for PwriteFile {
-    fn write_at(&mut self, data: &[u8], offset: u64) -> Result<usize> {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn write_at(&self, data: &[u8], offset: u64) -> Result<usize> {
+        let _permit = self.gates.acquire(&self.gate);
         loop {
             match self.f.write_at(data, offset) {
-                Ok(n) => return Ok(n),
+                Ok(n) => {
+                    self.stats.writes.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .bytes_written
+                        .fetch_add(n as u64, Ordering::Relaxed);
+                    return Ok(n);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(Error::io(format!("writing {}", self.path.display()), e)),
             }
         }
     }
 
-    fn sync(&mut self) -> Result<()> {
-        self.f
-            .sync_all()
+    fn sync(&self, data_only: bool) -> Result<()> {
+        // Through fsutil so the power-loss recorder observes every fsync.
+        let _permit = self.gates.acquire(&self.gate);
+        self.stats.syncs.fetch_add(1, Ordering::Relaxed);
+        crate::fsutil::sync_file(&self.f, &self.path, data_only)
             .map_err(|e| Error::io(format!("fsync {}", self.path.display()), e))
+    }
+
+    fn set_len(&self, len: u64) -> Result<()> {
+        self.f
+            .set_len(len)
+            .map_err(|e| Error::io(format!("truncating {}", self.path.display()), e))
+    }
+
+    fn len(&self) -> Result<u64> {
+        self.f
+            .metadata()
+            .map(|m| m.len())
+            .map_err(|e| Error::io(format!("stat {}", self.path.display()), e))
     }
 }
 
@@ -586,6 +839,24 @@ pub fn nofile_soft_limit() -> Option<u64> {
 
 static DEFAULT: OnceLock<Arc<dyn IoEngine>> = OnceLock::new();
 static CONFIGURED_MAX_OPEN: OnceLock<usize> = OnceLock::new();
+static CONFIGURED_MAX_INFLIGHT: OnceLock<usize> = OnceLock::new();
+
+/// Set the default engine's in-flight bound per device before its first use.
+pub fn configure_max_inflight_per_device(n: usize) -> Result<()> {
+    if n == 0 {
+        return Err(Error::invalid_input(
+            "max_inflight_per_device must be at least 1",
+        ));
+    }
+    if DEFAULT.get().is_some() {
+        return Err(Error::invalid_input(
+            "the I/O engine already started; set max_inflight_per_device before opening data",
+        ));
+    }
+    CONFIGURED_MAX_INFLIGHT
+        .set(n)
+        .map_err(|_| Error::invalid_input("max_inflight_per_device already configured"))
+}
 
 /// Default descriptor budget: 50% of the soft `RLIMIT_NOFILE`
 /// (STRATA-SYS-02-037), at least 64.
@@ -613,7 +884,11 @@ pub fn default_io() -> Arc<dyn IoEngine> {
             .get()
             .copied()
             .unwrap_or_else(default_max_open_files);
-        Arc::new(PreadEngine::new(max))
+        let inflight = CONFIGURED_MAX_INFLIGHT
+            .get()
+            .copied()
+            .unwrap_or(DEFAULT_MAX_INFLIGHT_PER_DEVICE);
+        Arc::new(PreadEngine::with_inflight_limit(max, inflight))
     }))
 }
 
@@ -640,14 +915,20 @@ pub enum Fault {
 }
 
 #[derive(Debug, Clone)]
+enum Op {
+    Write(u64, Vec<u8>),
+    SetLen(u64),
+}
+
+#[derive(Debug, Clone)]
 struct SimFile {
     ino: u64,
     /// What reads see (page cache).
     data: Vec<u8>,
     /// What survives a crash.
     durable: Vec<u8>,
-    /// Writes since the last successful fsync, in order.
-    pending: Vec<(u64, Vec<u8>)>,
+    /// Writes and truncations since the last successful fsync, in order.
+    pending: Vec<Op>,
 }
 
 #[derive(Debug, Default)]
@@ -762,15 +1043,20 @@ impl SimIo {
                 pending.swap(i, j);
             }
             let keep = (next() % (pending.len() as u64 + 1)) as usize;
-            for (k, (off, data)) in pending.into_iter().take(keep).enumerate() {
-                let torn = k + 1 == keep && next() % 2 == 0;
-                let n = if torn {
-                    let sectors = data.len().div_ceil(SECTOR);
-                    ((next() % sectors as u64) as usize * SECTOR).min(data.len())
-                } else {
-                    data.len()
-                };
-                apply(&mut img, off, &data[..n]);
+            for (k, op) in pending.into_iter().take(keep).enumerate() {
+                match op {
+                    Op::Write(off, data) => {
+                        let torn = k + 1 == keep && next() % 2 == 0;
+                        let n = if torn {
+                            let sectors = data.len().div_ceil(SECTOR);
+                            ((next() % sectors as u64) as usize * SECTOR).min(data.len())
+                        } else {
+                            data.len()
+                        };
+                        apply(&mut img, off, &data[..n]);
+                    }
+                    Op::SetLen(len) => img.resize(len as usize, 0),
+                }
             }
             f.data = img.clone();
             f.durable = img;
@@ -862,9 +1148,26 @@ impl IoEngine for SimIo {
         s.results
     }
 
-    fn create(&self, path: &Path) -> Result<Box<dyn WriteFile>> {
+    fn create_new(&self, path: &Path) -> Result<Arc<dyn WriteFile>> {
+        if self.lock().files.contains_key(path) {
+            return Err(Error::io(format!("creating {}", path.display()), os(17)));
+        }
         self.put(path, &[]);
-        Ok(Box::new(SimWriteFile {
+        // A new inode's durable content is empty.
+        if let Some(f) = self.lock().files.get_mut(path) {
+            f.durable.clear();
+        }
+        Ok(Arc::new(SimWriteFile {
+            sim: self.clone(),
+            path: path.to_path_buf(),
+        }))
+    }
+
+    fn open_write(&self, path: &Path) -> Result<Arc<dyn WriteFile>> {
+        if !self.lock().files.contains_key(path) {
+            return Err(Error::io(format!("opening {}", path.display()), os(2)));
+        }
+        Ok(Arc::new(SimWriteFile {
             sim: self.clone(),
             path: path.to_path_buf(),
         }))
@@ -883,7 +1186,11 @@ struct SimWriteFile {
 }
 
 impl WriteFile for SimWriteFile {
-    fn write_at(&mut self, data: &[u8], offset: u64) -> Result<usize> {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn write_at(&self, data: &[u8], offset: u64) -> Result<usize> {
         self.sim.spike(&self.path);
         let fault = self.sim.take(&self.path, |f| {
             matches!(f, Fault::ShortWrite | Fault::Enospc)
@@ -904,7 +1211,7 @@ impl WriteFile for SimWriteFile {
             .get_mut(&self.path)
             .ok_or_else(|| Error::io(format!("writing {}", self.path.display()), os(2)))?;
         apply(&mut f.data, offset, &data[..n]);
-        f.pending.push((offset, data[..n].to_vec()));
+        f.pending.push(Op::Write(offset, data[..n].to_vec()));
         self.sim.stats.writes.fetch_add(1, Ordering::Relaxed);
         self.sim
             .stats
@@ -913,7 +1220,7 @@ impl WriteFile for SimWriteFile {
         Ok(n)
     }
 
-    fn sync(&mut self) -> Result<()> {
+    fn sync(&self, _data_only: bool) -> Result<()> {
         self.sim.spike(&self.path);
         let eio = self
             .sim
@@ -934,20 +1241,43 @@ impl WriteFile for SimWriteFile {
         // Only writes since the last sync become durable: data whose fsync
         // failed was dropped by the kernel and is not written by a later,
         // successful fsync (it stays visible until a crash).
-        for (off, data) in std::mem::take(&mut f.pending) {
-            apply(&mut f.durable, off, &data);
+        for op in std::mem::take(&mut f.pending) {
+            match op {
+                Op::Write(off, data) => apply(&mut f.durable, off, &data),
+                Op::SetLen(len) => f.durable.resize(len as usize, 0),
+            }
         }
         Ok(())
+    }
+
+    fn set_len(&self, len: u64) -> Result<()> {
+        let mut st = self.sim.lock();
+        let f = st
+            .files
+            .get_mut(&self.path)
+            .ok_or_else(|| Error::io(format!("truncating {}", self.path.display()), os(2)))?;
+        f.data.resize(len as usize, 0);
+        f.pending.push(Op::SetLen(len));
+        Ok(())
+    }
+
+    fn len(&self) -> Result<u64> {
+        let st = self.sim.lock();
+        st.files
+            .get(&self.path)
+            .map(|f| f.data.len() as u64)
+            .ok_or_else(|| Error::io(format!("stat {}", self.path.display()), os(2)))
     }
 }
 
 // ---------------------------------------------------------------------------
 // Fault decorator
 
-/// Injects read faults ([`Fault::ShortRead`], [`Fault::ReadEio`],
-/// [`Fault::LatencySpike`]) into reads of any engine, for tests of upper
-/// layers whose writes still go to disk. The same retry and resubmission
-/// loop as the backends handles the injected faults.
+/// Injects faults into any engine, for tests of upper layers on a real
+/// file system: reads ([`Fault::ShortRead`], [`Fault::ReadEio`],
+/// [`Fault::LatencySpike`]) go through the same retry and resubmission loop
+/// as the backends; writes get [`Fault::ShortWrite`], [`Fault::Enospc`] and
+/// [`Fault::FsyncEio`]. Faults are scoped by path suffix.
 #[derive(Debug, Clone)]
 pub struct FaultyIo {
     inner: Arc<dyn IoEngine>,
@@ -962,8 +1292,8 @@ impl FaultyIo {
         }
     }
 
-    /// Inject `fault` into the next `times` reads of files whose path ends
-    /// with `suffix` (any file if `None`).
+    /// Inject `fault` into the next `times` matching operations on files
+    /// whose path ends with the string `suffix` (any file if `None`).
     pub fn inject(&self, suffix: Option<&str>, fault: Fault, times: usize) {
         self.faults
             .lock()
@@ -971,11 +1301,16 @@ impl FaultyIo {
             .push((suffix.map(PathBuf::from), fault, times));
     }
 
-    /// Take a scripted fault whose filter is a suffix of `path`.
+    /// Take a scripted fault whose filter is a string suffix of `path`
+    /// (`".log"`, `"MANIFEST.tmp"`, a file name).
     fn take(&self, path: &Path, want: impl Fn(Fault) -> bool) -> Option<Fault> {
         let mut st = self.faults.lock();
+        let full = path.to_string_lossy();
         let i = st.faults.iter().position(|(p, f, n)| {
-            *n > 0 && want(*f) && p.as_deref().is_none_or(|p| path.ends_with(p))
+            *n > 0
+                && want(*f)
+                && p.as_deref()
+                    .is_none_or(|p| full.ends_with(&*p.to_string_lossy()))
         })?;
         let f = st.faults[i].1;
         st.faults[i].2 -= 1;
@@ -993,6 +1328,10 @@ impl IoEngine for FaultyIo {
 
     fn open(&self, path: &Path) -> Result<FileRef> {
         self.inner.open(path)
+    }
+
+    fn forget(&self, file: &FileRef) {
+        self.inner.forget(file);
     }
 
     fn submit(&self, reqs: Vec<ReadReq>) -> Submission {
@@ -1028,14 +1367,78 @@ impl IoEngine for FaultyIo {
         s.results
     }
 
-    fn create(&self, path: &Path) -> Result<Box<dyn WriteFile>> {
-        self.inner.create(path)
+    fn create_new(&self, path: &Path) -> Result<Arc<dyn WriteFile>> {
+        Ok(Arc::new(FaultyWriteFile {
+            inner: self.inner.create_new(path)?,
+            io: self.clone(),
+        }))
+    }
+
+    fn open_write(&self, path: &Path) -> Result<Arc<dyn WriteFile>> {
+        Ok(Arc::new(FaultyWriteFile {
+            inner: self.inner.open_write(path)?,
+            io: self.clone(),
+        }))
     }
 
     fn stats(&self) -> IoStats {
-        let mut s = self.faults.stats.snapshot(self.inner.stats().files_open);
-        s.opens = self.inner.stats().opens;
+        let inner = self.inner.stats();
+        let mut s = self.faults.stats.snapshot(inner.files_open);
+        s.opens = inner.opens;
+        s.writes = inner.writes;
+        s.bytes_written = inner.bytes_written;
+        s.syncs = inner.syncs;
+        s.max_open_files = inner.max_open_files;
         s
+    }
+}
+
+/// Write side of [`FaultyIo`]: [`Fault::ShortWrite`], [`Fault::Enospc`] and
+/// [`Fault::FsyncEio`] (the fsync is not performed: the data is not durable).
+#[derive(Debug)]
+struct FaultyWriteFile {
+    inner: Arc<dyn WriteFile>,
+    io: FaultyIo,
+}
+
+impl WriteFile for FaultyWriteFile {
+    fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    fn write_at(&self, data: &[u8], offset: u64) -> Result<usize> {
+        let path = self.inner.path().to_path_buf();
+        if let Some(Fault::LatencySpike(d)) =
+            self.io.take(&path, |f| matches!(f, Fault::LatencySpike(_)))
+        {
+            std::thread::sleep(d);
+        }
+        match self
+            .io
+            .take(&path, |f| matches!(f, Fault::ShortWrite | Fault::Enospc))
+        {
+            Some(Fault::Enospc) => Err(Error::io(format!("writing {}", path.display()), os(28))),
+            Some(_) => self
+                .inner
+                .write_at(&data[..(data.len() / 2).max(1).min(data.len())], offset),
+            None => self.inner.write_at(data, offset),
+        }
+    }
+
+    fn sync(&self, data_only: bool) -> Result<()> {
+        let path = self.inner.path().to_path_buf();
+        if self.io.take(&path, |f| f == Fault::FsyncEio).is_some() {
+            return Err(Error::io(format!("fsync {}", path.display()), os(5)));
+        }
+        self.inner.sync(data_only)
+    }
+
+    fn set_len(&self, len: u64) -> Result<()> {
+        self.inner.set_len(len)
+    }
+
+    fn len(&self) -> Result<u64> {
+        self.inner.len()
     }
 }
 
@@ -1044,14 +1447,115 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    #[test]
+    fn device_gate_bounds_concurrent_calls() {
+        let g = Arc::new(DeviceGates::new(3));
+        let gate = g.gate(7);
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let (g, gate) = (Arc::clone(&g), Arc::clone(&gate));
+                std::thread::spawn(move || {
+                    for _ in 0..5 {
+                        let _p = g.acquire(&gate);
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let mut s = IoStats::default();
+        g.fill(&mut s);
+        assert_eq!(s.max_inflight_per_device, 3);
+        assert!(s.inflight_peak <= 3 && s.inflight_peak >= 2, "{s:?}");
+        assert!(s.inflight_waits > 0, "{s:?}");
+        assert_eq!(s.inflight, 0);
+        // Devices are independent.
+        let a = g.gate(1);
+        let b = g.gate(2);
+        let _pa = (g.acquire(&a), g.acquire(&a), g.acquire(&a));
+        let _pb = g.acquire(&b);
+    }
+
+    /// Cost of a permit next to the read it guards (run: `cargo test
+    /// --release -p stratadb-common --lib io::tests::gate_cost -- --ignored
+    /// --nocapture`).
+    #[test]
+    #[ignore = "measurement, not a check"]
+    fn gate_cost() {
+        let g = DeviceGates::new(128);
+        let gate = g.gate(1);
+        let n = 2_000_000u32;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(g.acquire(&gate));
+        }
+        let permit = t.elapsed().as_nanos() as f64 / f64::from(n);
+        let dir = tempfile::tempdir().unwrap();
+        let io = PreadEngine::new(16);
+        let path = dir.path().join("f");
+        let w = io.create_new(&path).unwrap();
+        write_all_at(&*w, &vec![7u8; 1 << 20], 0).unwrap();
+        let r = io.open(&path).unwrap();
+        let reads = 200_000u32;
+        let t = std::time::Instant::now();
+        for i in 0..reads {
+            let off = u64::from(i % 255) * 4096;
+            std::hint::black_box(read_exact_at(&io, &r, off, 4096).unwrap());
+        }
+        let read = t.elapsed().as_nanos() as f64 / f64::from(reads);
+        println!("permit acquire+release {permit:.1} ns; 4 KiB cached pread through the engine {read:.0} ns ({:.1}% of it)", permit / read * 100.0);
+    }
+
+    #[test]
+    fn engine_reads_writes_and_syncs_share_the_device_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = Arc::new(PreadEngine::with_inflight_limit(16, 1));
+        let path = dir.path().join("data");
+        let data: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        {
+            let f = io.create_new(&path).unwrap();
+            write_all_at(&*f, &data, 0).unwrap();
+            f.sync(true).unwrap();
+        }
+        let r = io.open(&path).unwrap();
+        let log = dir.path().join("log");
+        let w = io.create_new(&log).unwrap();
+        let readers: Vec<_> = (0..12)
+            .map(|t| {
+                let (io, r, data) = (Arc::clone(&io), r.clone(), data.clone());
+                std::thread::spawn(move || {
+                    for i in 0..200usize {
+                        let off = (t * 977 + i * 131) % (data.len() - 4096);
+                        let got = read_exact_at(&*io, &r, off as u64, 4096).unwrap();
+                        assert_eq!(got, &data[off..off + 4096]);
+                    }
+                })
+            })
+            .collect();
+        for i in 0..100u64 {
+            write_all_at(&*w, b"0123456789", i * 10).unwrap();
+            w.sync(true).unwrap();
+        }
+        for t in readers {
+            t.join().unwrap();
+        }
+        let s = io.stats();
+        assert_eq!(s.max_inflight_per_device, 1);
+        assert_eq!(s.inflight_peak, 1, "{s:?}");
+        assert_eq!(s.inflight, 0);
+        assert!(s.reads >= 2400 && s.syncs >= 100, "{s:?}");
+    }
+
     /// Behaviour every backend must share.
     fn conformance(io: &dyn IoEngine, dir: &Path) {
         let p = dir.join("f.bin");
         let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
-        let mut w = io.create(&p).unwrap();
-        write_all_at(w.as_mut(), &data[..6000], 0).unwrap();
-        write_all_at(w.as_mut(), &data[6000..], 6000).unwrap();
-        w.sync().unwrap();
+        let w = io.create_new(&p).unwrap();
+        write_all_at(&*w, &data[..6000], 0).unwrap();
+        write_all_at(&*w, &data[6000..], 6000).unwrap();
+        w.sync(false).unwrap();
         drop(w);
         let f = io.open(&p).unwrap();
         assert_eq!(f.len(), 10_000);
@@ -1075,6 +1579,17 @@ mod tests {
         }
         assert_eq!(read_file(io, &p).unwrap(), data);
         assert!(io.open(&dir.join("missing")).is_err());
+        // create_new refuses an existing file; open_write needs one.
+        assert!(io.create_new(&p).is_err());
+        assert!(io.open_write(&dir.join("missing")).is_err());
+        let w = io.open_write(&p).unwrap();
+        assert_eq!(w.len().unwrap(), 10_000);
+        write_all_at(&*w, b"tail", 10_000).unwrap();
+        w.set_len(5_000).unwrap();
+        w.sync(true).unwrap();
+        assert_eq!(w.len().unwrap(), 5_000);
+        drop(w);
+        assert_eq!(read_file(io, &p).unwrap(), &data[..5_000]);
         let s = io.stats();
         assert!(s.reads >= 8 && s.bytes_read >= 20_000 && s.syncs <= s.writes + 1);
     }
@@ -1164,26 +1679,26 @@ mod tests {
     fn write_faults_and_crash_semantics() {
         let io = SimIo::new();
         let p = Path::new("/sim/w");
-        let mut w = io.create(p).unwrap();
+        let w = io.create_new(p).unwrap();
         // Short writes are completed by write_all_at.
         io.inject(Some(p), Fault::ShortWrite, 3);
-        write_all_at(w.as_mut(), &[1u8; 2048], 0).unwrap();
+        write_all_at(&*w, &[1u8; 2048], 0).unwrap();
         assert_eq!(io.contents(p).unwrap(), vec![1u8; 2048]);
         // ENOSPC is an error.
         io.inject(Some(p), Fault::Enospc, 1);
-        let e = write_all_at(w.as_mut(), &[2u8; 10], 2048).unwrap_err();
+        let e = write_all_at(&*w, &[2u8; 10], 2048).unwrap_err();
         assert!(
             e.to_string().contains("28") || e.to_string().to_lowercase().contains("space"),
             "{e}"
         );
-        w.sync().unwrap();
+        w.sync(false).unwrap();
         // Unsynced writes: visible now, may vanish at a crash.
-        write_all_at(w.as_mut(), &[3u8; 1024], 2048).unwrap();
+        write_all_at(&*w, &[3u8; 1024], 2048).unwrap();
         assert_eq!(io.contents(p).unwrap().len(), 3072);
         // fsync EIO: reported once; the dirty data is gone after a crash.
         io.inject(Some(p), Fault::FsyncEio, 1);
-        assert!(w.sync().is_err());
-        assert!(w.sync().is_ok(), "the error is reported once");
+        assert!(w.sync(false).is_err());
+        assert!(w.sync(false).is_ok(), "the error is reported once");
         io.crash(1);
         assert_eq!(
             io.contents(p).unwrap(),
@@ -1204,11 +1719,11 @@ mod tests {
         for seed in 0..200 {
             let io = SimIo::new();
             let p = Path::new("/sim/c");
-            let mut w = io.create(p).unwrap();
-            write_all_at(w.as_mut(), &[1u8; 1024], 0).unwrap();
-            w.sync().unwrap();
-            write_all_at(w.as_mut(), &[2u8; 2048], 1024).unwrap();
-            write_all_at(w.as_mut(), &[3u8; 1024], 3072).unwrap();
+            let w = io.create_new(p).unwrap();
+            write_all_at(&*w, &[1u8; 1024], 0).unwrap();
+            w.sync(false).unwrap();
+            write_all_at(&*w, &[2u8; 2048], 1024).unwrap();
+            write_all_at(&*w, &[3u8; 1024], 3072).unwrap();
             io.crash(seed);
             let c = io.contents(p).unwrap();
             // Durable prefix always survives.
@@ -1221,11 +1736,11 @@ mod tests {
             outcomes.insert(c.len());
             // Deterministic per seed.
             let io2 = SimIo::new();
-            let mut w2 = io2.create(p).unwrap();
-            write_all_at(w2.as_mut(), &[1u8; 1024], 0).unwrap();
-            w2.sync().unwrap();
-            write_all_at(w2.as_mut(), &[2u8; 2048], 1024).unwrap();
-            write_all_at(w2.as_mut(), &[3u8; 1024], 3072).unwrap();
+            let w2 = io2.create_new(p).unwrap();
+            write_all_at(&*w2, &[1u8; 1024], 0).unwrap();
+            w2.sync(false).unwrap();
+            write_all_at(&*w2, &[2u8; 2048], 1024).unwrap();
+            write_all_at(&*w2, &[3u8; 1024], 3072).unwrap();
             io2.crash(seed);
             assert_eq!(io2.contents(p).unwrap(), c);
         }
@@ -1262,6 +1777,45 @@ mod tests {
             s.short_reads_resubmitted >= 4 && s.read_retries >= 2 && s.read_errors >= 1,
             "{s:?}"
         );
+    }
+
+    #[test]
+    fn atomic_write_through_the_engine_replaces_contents() {
+        let d = tempfile::tempdir().unwrap();
+        let io = PreadEngine::new(16);
+        let p = d.path().join("MANIFEST");
+        atomic_write(&io, &p, b"one", "t").unwrap();
+        atomic_write(&io, &p, b"two", "t").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"two");
+        assert!(!crate::fsutil::tmp_path(&p).exists());
+        assert!(io.stats().syncs >= 2 && io.stats().writes >= 2);
+    }
+
+    #[test]
+    fn faulty_write_side() {
+        let d = tempfile::tempdir().unwrap();
+        let io = FaultyIo::new(Arc::new(PreadEngine::new(16)));
+        let p = d.path().join("wal-1.log");
+        let w = io.create_new(&p).unwrap();
+        io.inject(Some("wal-1.log"), Fault::ShortWrite, 3);
+        write_all_at(&*w, &[7u8; 4096], 0).unwrap();
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            vec![7u8; 4096],
+            "short writes completed"
+        );
+        io.inject(Some("wal-1.log"), Fault::Enospc, 1);
+        let e = write_all_at(&*w, &[1u8; 10], 4096).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::ResourceExhausted, "{e}");
+        io.inject(Some("wal-1.log"), Fault::FsyncEio, 1);
+        assert_eq!(w.sync(true).unwrap_err().kind(), ErrorKind::Io);
+        w.sync(true).unwrap();
+        // atomic_write surfaces a failed fsync and leaves the target alone.
+        let m = d.path().join("MANIFEST");
+        atomic_write(&io, &m, b"v1", "t").unwrap();
+        io.inject(Some("MANIFEST.tmp"), Fault::FsyncEio, 1);
+        assert!(atomic_write(&io, &m, b"v2", "t").is_err());
+        assert_eq!(std::fs::read(&m).unwrap(), b"v1");
     }
 
     #[test]

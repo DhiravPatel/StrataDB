@@ -1,0 +1,64 @@
+== old group=
+writers   8: commit p50     353 us  p99     414 us  max     733 us  records/fsync   8.0  commits/s    23390
+writers  32: commit p50     502 us  p99     831 us  max    1205 us  records/fsync  30.5  commits/s    60625
+writers  64: commit p50     672 us  p99    1314 us  max    1579 us  records/fsync  47.8  commits/s    80980
+writers 128: commit p50    1085 us  p99    2261 us  max    3306 us  records/fsync  74.9  commits/s    99945
+test wakeup_latency_with_many_writers ... ok
+== final group=
+  wake (publish -> covered writer returns): n 3499 mean 26.5 us p50 <= 50 us p99 <= 100 us
+writers   8: commit p50     353 us  p99     429 us  max     720 us  records/fsync   8.0  commits/s    23305
+  wake (publish -> covered writer returns): n 3873 mean 105.3 us p50 <= 250 us p99 <= 250 us
+writers  32: commit p50     503 us  p99     711 us  max    1006 us  records/fsync  31.2  commits/s    62002
+  wake (publish -> covered writer returns): n 3888 mean 188.9 us p50 <= 250 us p99 <= 500 us
+writers  64: commit p50     677 us  p99    1310 us  max    1573 us  records/fsync  47.2  commits/s    80150
+  wake (publish -> covered writer returns): n 3912 mean 324.7 us p50 <= 500 us p99 <= 1000 us
+writers 128: commit p50    1093 us  p99    2306 us  max    3711 us  records/fsync  74.9  commits/s   102943
+test wakeup_latency_with_many_writers ... ok
+== old group=
+writers   8: commit p50     350 us  p99     423 us  max     576 us  records/fsync   8.0  commits/s    23727
+writers  32: commit p50     496 us  p99     701 us  max    1033 us  records/fsync  31.2  commits/s    63341
+writers  64: commit p50     677 us  p99    1316 us  max    1654 us  records/fsync  48.4  commits/s    82559
+writers 128: commit p50    1100 us  p99    2208 us  max    3058 us  records/fsync  77.8  commits/s   100539
+test wakeup_latency_with_many_writers ... ok
+== final group=
+  wake (publish -> covered writer returns): n 3499 mean 26.3 us p50 <= 25 us p99 <= 100 us
+writers   8: commit p50     352 us  p99     411 us  max     680 us  records/fsync   8.0  commits/s    23596
+  wake (publish -> covered writer returns): n 3872 mean 107.4 us p50 <= 250 us p99 <= 250 us
+writers  32: commit p50     500 us  p99     707 us  max     851 us  records/fsync  31.5  commits/s    63114
+  wake (publish -> covered writer returns): n 3887 mean 187.4 us p50 <= 250 us p99 <= 500 us
+writers  64: commit p50     666 us  p99    1313 us  max    1688 us  records/fsync  49.6  commits/s    82014
+  wake (publish -> covered writer returns): n 3915 mean 339.9 us p50 <= 500 us p99 <= 1000 us
+writers 128: commit p50    1108 us  p99    2200 us  max    2923 us  records/fsync  73.5  commits/s   101687
+test wakeup_latency_with_many_writers ... ok
+== old group=1
+writers   8: commit p50     350 us  p99     418 us  max     732 us  records/fsync   8.0  commits/s    23724
+writers  32: commit p50     495 us  p99     712 us  max    1107 us  records/fsync  31.2  commits/s    63389
+writers  64: commit p50     680 us  p99    1316 us  max    1616 us  records/fsync  47.8  commits/s    79955
+writers 128: commit p50    1050 us  p99    2195 us  max    3407 us  records/fsync  69.6  commits/s   105191
+test wakeup_latency_with_many_writers ... ok
+== final group=1
+  wake (publish -> covered writer returns): n 3499 mean 25.9 us p50 <= 25 us p99 <= 100 us
+writers   8: commit p50     353 us  p99     411 us  max     654 us  records/fsync   8.0  commits/s    23381
+  wake (publish -> covered writer returns): n 3872 mean 103.2 us p50 <= 100 us p99 <= 250 us
+writers  32: commit p50     499 us  p99     714 us  max    1079 us  records/fsync  31.0  commits/s    62115
+  wake (publish -> covered writer returns): n 3889 mean 191.0 us p50 <= 250 us p99 <= 500 us
+writers  64: commit p50     671 us  p99    1313 us  max    1642 us  records/fsync  49.6  commits/s    81727
+  wake (publish -> covered writer returns): n 3916 mean 346.4 us p50 <= 500 us p99 <= 1000 us
+writers 128: commit p50    1104 us  p99    2215 us  max    3176 us  records/fsync  77.8  commits/s   100834
+test wakeup_latency_with_many_writers ... ok
+== old group=1
+writers   8: commit p50     352 us  p99     416 us  max     541 us  records/fsync   8.0  commits/s    23610
+writers  32: commit p50     503 us  p99     716 us  max     855 us  records/fsync  31.5  commits/s    62487
+writers  64: commit p50     673 us  p99    1292 us  max    1547 us  records/fsync  49.6  commits/s    81129
+writers 128: commit p50    1093 us  p99    2188 us  max    3166 us  records/fsync  77.8  commits/s   100950
+test wakeup_latency_with_many_writers ... ok
+== final group=1
+  wake (publish -> covered writer returns): n 3499 mean 26.2 us p50 <= 25 us p99 <= 100 us
+writers   8: commit p50     353 us  p99     415 us  max     595 us  records/fsync   8.0  commits/s    23352
+  wake (publish -> covered writer returns): n 3872 mean 105.4 us p50 <= 250 us p99 <= 250 us
+writers  32: commit p50     498 us  p99     711 us  max     816 us  records/fsync  31.5  commits/s    63398
+  wake (publish -> covered writer returns): n 3889 mean 190.4 us p50 <= 250 us p99 <= 500 us
+writers  64: commit p50     685 us  p99    1345 us  max    1779 us  records/fsync  49.0  commits/s    81217
+  wake (publish -> covered writer returns): n 3918 mean 363.1 us p50 <= 500 us p99 <= 1000 us
+writers 128: commit p50    1105 us  p99    2253 us  max    2987 us  records/fsync  77.8  commits/s    98858
+test wakeup_latency_with_many_writers ... ok

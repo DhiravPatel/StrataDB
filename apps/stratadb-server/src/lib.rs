@@ -10,6 +10,8 @@ pub mod audit;
 pub mod auth;
 pub mod blocking;
 pub mod config;
+pub mod memory;
+pub mod query_log;
 pub mod telemetry;
 pub mod tls;
 
@@ -28,7 +30,7 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value as J};
 use stratadb_common::TenantId;
 use stratadb_common::{time, Error, ErrorKind};
-use stratadb_query::{execute, execute_page, Datum, PageRequest, QueryOptions};
+use stratadb_query::{execute, execute_page, Catalog, Datum, PageRequest, QueryOptions, Table};
 use stratadb_schema::json::event_from_json;
 use stratadb_schema::{Limits, Value};
 use stratadb_storage::RetentionPolicy;
@@ -71,6 +73,9 @@ pub struct TenantQuota {
     pub ingest_burst_events: Option<f64>,
     /// Segments + memtable bytes.
     pub storage_bytes: Option<u64>,
+    /// Memory all of the tenant's running queries may hold together (its
+    /// node in the query pool, spec VIII.5.2).
+    pub query_memory_bytes: Option<u64>,
 }
 
 /// Default quota plus per-tenant overrides (field-wise).
@@ -89,6 +94,7 @@ impl Quotas {
                 ingest_events_per_sec: o.ingest_events_per_sec.or(d.ingest_events_per_sec),
                 ingest_burst_events: o.ingest_burst_events.or(d.ingest_burst_events),
                 storage_bytes: o.storage_bytes.or(d.storage_bytes),
+                query_memory_bytes: o.query_memory_bytes.or(d.query_memory_bytes),
             },
         }
     }
@@ -133,6 +139,10 @@ pub struct AppState {
     audit: Option<Arc<audit::AuditLog>>,
     metrics: Arc<telemetry::ServerMetrics>,
     blk: Arc<blocking::BlockingPool>,
+    /// `system.query_log` (None: disabled).
+    query_log: Option<Arc<query_log::QueryLog>>,
+    /// Memory accounting tree (None: queries are accounted on their own).
+    memory: Option<Arc<memory::ServerMemory>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -264,8 +274,78 @@ impl AppState {
             cfg: Arc::new(cfg),
             audit: None,
             metrics: Arc::default(),
+            query_log: None,
+            memory: None,
         }
     }
+
+    /// Account queries in the server's memory tree (tenant and pool limits).
+    pub fn with_memory(mut self, m: Arc<memory::ServerMemory>) -> Self {
+        self.memory = Some(m);
+        self
+    }
+
+    /// Record every query in `system.query_log`.
+    pub fn with_query_log(mut self, log: Arc<query_log::QueryLog>) -> Self {
+        self.query_log = Some(log);
+        self
+    }
+}
+
+/// The tables of one tenant: `logs` and, when enabled, `system.query_log`.
+struct TenantCatalog {
+    tenant: TenantId,
+    engine: Arc<Engine>,
+    query_log: Option<Arc<query_log::QueryLog>>,
+}
+
+impl Catalog for TenantCatalog {
+    fn tenant(&self) -> &TenantId {
+        &self.tenant
+    }
+
+    fn snapshot(
+        &self,
+        table: Table,
+    ) -> stratadb_common::Result<std::borrow::Cow<'_, stratadb_storage::Snapshot>> {
+        use std::borrow::Cow;
+        match table {
+            Table::Logs => Ok(Cow::Owned(self.engine.snapshot(&self.tenant))),
+            Table::QueryLog => match &self.query_log {
+                Some(q) => Ok(Cow::Owned(q.engine().snapshot(&self.tenant))),
+                None => Err(Error::unsupported(
+                    "system.query_log is disabled ([observability] query_log = false)",
+                )),
+            },
+        }
+    }
+}
+
+/// Microseconds, for headers and logs.
+fn micros(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Query identity and timing headers (STRATA-SYS-11-006: `queue_us` in the
+/// response, not only the body).
+fn with_query_headers(
+    mut r: Response,
+    query_id: &str,
+    fp: &stratadb_query::Fingerprint,
+    timings: &[(&'static str, Duration)],
+) -> Response {
+    let h = r.headers_mut();
+    let mut put = |name: &'static str, v: String| {
+        if let Ok(v) = header::HeaderValue::from_str(&v) {
+            h.insert(name, v);
+        }
+    };
+    put("x-stratadb-query-id", query_id.to_owned());
+    put("x-stratadb-fingerprint", fp.hex());
+    for (name, d) in timings {
+        put(name, micros(*d).to_string());
+    }
+    r
 }
 
 /// Request correlation + access log (spec §25.2): assigns `x-request-id`
@@ -325,6 +405,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/admin/compaction", post(admin_compaction))
         .route("/api/v1/admin/backup", post(admin_backup))
         .route("/api/v1/admin/threads", get(admin_threads))
+        .route("/api/v1/admin/memory", get(admin_memory))
         .route(
             "/api/v1/retention",
             get(get_retention)
@@ -455,9 +536,11 @@ pub struct ThreadPlan {
 }
 
 /// Threads outside the configurable pools: the main thread, the engine's
-/// background thread (`sx-maint`), and up to 2 tokio blocking threads
-/// (`max_blocking_threads`; StrataDB itself runs blocking work on `sx-blk`).
-pub const FIXED_THREADS: usize = 4;
+/// background thread (`sx-maint-00`), the query log engine's background
+/// thread and writer (`sx-maint-01`, `-02`; counted even when the query log
+/// is disabled), and up to 2 tokio blocking threads (`max_blocking_threads`;
+/// StrataDB itself runs blocking work on `sx-blk`).
+pub const FIXED_THREADS: usize = 6;
 
 /// tokio blocking-pool threads allowed (counted in [`FIXED_THREADS`]).
 pub const TOKIO_BLOCKING_THREADS: usize = 2;
@@ -1019,6 +1102,7 @@ async fn query(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> R
 }
 
 async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let arrived = Instant::now();
     let principal = match authenticate(&st, &headers, Permission::Query) {
         Ok(p) => p,
         Err(r) => return r,
@@ -1032,9 +1116,6 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
     if req.database.as_deref().is_some_and(|d| d != "default") {
         return error_response(&Error::unsupported("only the `default` database exists"));
     }
-    let Ok(permit) = Arc::clone(&st.query_sem).try_acquire_owned() else {
-        return error_response(&Error::resource_exhausted("too many concurrent queries"));
-    };
     let timeout =
         Duration::from_millis(req.timeout_ms.unwrap_or(30_000)).min(st.cfg.max_query_timeout);
     let max_rows = req.max_rows.unwrap_or(10_000).min(st.cfg.max_query_rows);
@@ -1054,16 +1135,64 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
                 .finish()
         }),
     };
+    // From here every outcome is a query: it is recorded in system.query_log
+    // (STRATA-SYS-13-009) and its response carries the timing headers.
+    let fp = stratadb_query::fingerprint(&req.query);
+    let arrived_ns = time::now_unix_nanos();
+    let record = |status: &str,
+                  queue: Duration,
+                  serialize: Duration,
+                  stats: Option<&stratadb_query::QueryStats>,
+                  rows: u64| {
+        if let Some(q) = &st.query_log {
+            q.record(&query_log::Entry {
+                tenant: &principal.tenant,
+                started_unix_ns: arrived_ns,
+                query_id: &query_id,
+                fingerprint: &fp,
+                status,
+                queue,
+                elapsed: arrived.elapsed(),
+                serialize,
+                stats,
+                result_rows: rows,
+            });
+        }
+    };
+    let fail = |e: &Error, queue: Option<Duration>| {
+        record(
+            e.kind().as_str(),
+            queue.unwrap_or_default(),
+            Duration::ZERO,
+            None,
+            0,
+        );
+        let t: Vec<(&'static str, Duration)> = queue
+            .map(|q| ("x-stratadb-queue-us", q))
+            .into_iter()
+            .collect();
+        with_query_headers(error_response(e), &query_id, &fp, &t)
+    };
+    let Ok(permit) = Arc::clone(&st.query_sem).try_acquire_owned() else {
+        return fail(
+            &Error::resource_exhausted("too many concurrent queries"),
+            None,
+        );
+    };
     // Registry keys are global; scope them by tenant so ids cannot collide or leak.
     let key = format!("{}/{}", principal.tenant, query_id);
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let mut reg = st.running.lock().unwrap_or_else(|e| e.into_inner());
         if reg.contains_key(&key) {
-            return error_response(&Error::new(
-                ErrorKind::AlreadyExists,
-                "a query with this query_id is already running",
-            ));
+            drop(reg);
+            return fail(
+                &Error::new(
+                    ErrorKind::AlreadyExists,
+                    "a query with this query_id is already running",
+                ),
+                None,
+            );
         }
         reg.insert(
             key.clone(),
@@ -1079,36 +1208,56 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
         reg: Arc::clone(&st.running),
         id: key,
     };
-    let engine = Arc::clone(&st.engine);
-    let tenant = principal.tenant.clone();
+    let catalog = TenantCatalog {
+        tenant: principal.tenant.clone(),
+        engine: Arc::clone(&st.engine),
+        query_log: st.query_log.clone(),
+    };
     let started = Instant::now();
+    let sql = req.query.clone();
+    let memory = st.memory.as_ref().map(|m| {
+        (
+            m.query_parent(&principal.tenant, &query_id),
+            m.plan.per_query,
+            m.plan.wait,
+        )
+    });
     let res = st
         .blk
         .run(move || {
             let queued = started.elapsed();
             let _permit = permit;
             let _guard = guard;
-            let opts = QueryOptions {
+            let mut opts = QueryOptions {
                 timeout,
                 max_result_rows: max_rows,
                 cancel: Some(cancel),
                 ..QueryOptions::default()
             };
-            let snap = engine.snapshot(&tenant);
-            if req.page_size.is_some() || req.cursor.is_some() {
+            if let Some((parent, limit, wait)) = memory {
+                opts.memory = Some(parent);
+                opts.max_memory_bytes = usize::try_from(limit).unwrap_or(usize::MAX);
+                opts.memory_wait = wait;
+            }
+            let out = if req.page_size.is_some() || req.cursor.is_some() {
                 let page = PageRequest {
                     page_size: req.page_size.unwrap_or(max_rows).min(max_rows),
                     cursor: req.cursor,
                 };
-                execute_page(&snap, &req.query, &opts, &page)
-                    .map(|p| (p.output, p.next_cursor, queued))
+                execute_page(&catalog, &sql, &opts, &page).map(|p| (p.output, p.next_cursor))
             } else {
-                execute(&snap, &req.query, &opts).map(|o| (o, None, queued))
-            }
+                execute(&catalog, &sql, &opts).map(|o| (o, None))
+            };
+            Ok((queued, out))
         })
         .await;
+    let (queued, res) = match res {
+        Ok((queued, r)) => (Some(queued), r),
+        Err(e) => (None, Err(e)),
+    };
     match res {
-        Ok((out, next_cursor, queued)) => {
+        Ok((out, next_cursor)) => {
+            let queued = queued.unwrap_or_default();
             use telemetry::QueryStage;
             let serializing = Instant::now();
             st.metrics.query_work(&out.stats);
@@ -1136,7 +1285,9 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
                     "plan_us": us(s.plan), "exec_us": us(s.elapsed),
                     // Degree of parallelism (STRATA-SYS-11-008).
                     "scan_workers": s.scan_workers, "est_cpu_ms": s.est_cpu_ms,
+                    "cpu_us": us(s.cpu),
                 },
+                "fingerprint": fp.hex(),
             }))
             .into_response();
             let serialize = serializing.elapsed();
@@ -1149,17 +1300,32 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
             ] {
                 st.metrics.query_stage(stage, d);
             }
-            // Query log (no SQL text or values: they may carry tenant data).
+            // Query log line (no SQL text or values: they may carry tenant
+            // data; the fingerprint identifies the query shape).
             tracing::info!(
                 target: "query", query_id = %query_id, tenant = %principal.tenant,
+                fingerprint = %fp.hex(),
                 queue_us = us(queued) as u64, parse_us = us(s.parse) as u64,
                 plan_us = us(s.plan) as u64, exec_us = us(s.elapsed) as u64,
+                cpu_us = us(s.cpu) as u64,
                 serialize_us = us(serialize) as u64, rows_scanned = s.rows_scanned,
                 rows_returned = rows.len(), segment_bytes_read = s.bytes_read, "query"
             );
-            r
+            record("ok", queued, serialize, Some(s), rows.len() as u64);
+            with_query_headers(
+                r,
+                &query_id,
+                &fp,
+                &[
+                    ("x-stratadb-queue-us", queued),
+                    ("x-stratadb-parse-us", s.parse),
+                    ("x-stratadb-plan-us", s.plan),
+                    ("x-stratadb-exec-us", s.elapsed),
+                    ("x-stratadb-cpu-us", s.cpu),
+                ],
+            )
         }
-        Err(e) => error_response(&e),
+        Err(e) => fail(&e, queued),
     }
 }
 
@@ -1332,6 +1498,20 @@ async fn metrics(State(st): State<AppState>, headers: HeaderMap) -> Response {
         "",
         true,
     );
+    s.wal_metrics.group_delay_seconds.render(
+        &mut out,
+        "strata_wal_group_delay_seconds",
+        "Time the WAL sync leader waited to gather a group commit (adaptive, spec STRATA-SYS-07-004).",
+        "",
+        true,
+    );
+    s.wal_metrics.commit_wake_seconds.render(
+        &mut out,
+        "strata_wal_commit_wake_seconds",
+        "From a group commit's durability being published to a covered writer resuming (spec STRATA-SYS-07-006).",
+        "",
+        true,
+    );
     s.wal_metrics.group_size.render(
         &mut out,
         "stratadb_wal_group_commit_records",
@@ -1389,6 +1569,49 @@ async fn metrics(State(st): State<AppState>, headers: HeaderMap) -> Response {
              # TYPE strata_blocking_pool_rejected_total counter\nstrata_blocking_pool_rejected_total {}\n",
             b.workers, b.max_workers, b.busy, b.queued, b.rejected
         ));
+    }
+    if let Some(m) = &st.memory {
+        m.render(&mut out);
+    }
+    {
+        let w = &st.engine.stats().wal;
+        out.push_str(&format!(
+            "# HELP strata_wal_bytes_total WAL frame bytes appended since start (headers + payloads).\n\
+             # TYPE strata_wal_bytes_total counter\nstrata_wal_bytes_total {}\n\
+             # HELP strata_wal_records_total WAL records appended since start.\n\
+             # TYPE strata_wal_records_total counter\nstrata_wal_records_total {}\n",
+            w.bytes_appended, w.records_appended
+        ));
+    }
+    if let Some(q) = &st.query_log {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = q.counters();
+        for (name, help, v) in [
+            (
+                "query_log_entries_total",
+                "Queries recorded for system.query_log.",
+                c.recorded.load(Relaxed),
+            ),
+            (
+                "query_log_written_total",
+                "Query log entries written to storage.",
+                c.written.load(Relaxed),
+            ),
+            (
+                "query_log_dropped_total",
+                "Query log entries dropped because the queue was full.",
+                c.dropped.load(Relaxed),
+            ),
+            (
+                "query_log_write_errors_total",
+                "Query log entries lost to storage write errors.",
+                c.write_errors.load(Relaxed),
+            ),
+        ] {
+            out.push_str(&format!(
+                "# HELP strata_{name} {help}\n# TYPE strata_{name} counter\nstrata_{name} {v}\n"
+            ));
+        }
     }
     let io = st.engine.io_stats();
     for (name, kind, help, v) in [
@@ -1452,6 +1675,30 @@ async fn metrics(State(st): State<AppState>, headers: HeaderMap) -> Response {
             "EMFILE on open recovered by closing cold files.",
             io.emfile_recoveries,
         ),
+        (
+            "io_max_inflight_per_device",
+            "gauge",
+            "I/O calls allowed in flight per device (STRATA-SYS-04-008).",
+            io.max_inflight_per_device,
+        ),
+        (
+            "io_inflight",
+            "gauge",
+            "I/O calls in flight now, all devices.",
+            io.inflight,
+        ),
+        (
+            "io_inflight_peak",
+            "gauge",
+            "Highest number of I/O calls in flight on one device since start.",
+            io.inflight_peak,
+        ),
+        (
+            "io_inflight_waits_total",
+            "counter",
+            "I/O calls that waited because their device was at its in-flight limit.",
+            io.inflight_waits,
+        ),
     ] {
         out.push_str(&format!(
             "# HELP strata_{name} {help}\n# TYPE strata_{name} {kind}\nstrata_{name} {v}\n"
@@ -1487,6 +1734,23 @@ pub fn parse_permissions(s: &str) -> stratadb_common::Result<BTreeSet<Permission
 
 // ---------------------------------------------------------------------------
 // Administration (spec §2.4, §16, §19)
+
+/// `GET /api/v1/admin/memory` (cluster.read): the memory budget, its
+/// regions and the accounting tree with live usage (spec VIII.5.2).
+async fn admin_memory(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authenticate(&st, &headers, Permission::ClusterRead) {
+        return r;
+    }
+    let Some(m) = &st.memory else {
+        return error_response(&Error::unsupported("memory accounting is not enabled"));
+    };
+    Json(json!({
+        "plan": m.plan,
+        "tracked_bytes": m.tracked(),
+        "tree": m.snapshot(),
+    }))
+    .into_response()
+}
 
 /// `GET /api/v1/admin/threads` (cluster.read): the thread inventory, the
 /// spec's `system.threads` (STRATA-SYS-03-014). It lists every registered

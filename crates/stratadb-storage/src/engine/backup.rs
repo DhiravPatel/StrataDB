@@ -25,7 +25,6 @@
 //! file and directory is fsynced; an interrupted backup never looks complete.
 
 use std::fs;
-use std::io::Write;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -88,18 +87,19 @@ fn copy_hashed(from: &Path, to: &Path) -> Result<(u64, String)> {
     if let Some(p) = to.parent() {
         fsutil::create_dir_durable(p)?;
     }
-    let src = stratadb_common::io::IoFile::open(stratadb_common::io::default_io(), from)?;
-    let mut dst = fsutil::create_new_file(to)?;
+    let io = stratadb_common::io::default_io();
+    let src = stratadb_common::io::IoFile::open(std::sync::Arc::clone(&io), from)?;
+    let dst = io.create_new(to)?;
     let mut h = Sha256::new();
     let mut total = 0u64;
     for (off, n) in chunks(stratadb_common::io::RandomRead::len(&src)) {
         let buf = src.read_vec(off, n)?;
         h.update(&buf);
-        dst.write_all(&buf)
-            .ctx(|| format!("writing {}", to.display()))?;
+        stratadb_common::io::write_all_at(&*dst, &buf, off)?;
         total += n as u64;
     }
-    fsutil::sync_file(&dst, to, false).ctx(|| format!("fsyncing {}", to.display()))?;
+    dst.sync(false)?;
+    io.forget(src.file());
     Ok((total, hex(&h.finalize())))
 }
 
@@ -113,13 +113,15 @@ fn chunks(len: u64) -> impl Iterator<Item = (u64, usize)> {
 }
 
 fn hash_file(p: &Path) -> Result<(u64, String)> {
-    let f = stratadb_common::io::IoFile::open(stratadb_common::io::default_io(), p)?;
+    let io = stratadb_common::io::default_io();
+    let f = stratadb_common::io::IoFile::open(std::sync::Arc::clone(&io), p)?;
     let mut h = Sha256::new();
     let mut total = 0u64;
     for (off, n) in chunks(stratadb_common::io::RandomRead::len(&f)) {
         h.update(&f.read_vec(off, n)?);
         total += n as u64;
     }
+    io.forget(f.file());
     Ok((total, hex(&h.finalize())))
 }
 
@@ -399,7 +401,7 @@ impl Shared {
         bman.obsolete_segments.clear();
         bman.segments
             .retain(|s| pinned.iter().any(|h| h.entry.id == s.id));
-        bman.commit(&tmp, self.keys.as_deref())?;
+        bman.commit_with(&tmp, self.keys.as_deref(), &*self.opts.io_engine())?;
         let (mbytes, msha) = hash_file(&tmp.join(crate::manifest::MANIFEST_FILE))?;
         files.push(BackupFile {
             path: crate::manifest::MANIFEST_FILE.into(),

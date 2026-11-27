@@ -1,0 +1,72 @@
+== old 1
+writers   8: commit p50     556 us  p99     814 us  max    1647 us  records/fsync   4.3  commits/s    14701
+writers  32: commit p50     813 us  p99    2274 us  max    3864 us  records/fsync  13.1  commits/s    34009
+writers  64: commit p50    1551 us  p99    5017 us  max    8204 us  records/fsync  20.5  commits/s    35972
+writers 128: commit p50    2099 us  p99    5332 us  max    8214 us  records/fsync  34.5  commits/s    52794
+test wakeup_latency_with_many_writers ... ok
+== new 1
+writers   8: commit p50     545 us  p99     674 us  max     764 us  records/fsync   4.1  commits/s    14468
+writers  32: commit p50     637 us  p99    1048 us  max    1629 us  records/fsync  15.3  commits/s    47946
+writers  64: commit p50    1064 us  p99    2718 us  max    5721 us  records/fsync  22.7  commits/s    52360
+writers 128: commit p50    2063 us  p99    5545 us  max   11388 us  records/fsync  38.9  commits/s    55411
+test wakeup_latency_with_many_writers ... ok
+== old 2
+writers   8: commit p50     582 us  p99    1300 us  max    7740 us  records/fsync   4.3  commits/s    13738
+writers  32: commit p50     735 us  p99    1641 us  max    2465 us  records/fsync  13.4  commits/s    38993
+writers  64: commit p50    1360 us  p99    3724 us  max    5173 us  records/fsync  18.4  commits/s    41234
+writers 128: commit p50    2113 us  p99    5497 us  max   10311 us  records/fsync  33.9  commits/s    52090
+test wakeup_latency_with_many_writers ... ok
+== new 2
+writers   8: commit p50     542 us  p99     682 us  max     749 us  records/fsync   4.1  commits/s    14648
+writers  32: commit p50     618 us  p99    1268 us  max    5201 us  records/fsync  15.3  commits/s    47014
+writers  64: commit p50     984 us  p99    8759 us  max    8804 us  records/fsync  23.5  commits/s    50551
+writers 128: commit p50    1637 us  p99    4706 us  max    8360 us  records/fsync  35.4  commits/s    66306
+test wakeup_latency_with_many_writers ... ok
+== old 3
+writers   8: commit p50     531 us  p99     741 us  max    1452 us  records/fsync   4.3  commits/s    15548
+writers  32: commit p50     565 us  p99     781 us  max    1032 us  records/fsync  15.9  commits/s    55908
+writers  64: commit p50     722 us  p99    1736 us  max    2612 us  records/fsync  23.3  commits/s    75113
+writers 128: commit p50    1410 us  p99    3762 us  max    5756 us  records/fsync  34.8  commits/s    78447
+test wakeup_latency_with_many_writers ... ok
+== new 3
+writers   8: commit p50     551 us  p99     651 us  max     683 us  records/fsync   4.1  commits/s    14129
+writers  32: commit p50     656 us  p99     735 us  max     762 us  records/fsync  15.9  commits/s    50402
+writers  64: commit p50     680 us  p99    1100 us  max    1507 us  records/fsync  29.6  commits/s    88935
+writers 128: commit p50    1134 us  p99    2845 us  max    4544 us  records/fsync  42.7  commits/s    98962
+test wakeup_latency_with_many_writers ... ok
+== old 4
+writers   8: commit p50     533 us  p99     657 us  max     711 us  records/fsync   4.3  commits/s    15581
+writers  32: commit p50     567 us  p99     752 us  max     857 us  records/fsync  16.0  commits/s    56208
+writers  64: commit p50     545 us  p99     961 us  max    1545 us  records/fsync  29.4  commits/s   106774
+writers 128: commit p50     976 us  p99    2387 us  max    3823 us  records/fsync  41.3  commits/s   110564
+test wakeup_latency_with_many_writers ... ok
+== new 4
+writers   8: commit p50     551 us  p99     647 us  max     668 us  records/fsync   4.1  commits/s    14169
+writers  32: commit p50     651 us  p99     739 us  max     853 us  records/fsync  15.9  commits/s    49807
+writers  64: commit p50     693 us  p99    1113 us  max    1610 us  records/fsync  29.4  commits/s    86403
+writers 128: commit p50    1230 us  p99    2828 us  max    4896 us  records/fsync  45.1  commits/s    94496
+test wakeup_latency_with_many_writers ... ok
+== old 5
+writers   8: commit p50     530 us  p99     650 us  max     787 us  records/fsync   4.3  commits/s    15576
+writers  32: commit p50     572 us  p99     751 us  max     858 us  records/fsync  15.9  commits/s    55720
+writers  64: commit p50     565 us  p99    1084 us  max    1347 us  records/fsync  29.2  commits/s   101584
+writers 128: commit p50    1002 us  p99    2681 us  max    3963 us  records/fsync  39.3  commits/s   106245
+test wakeup_latency_with_many_writers ... ok
+== new 5
+writers   8: commit p50     552 us  p99     647 us  max     674 us  records/fsync   4.1  commits/s    14127
+writers  32: commit p50     659 us  p99     740 us  max     789 us  records/fsync  15.9  commits/s    49896
+writers  64: commit p50     708 us  p99    1145 us  max    1323 us  records/fsync  29.6  commits/s    85524
+writers 128: commit p50    1174 us  p99    2788 us  max    4459 us  records/fsync  43.6  commits/s    97106
+test wakeup_latency_with_many_writers ... ok
+== old 6
+writers   8: commit p50     532 us  p99     649 us  max     718 us  records/fsync   4.3  commits/s    15569
+writers  32: commit p50     558 us  p99     759 us  max     846 us  records/fsync  15.9  commits/s    56382
+writers  64: commit p50     564 us  p99    1093 us  max    1536 us  records/fsync  29.2  commits/s   102518
+writers 128: commit p50    1046 us  p99    2655 us  max    4241 us  records/fsync  39.7  commits/s   104434
+test wakeup_latency_with_many_writers ... ok
+== new 6
+writers   8: commit p50     548 us  p99     646 us  max     664 us  records/fsync   4.1  commits/s    14123
+writers  32: commit p50     626 us  p99     754 us  max    1003 us  records/fsync  15.9  commits/s    50598
+writers  64: commit p50     676 us  p99    1179 us  max    1733 us  records/fsync  29.0  commits/s    87351
+writers 128: commit p50    1136 us  p99    2862 us  max    4804 us  records/fsync  43.6  commits/s    95053
+test wakeup_latency_with_many_writers ... ok

@@ -1,6 +1,6 @@
 # ADR-0027: Storage I/O engine and segment file cache
 
-- **Status:** Accepted (read path); the write path is a follow-up
+- **Status:** Accepted (read and write paths)
 - **Spec references:** VIII.4 (STRATA-SYS-04-001/002/009/025), VIII.2
   (STRATA-SYS-02-036/037), VIII.24 (fault catalog); ADR-0026 (phase plan)
 
@@ -63,14 +63,40 @@ requires:
   fails the query naming the segment file.
 - In 3 foreground A/B pairs the overhead was not measurable (report
   2026-11-26-io-engine).
-- **Not yet:**
-  - Writes (segment writer, WAL appends and fsync, manifest commits) still
-    use `std::fs` and are tested with failpoints and the power-loss
-    recorder.
-  - WAL replay reads directly.
-  - There is no io_uring backend, and no bound on in-flight I/O per worker or
-    device (STRATA-SYS-04-008).
-  - These are recorded in KNOWN_LIMITATIONS.md and PERF_INVENTORY.md.
+- **Not yet:** an io_uring backend, and a bound on in-flight I/O per worker
+  or device (STRATA-SYS-04-008). Writes were routed in the 2026-11-26
+  update.
+
+## Update 2026-11-26: write path
+- **What moved onto the engine:**
+  - WAL appends, fsyncs, segment creation, rotation, torn-tail truncation
+    and replay reads;
+  - segment writes (flush, compaction, retention, upgrade);
+  - manifest commits (`io::atomic_write`);
+  - backup copies and verification reads.
+- **Write interface:** `WriteFile` (`write_at`, `sync(data_only)`,
+  `set_len`, `len`; `&self`, so the sync leader fsyncs while appenders
+  write), `IoEngine::create_new` (exclusive, mode 0600) and `open_write`.
+- **The WAL:** it writes at its tracked length under its lock, which is
+  equivalent to `O_APPEND` with a single writer.
+- **Instrumentation preserved:** the real backend creates through
+  `fsutil::create_new_file` and syncs through `fsutil::sync_file`, so the
+  `simfs` power-loss recorder sees every create and fsync. The failpoints
+  stay where they were.
+- **Namespace operations:** rename, directory fsync and unlink stay in
+  `fsutil`. They are metadata, modelled by the recorder, and the durable
+  publish sequence lives there.
+- **One-shot reads:** whole-file reads (manifests, WAL replay, backup hashes)
+  `forget` their cached descriptor, so a later unlink frees the space at
+  once.
+- **`FaultyIo`:** now injects `ShortWrite`, `Enospc` and `FsyncEio`, matched
+  by a string suffix of the path.
+- **Lint:** extended to writes (`fs::write`, `File::create`,
+  `OpenOptions::open`, `FileExt::write_at` and `write_all_at`) and to the WAL
+  crate.
+- **Evidence:** crash matrix and power-loss simulation unchanged (0
+  violations in 3,748 states), new `tests/io_write_faults.rs`, no measurable
+  overhead (report `2026-11-26-io-write-path`).
 
 ## Alternatives rejected
 - **Keep one descriptor per segment, raise the limit:** still fails at

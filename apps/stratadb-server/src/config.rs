@@ -30,6 +30,8 @@
 //! [storage]
 //! memtable_max_bytes = 67108864
 //! max_open_files = 4096     # segment file descriptor budget (default: 50% of RLIMIT_NOFILE)
+//! group_commit_max_delay_ms = 2   # upper bound of the adaptive group-commit wait
+//! group_commit_adaptive = true    # false: always wait the full delay
 //! wal_segment_max_bytes = 67108864
 //! disk_reserve_bytes = 536870912
 //! disk_reserve_ratio = 0.02
@@ -80,6 +82,49 @@ pub struct FileConfig {
     pub quotas: QuotasSection,
     #[serde(default)]
     pub encryption: EncryptionSection,
+    #[serde(default)]
+    pub observability: ObservabilitySection,
+    #[serde(default)]
+    pub memory: MemorySection,
+}
+
+/// `[memory]` — budget and regions (spec VIII.5.2, `memory.*` settings).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemorySection {
+    /// Absolute process budget (bytes, >= 256 MiB); overrides the ratio.
+    pub max_server_memory_bytes: Option<u64>,
+    /// Budget as a share of the cgroup limit or physical memory (0.1..=0.95;
+    /// default 0.80).
+    pub max_server_memory_ratio: Option<f64>,
+    /// Memtables (0.01..=0.5; default 0.10).
+    pub ingest_memory_ratio: Option<f64>,
+    /// Caches (0..=0.8; default 0.30).
+    pub cache_memory_ratio: Option<f64>,
+    /// Compaction and retention rewrites (0.01..=0.5; default 0.10).
+    pub merge_memory_ratio: Option<f64>,
+    /// Per-query limit (>= 64 MiB; default min(10 GiB, query pool)).
+    pub max_query_memory_bytes: Option<u64>,
+    /// Wait for memory before failing a query (0..=600000; default 0).
+    pub memory_wait_timeout_ms: Option<u64>,
+    /// Warn when untracked resident memory exceeds this share of RSS
+    /// (0.01..=1; default 0.10).
+    pub untracked_warn_ratio: Option<f64>,
+}
+
+/// `[observability]` — `system.query_log` (spec `obs.query_log*`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilitySection {
+    /// Record every query in `system.query_log` (default true).
+    pub query_log: Option<bool>,
+    /// Buffering before entries are written (ms, 10..=600000; default 7500).
+    pub query_log_flush_ms: Option<u64>,
+    /// Retention of query log entries (days, 1..=3650; default 7).
+    pub query_log_retention_days: Option<u64>,
+    /// Entries buffered at most before new ones are dropped (1..=1000000;
+    /// default 10000).
+    pub query_log_queue: Option<usize>,
 }
 
 /// `[encryption]` — encryption at rest (ADR-0024).
@@ -98,6 +143,8 @@ pub struct QuotasSection {
     pub default_ingest_events_per_sec: Option<f64>,
     pub default_ingest_burst_events: Option<f64>,
     pub default_storage_bytes: Option<u64>,
+    /// Memory each tenant's running queries may hold together.
+    pub default_query_memory_bytes: Option<u64>,
     #[serde(default)]
     pub tenants: std::collections::BTreeMap<String, TenantQuotaSection>,
 }
@@ -108,6 +155,7 @@ pub struct TenantQuotaSection {
     pub ingest_events_per_sec: Option<f64>,
     pub ingest_burst_events: Option<f64>,
     pub storage_bytes: Option<u64>,
+    pub query_memory_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -148,6 +196,16 @@ pub struct StorageSection {
     pub ngram_attribute_keys: Option<Vec<String>>,
     /// Open segment file budget (LRU; default 50% of the soft RLIMIT_NOFILE).
     pub max_open_files: Option<usize>,
+    /// I/O calls in flight per device (1..=4096; default 128;
+    /// STRATA-SYS-04-008).
+    pub io_max_inflight_per_device: Option<usize>,
+    /// Upper bound of the group-commit wait (ms, 0..=100; default 2).
+    pub group_commit_max_delay_ms: Option<u64>,
+    /// Adaptive group-commit delay (default true; spec STRATA-SYS-07-004).
+    pub group_commit_adaptive: Option<bool>,
+    /// WAL format written: 3 (default; columnar payloads) or 2 (readable by
+    /// the previous release, for a rollback window after an upgrade).
+    pub wal_format_version: Option<u16>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -199,6 +257,13 @@ pub struct Resolved {
     pub threads: crate::ThreadPlan,
     /// Segment file descriptor budget (`None`: 50% of RLIMIT_NOFILE).
     pub max_open_files: Option<usize>,
+    /// I/O calls in flight per device (`None`: 128).
+    pub io_max_inflight_per_device: Option<usize>,
+    /// `system.query_log`.
+    pub query_log: crate::query_log::QueryLogConfig,
+    /// Memory budget settings (turned into byte limits at startup, once the
+    /// host's memory is known).
+    pub memory: crate::memory::MemorySettings,
 }
 
 /// Values from flags/environment that override the file (None = not given).
@@ -358,6 +423,10 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
             qs.default_ingest_burst_events,
         )?,
         storage_bytes: positive("quotas.default_storage_bytes", qs.default_storage_bytes)?,
+        query_memory_bytes: positive(
+            "quotas.default_query_memory_bytes",
+            qs.default_query_memory_bytes,
+        )?,
     };
     for (t, q) in &qs.tenants {
         stratadb_common::TenantId::new(t.clone())
@@ -368,13 +437,39 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
                 ingest_events_per_sec: rate_ok("ingest_events_per_sec", q.ingest_events_per_sec)?,
                 ingest_burst_events: rate_ok("ingest_burst_events", q.ingest_burst_events)?,
                 storage_bytes: positive("storage_bytes", q.storage_bytes)?,
+                query_memory_bytes: positive("query_memory_bytes", q.query_memory_bytes)?,
             },
         );
     }
 
     let s = &file.storage;
     let mut engine = EngineOptions::new(&data_dir);
-    engine.wal.durability = durability;
+    engine.wal.durability = match durability {
+        Durability::GroupCommit { .. } => match s.group_commit_max_delay_ms {
+            Some(ms) if ms > 100 => {
+                return Err(Error::invalid_input(
+                    "storage.group_commit_max_delay_ms must be at most 100",
+                ))
+            }
+            Some(ms) => Durability::GroupCommit {
+                max_delay: Duration::from_millis(ms),
+            },
+            None => durability,
+        },
+        other => other,
+    };
+    if let Some(a) = s.group_commit_adaptive {
+        engine.wal.adaptive_group_delay = a;
+    }
+    if let Some(v) = s.wal_format_version {
+        use stratadb_storage::{WAL_FORMAT_VERSION, WAL_MIN_WRITE_VERSION};
+        if !(WAL_MIN_WRITE_VERSION..=WAL_FORMAT_VERSION).contains(&v) {
+            return Err(Error::invalid_input(format!(
+                "storage.wal_format_version must be {WAL_MIN_WRITE_VERSION} or {WAL_FORMAT_VERSION}"
+            )));
+        }
+        engine.wal.format_version = v;
+    }
     if let Some(k) = o
         .key_file
         .clone()
@@ -391,6 +486,12 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
         )));
     }
     let max_open_files = positive("storage.max_open_files", s.max_open_files)?;
+    let io_max_inflight_per_device = s.io_max_inflight_per_device;
+    if io_max_inflight_per_device.is_some_and(|n| !(1..=4096).contains(&n)) {
+        return Err(Error::invalid_input(
+            "storage.io_max_inflight_per_device must be within 1..=4096",
+        ));
+    }
     if max_open_files.is_some_and(|n| n < 16) {
         return Err(Error::invalid_input(
             "storage.max_open_files must be at least 16",
@@ -437,7 +538,55 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
         }
         engine.ngram_attribute_keys = k.clone();
     }
+    let ob = &file.observability;
+    let mut query_log = crate::query_log::QueryLogConfig::default();
+    if let Some(b) = ob.query_log {
+        query_log.enabled = b;
+    }
+    if let Some(ms) = ob.query_log_flush_ms {
+        if !(10..=600_000).contains(&ms) {
+            return Err(Error::invalid_input(
+                "observability.query_log_flush_ms must be within 10..=600000",
+            ));
+        }
+        query_log.flush_interval = Duration::from_millis(ms);
+    }
+    if let Some(d) = ob.query_log_retention_days {
+        if !(1..=3650).contains(&d) {
+            return Err(Error::invalid_input(
+                "observability.query_log_retention_days must be within 1..=3650",
+            ));
+        }
+        query_log.retention = Duration::from_secs(d * 86_400);
+    }
+    if let Some(n) = ob.query_log_queue {
+        if !(1..=1_000_000).contains(&n) {
+            return Err(Error::invalid_input(
+                "observability.query_log_queue must be within 1..=1000000",
+            ));
+        }
+        query_log.queue = n;
+    }
+    let m = &file.memory;
+    let d = crate::memory::MemorySettings::default();
+    let memory = crate::memory::MemorySettings {
+        max_server_memory_bytes: m.max_server_memory_bytes,
+        max_server_memory_ratio: m
+            .max_server_memory_ratio
+            .unwrap_or(d.max_server_memory_ratio),
+        ingest_ratio: m.ingest_memory_ratio.unwrap_or(d.ingest_ratio),
+        cache_ratio: m.cache_memory_ratio.unwrap_or(d.cache_ratio),
+        merge_ratio: m.merge_memory_ratio.unwrap_or(d.merge_ratio),
+        max_query_memory_bytes: m.max_query_memory_bytes,
+        wait_timeout: m
+            .memory_wait_timeout_ms
+            .map_or(d.wait_timeout, Duration::from_millis),
+        untracked_warn_ratio: m.untracked_warn_ratio.unwrap_or(d.untracked_warn_ratio),
+    };
+    memory.validate()?;
     Ok(Resolved {
+        memory,
+        query_log,
         data_dir,
         listen,
         durability,
@@ -458,6 +607,7 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
         engine,
         scan_threads,
         max_open_files,
+        io_max_inflight_per_device,
     })
 }
 
@@ -485,6 +635,10 @@ impl Resolved {
             "storage": {
                 "memtable_max_bytes": self.engine.memtable_max_bytes,
                 "max_open_files": self.max_open_files,
+                "io_max_inflight_per_device": self.io_max_inflight_per_device
+                    .unwrap_or(stratadb_common::io::DEFAULT_MAX_INFLIGHT_PER_DEVICE),
+                "group_commit_adaptive": self.engine.wal.adaptive_group_delay,
+                "wal_format_version": self.engine.wal.format_version,
                 "wal_segment_max_bytes": self.engine.wal.segment_max_bytes,
                 "disk_reserve_bytes": self.engine.disk_reserve_bytes,
                 "disk_reserve_ratio": self.engine.disk_reserve_ratio,
@@ -492,6 +646,22 @@ impl Resolved {
                 "bloom_attribute_keys": self.engine.bloom_attribute_keys,
                 "ngram_index": self.engine.ngram_enabled,
                 "ngram_attribute_keys": self.engine.ngram_attribute_keys,
+            },
+            "memory": {
+                "max_server_memory_bytes": self.memory.max_server_memory_bytes,
+                "max_server_memory_ratio": self.memory.max_server_memory_ratio,
+                "ingest_memory_ratio": self.memory.ingest_ratio,
+                "cache_memory_ratio": self.memory.cache_ratio,
+                "merge_memory_ratio": self.memory.merge_ratio,
+                "max_query_memory_bytes": self.memory.max_query_memory_bytes,
+                "memory_wait_timeout_ms": self.memory.wait_timeout.as_millis() as u64,
+                "untracked_warn_ratio": self.memory.untracked_warn_ratio,
+            },
+            "observability": {
+                "query_log": self.query_log.enabled,
+                "query_log_flush_ms": self.query_log.flush_interval.as_millis() as u64,
+                "query_log_retention_days": self.query_log.retention.as_secs() / 86_400,
+                "query_log_queue": self.query_log.queue,
             },
             "backup_dir": self.server.backup_root,
             "encryption": self.engine.encryption.as_ref().map(|p| p.describe()),
@@ -572,10 +742,10 @@ mod tests {
     #[test]
     fn thread_plan_respects_the_budget() {
         use crate::ThreadPlan;
-        // 10 CPUs: budget 52; defaults 10 net + 10 scan + 4 fixed, blocking
+        // 10 CPUs: budget 52; defaults 10 net + 10 scan + 6 fixed, blocking
         // fills the rest up to one per admitted request.
         let p = ThreadPlan::for_cpus(10, None, None, None, 32, 16).unwrap();
-        assert_eq!((p.budget, p.net, p.scan, p.blocking), (52, 10, 10, 28));
+        assert_eq!((p.budget, p.net, p.scan, p.blocking), (52, 10, 10, 26));
         assert_eq!(p.total(), 52);
         let small = ThreadPlan::for_cpus(10, None, None, None, 4, 2).unwrap();
         assert_eq!(small.blocking, 6, "no more than admitted requests");
@@ -600,6 +770,142 @@ mod tests {
         assert_eq!(ok.server.blocking_threads, 5);
         let e = r(&format!("{base}[limits]\nblocking_threads = 5000\n")).unwrap_err();
         assert!(e.to_string().contains("budget"), "{e}");
+    }
+
+    #[test]
+    fn group_commit_settings() {
+        let r = |s: &str| resolve(&parse(s).unwrap(), &Overrides::default());
+        let base = "config_version = 1\ndata_dir = \"/d\"\n";
+        let d = r(base).unwrap();
+        assert!(d.engine.wal.adaptive_group_delay);
+        let x = r(&format!(
+            "{base}[storage]\ngroup_commit_max_delay_ms = 5\ngroup_commit_adaptive = false\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            x.engine.wal.durability,
+            Durability::GroupCommit {
+                max_delay: Duration::from_millis(5)
+            }
+        );
+        assert!(!x.engine.wal.adaptive_group_delay);
+        assert!(r(&format!(
+            "{base}[storage]\ngroup_commit_max_delay_ms = 500\n"
+        ))
+        .is_err());
+        // Only meaningful for group_commit: other modes are unchanged.
+        let s = r(&format!(
+            "{base}durability = \"sync\"\n[storage]\ngroup_commit_max_delay_ms = 5\n"
+        ))
+        .unwrap();
+        assert_eq!(s.engine.wal.durability, Durability::Sync);
+    }
+
+    #[test]
+    fn io_inflight_setting() {
+        let r = |s: &str| resolve(&parse(s)?, &Overrides::default());
+        let base = "config_version = 1\ndata_dir = \"/d\"\n";
+        assert_eq!(r(base).unwrap().io_max_inflight_per_device, None);
+        assert_eq!(
+            r(&format!(
+                "{base}[storage]\nio_max_inflight_per_device = 32\n"
+            ))
+            .unwrap()
+            .io_max_inflight_per_device,
+            Some(32)
+        );
+        for bad in [0, 5000] {
+            assert!(r(&format!(
+                "{base}[storage]\nio_max_inflight_per_device = {bad}\n"
+            ))
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn wal_format_version_setting() {
+        let r = |s: &str| resolve(&parse(s)?, &Overrides::default());
+        let base = "config_version = 1\ndata_dir = \"/d\"\n";
+        assert_eq!(r(base).unwrap().engine.wal.format_version, 3);
+        assert_eq!(
+            r(&format!("{base}[storage]\nwal_format_version = 2\n"))
+                .unwrap()
+                .engine
+                .wal
+                .format_version,
+            2
+        );
+        for bad in [1, 4] {
+            assert!(r(&format!("{base}[storage]\nwal_format_version = {bad}\n")).is_err());
+        }
+    }
+
+    #[test]
+    fn memory_settings() {
+        let r = |s: &str| resolve(&parse(s)?, &Overrides::default());
+        let base = "config_version = 1\ndata_dir = \"/d\"\n";
+        assert_eq!(
+            r(base).unwrap().memory,
+            crate::memory::MemorySettings::default()
+        );
+        let x = r(&format!(
+            "{base}[memory]\nmax_server_memory_bytes = 2147483648\ningest_memory_ratio = 0.2\n\
+             max_query_memory_bytes = 134217728\nmemory_wait_timeout_ms = 500\n\
+             [quotas]\ndefault_query_memory_bytes = 1000000\n[quotas.tenants.acme]\nquery_memory_bytes = 5000000\n"
+        ))
+        .unwrap();
+        assert_eq!(x.memory.max_server_memory_bytes, Some(2 << 30));
+        assert_eq!(x.memory.ingest_ratio, 0.2);
+        assert_eq!(x.memory.wait_timeout, Duration::from_millis(500));
+        let acme = stratadb_common::TenantId::new("acme").unwrap();
+        let other = stratadb_common::TenantId::new("other").unwrap();
+        assert_eq!(
+            x.server.quotas.for_tenant(&acme).query_memory_bytes,
+            Some(5_000_000)
+        );
+        assert_eq!(
+            x.server.quotas.for_tenant(&other).query_memory_bytes,
+            Some(1_000_000)
+        );
+        for bad in [
+            "cache_memory_ratio = 0.7\ningest_memory_ratio = 0.3",
+            "max_query_memory_bytes = 1000",
+            "max_server_memory_ratio = 1.5",
+            "unknown_memory_knob = 1",
+        ] {
+            assert!(r(&format!("{base}[memory]\n{bad}\n")).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn observability_settings() {
+        let r = |s: &str| resolve(&parse(s)?, &Overrides::default());
+        let base = "config_version = 1\ndata_dir = \"/d\"\n";
+        let d = r(base).unwrap().query_log;
+        assert_eq!(d, crate::query_log::QueryLogConfig::default());
+        assert!(d.enabled);
+        assert_eq!(d.flush_interval, Duration::from_millis(7500));
+        let x = r(&format!(
+            "{base}[observability]\nquery_log = false\nquery_log_flush_ms = 100\n\
+             query_log_retention_days = 30\nquery_log_queue = 50\n"
+        ))
+        .unwrap()
+        .query_log;
+        assert!(!x.enabled);
+        assert_eq!(x.flush_interval, Duration::from_millis(100));
+        assert_eq!(x.retention, Duration::from_secs(30 * 86_400));
+        assert_eq!(x.queue, 50);
+        for bad in [
+            "query_log_flush_ms = 0",
+            "query_log_retention_days = 0",
+            "query_log_queue = 0",
+            "query_log_typo = 1",
+        ] {
+            assert!(
+                r(&format!("{base}[observability]\n{bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

@@ -124,7 +124,7 @@ fn tenant_isolation_in_storage() {
     write_n(&e, &a, 10, 3);
     let sa = e.snapshot(&a);
     assert!(sa.segments().iter().all(|s| s.entry.tenant == a));
-    assert!(sa.memory_rows().iter().all(|r| r.event.tenant_id == a));
+    assert!(sa.memory_views().iter().all(|v| v.tenant() == &a));
     assert_eq!(ids(&e, &a).len(), 13);
     assert_eq!(ids(&e, &b).len(), 5);
     assert!(ids(&e, &tenant("nobody")).is_empty());

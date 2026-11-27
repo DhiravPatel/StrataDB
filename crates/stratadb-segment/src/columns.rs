@@ -1,75 +1,17 @@
 //! Column chunk encodings for segment format v1.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use stratadb_common::codec::{Decoder, Encoder};
 use stratadb_common::{Error, Result};
 use stratadb_schema::codec::{decode_map, decode_value, encode_map, encode_value, DecodeLimits};
 use stratadb_schema::{Event, Value};
 
+pub(crate) use stratadb_schema::column::index_opt_values;
+pub use stratadb_schema::column::{ColumnData, ColumnId, RawValues};
+use stratadb_schema::column::{StrBuilder, StrColumn};
+
 use crate::RowRef;
-
-/// Stable column identifiers (persisted; never renumber).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[repr(u16)]
-pub enum ColumnId {
-    EventTime = 1,
-    IngestTime = 2,
-    Seq = 3,
-    Idx = 4,
-    Severity = 5,
-    Service = 6,
-    SeverityText = 7,
-    TraceId = 8,
-    SpanId = 9,
-    EventId = 10,
-    Body = 11,
-    Attributes = 12,
-    ResourceAttributes = 13,
-    SchemaVersion = 14,
-}
-
-impl ColumnId {
-    pub const ALL: [ColumnId; 14] = [
-        ColumnId::EventTime,
-        ColumnId::IngestTime,
-        ColumnId::Seq,
-        ColumnId::Idx,
-        ColumnId::Severity,
-        ColumnId::Service,
-        ColumnId::SeverityText,
-        ColumnId::TraceId,
-        ColumnId::SpanId,
-        ColumnId::EventId,
-        ColumnId::Body,
-        ColumnId::Attributes,
-        ColumnId::ResourceAttributes,
-        ColumnId::SchemaVersion,
-    ];
-
-    pub fn from_u16(v: u16) -> Option<Self> {
-        Self::ALL.iter().copied().find(|c| *c as u16 == v)
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            ColumnId::EventTime => "event_time",
-            ColumnId::IngestTime => "ingest_time",
-            ColumnId::Seq => "_seq",
-            ColumnId::Idx => "_idx",
-            ColumnId::Severity => "severity",
-            ColumnId::Service => "service",
-            ColumnId::SeverityText => "severity_text",
-            ColumnId::TraceId => "trace_id",
-            ColumnId::SpanId => "span_id",
-            ColumnId::EventId => "event_id",
-            ColumnId::Body => "body",
-            ColumnId::Attributes => "attributes",
-            ColumnId::ResourceAttributes => "resource_attributes",
-            ColumnId::SchemaVersion => "schema_version",
-        }
-    }
-}
 
 /// Chunk encodings (persisted; never renumber).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,67 +42,6 @@ impl Encoding {
             6 => Encoding::Map,
             _ => return None,
         })
-    }
-}
-
-/// Decoded column values, one entry per row.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ColumnData {
-    Ints(Vec<i64>),
-    U8s(Vec<u8>),
-    Strs(Vec<Option<String>>),
-    Values(Vec<Option<Value>>),
-    Maps(Vec<BTreeMap<String, Value>>),
-}
-
-fn wrong(expected: &str) -> Error {
-    Error::internal(format!("column data is not {expected}"))
-}
-
-impl ColumnData {
-    pub fn len(&self) -> usize {
-        match self {
-            ColumnData::Ints(v) => v.len(),
-            ColumnData::U8s(v) => v.len(),
-            ColumnData::Strs(v) => v.len(),
-            ColumnData::Values(v) => v.len(),
-            ColumnData::Maps(v) => v.len(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn into_ints(self) -> Result<Vec<i64>> {
-        match self {
-            ColumnData::Ints(v) => Ok(v),
-            _ => Err(wrong("ints")),
-        }
-    }
-    pub fn into_u8s(self) -> Result<Vec<u8>> {
-        match self {
-            ColumnData::U8s(v) => Ok(v),
-            _ => Err(wrong("u8s")),
-        }
-    }
-    pub fn into_strs(self) -> Result<Vec<Option<String>>> {
-        match self {
-            ColumnData::Strs(v) => Ok(v),
-            _ => Err(wrong("strings")),
-        }
-    }
-    pub fn into_values(self) -> Result<Vec<Option<Value>>> {
-        match self {
-            ColumnData::Values(v) => Ok(v),
-            _ => Err(wrong("values")),
-        }
-    }
-    pub fn into_maps(self) -> Result<Vec<BTreeMap<String, Value>>> {
-        match self {
-            ColumnData::Maps(v) => Ok(v),
-            _ => Err(wrong("maps")),
-        }
     }
 }
 
@@ -429,21 +310,22 @@ pub(crate) fn decode_column(
         }
         Encoding::RawU8 => ColumnData::U8s(d.get_raw(rows)?.to_vec()),
         Encoding::OptStr => {
-            let mut v = Vec::with_capacity(rows);
+            // Straight into one byte buffer: no allocation per row.
+            let mut v = StrBuilder::with_capacity(rows, bytes.len());
             for _ in 0..rows {
                 let n = d.get_uvarint()?;
                 if n == 0 {
-                    v.push(None);
+                    v.push(None)?;
                 } else {
                     let len = usize::try_from(n - 1)
                         .map_err(|_| Error::corruption("column", "length overflow"))?;
                     let raw = d.get_raw(len)?;
                     let s = std::str::from_utf8(raw)
                         .map_err(|e| Error::corruption("column", format!("invalid UTF-8: {e}")))?;
-                    v.push(Some(s.to_owned()));
+                    v.push(Some(s))?;
                 }
             }
-            ColumnData::Strs(v)
+            ColumnData::Strs(v.finish())
         }
         Encoding::DictStr => {
             let n = d.get_len(bytes.len(), 1)?;
@@ -451,22 +333,17 @@ pub(crate) fn decode_column(
             for _ in 0..n {
                 dict.push(d.get_string(bytes.len())?);
             }
-            let mut v = Vec::with_capacity(rows);
+            // Kept dictionary-encoded: filters evaluate once per entry.
+            let mut codes = Vec::with_capacity(rows);
             for _ in 0..rows {
                 let code = d.get_uvarint()?;
-                if code == 0 {
-                    v.push(None);
-                } else {
-                    let s = usize::try_from(code - 1)
-                        .ok()
-                        .and_then(|i| dict.get(i))
-                        .ok_or_else(|| {
-                            Error::corruption("column", "dictionary code out of range")
-                        })?;
-                    v.push(Some(s.clone()));
-                }
+                let code = u32::try_from(code)
+                    .ok()
+                    .filter(|c| *c as usize <= dict.len())
+                    .ok_or_else(|| Error::corruption("column", "dictionary code out of range"))?;
+                codes.push(code);
             }
-            ColumnData::Strs(v)
+            ColumnData::Strs(StrColumn::from_dict(dict, codes)?)
         }
         Encoding::OptValue => {
             let mut v = Vec::with_capacity(rows);
@@ -494,79 +371,6 @@ pub(crate) fn decode_column(
     };
     d.expect_end()?;
     Ok(data)
-}
-
-/// An `OptValue` column kept in its encoded form: row `i` is missing or the
-/// `encode_value` bytes `buf[start..end]`. Decoding is deferred to
-/// [`RawValues::value`]; the bytes are validated on construction exactly as
-/// [`decode_column`] validates them (presence markers, tags, lengths, UTF-8,
-/// nesting, map key order — via `skip_value`), so a chunk is accepted or
-/// rejected the same way in either form.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RawValues {
-    buf: Vec<u8>,
-    spans: Vec<Option<(u32, u32)>>,
-}
-
-impl RawValues {
-    pub fn len(&self) -> usize {
-        self.spans.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.spans.is_empty()
-    }
-
-    /// Encoded value of row `i` (`None` = missing). Panics if `i >= len`.
-    pub fn bytes(&self, i: usize) -> Option<&[u8]> {
-        self.spans[i].map(|(s, e)| &self.buf[s as usize..e as usize])
-    }
-
-    /// Decoded value of row `i`.
-    pub fn value(&self, i: usize) -> Result<Option<Value>> {
-        match self.bytes(i) {
-            None => Ok(None),
-            Some(b) => {
-                let mut d = Decoder::new(b, "raw value");
-                let v = decode_value(&mut d, &DecodeLimits::default())?;
-                d.expect_end()?;
-                Ok(Some(v))
-            }
-        }
-    }
-}
-
-/// Validate an `OptValue` chunk and index its values without decoding them.
-pub(crate) fn index_opt_values(buf: Vec<u8>, rows: usize) -> Result<RawValues> {
-    if rows > buf.len() {
-        return Err(Error::corruption("column", "row count exceeds chunk size"));
-    }
-    let end = u32::try_from(buf.len())
-        .map_err(|_| Error::corruption("column", "value chunk larger than 4 GiB"))?;
-    let lim = DecodeLimits::default();
-    let mut spans = Vec::with_capacity(rows);
-    {
-        let mut d = Decoder::new(&buf, "column chunk");
-        let pos = |d: &Decoder<'_>| end - d.remaining() as u32;
-        for _ in 0..rows {
-            match d.get_u8()? {
-                0 => spans.push(None),
-                1 => {
-                    let start = pos(&d);
-                    stratadb_schema::codec::skip_value(&mut d, &lim)?;
-                    spans.push(Some((start, pos(&d))));
-                }
-                other => {
-                    return Err(Error::corruption(
-                        "column",
-                        format!("invalid presence marker {other}"),
-                    ))
-                }
-            }
-        }
-        d.expect_end()?;
-    }
-    Ok(RawValues { buf, spans })
 }
 
 fn expected_encoding(id: ColumnId) -> Encoding {

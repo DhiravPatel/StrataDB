@@ -1,0 +1,10 @@
+crc32c                       base [33.5, 32.8, 32.6] new [32.7, 32.8, 32.6] speed-up(min) 1.000
+event_batch_decode           base [803.4, 783.4, 778.9] new [769.6, 775.8, 767.9] speed-up(min) 1.014
+columnar_batch_decode        base [775.0, 763.6, 741.1] new [755.4, 761.4, 753.6] speed-up(min) 0.983
+event_batch_encode           base [89.7, 86.4, 87.5] new [87.2, 87.9, 87.3] speed-up(min) 0.991
+columnar_batch_encode        base [187.4, 182.0, 181.5] new [182.0, 180.1, 178.9] speed-up(min) 1.015
+scan_filter_count            base [3.4, 3.3, 3.3] new [1.7, 1.7, 1.7] speed-up(min) 2.011
+like_substring_count         base [57.1, 55.6, 56.0] new [54.5, 54.3, 54.0] speed-up(min) 1.031
+group_by_high_cardinality    base [62.3, 60.6, 61.0] new [60.7, 59.8, 60.3] speed-up(min) 1.015
+group_by_low_cardinality     base [38.0, 37.7, 37.3] new [13.6, 13.5, 13.7] speed-up(min) 2.767
+top_k_order_by_time          base [155.8, 151.9, 152.0] new [140.5, 138.6, 138.1] speed-up(min) 1.099

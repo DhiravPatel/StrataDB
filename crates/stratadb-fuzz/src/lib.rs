@@ -47,9 +47,9 @@ pub fn fuzz_wal_recovery(data: &[u8]) {
         dir.path(),
         stratadb_wal::WalOptions::default(),
         0,
-        |_, _, p| {
+        |_, t, p| {
             replayed += p.len();
-            let _ = decode_batch(p, &DecodeLimits::default());
+            decode_payload(t, p);
             Ok(())
         },
     );
@@ -101,9 +101,39 @@ pub fn fuzz_manifest(data: &[u8]) {
     let _ = stratadb_storage::BackupManifest::decode(data);
 }
 
+/// Decode a WAL payload the way engine replay does, by record type.
+fn decode_payload(t: stratadb_wal::RecordType, p: &[u8]) {
+    use stratadb_wal::RecordType as R;
+    let lim = DecodeLimits::default();
+    let body = match t {
+        R::EventBatch | R::ColumnarEventBatch => Some(p),
+        R::IdempotentEventBatch | R::IdempotentColumnarEventBatch => {
+            stratadb_storage::idempotency::decode_record(p)
+                .ok()
+                .map(|r| r.3)
+        }
+    };
+    if let Some(b) = body {
+        let _ = match t {
+            R::EventBatch | R::IdempotentEventBatch => decode_batch(b, &lim),
+            _ => stratadb_schema::columnar::decode_batch(b, &lim),
+        };
+    }
+}
+
 pub fn fuzz_event_codec(data: &[u8]) {
     let lim = DecodeLimits::default();
     let _ = decode_batch(data, &lim);
+    // Columnar batches: whatever decodes must re-encode to an equal batch.
+    if let Ok(evs) = stratadb_schema::columnar::decode_batch(data, &lim) {
+        for threshold in [usize::MAX, 0] {
+            let again = stratadb_schema::columnar::encode_batch_with(&evs, threshold)
+                .expect("a decoded batch is a valid batch");
+            let back = stratadb_schema::columnar::decode_batch(&again, &lim)
+                .expect("re-encoded batch decodes");
+            assert_eq!(back, evs, "columnar round trip changed events");
+        }
+    }
     let mut d = Decoder::new(data, "fuzz");
     let _ = decode_event(&mut d, &lim);
     let _ = stratadb_storage::idempotency::decode_record(data);
@@ -310,8 +340,8 @@ pub fn fuzz_sealed(data: &[u8]) {
         keys: Some(std::sync::Arc::clone(keys)),
         ..Default::default()
     };
-    let _ = stratadb_wal::Wal::open(wal.path(), o, 0, |_, _, p| {
-        let _ = stratadb_schema::codec::decode_batch(p, &DecodeLimits::default());
+    let _ = stratadb_wal::Wal::open(wal.path(), o, 0, |_, t, p| {
+        decode_payload(t, p);
         Ok(())
     });
 }

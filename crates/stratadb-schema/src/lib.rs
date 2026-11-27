@@ -7,6 +7,8 @@
 //! * [`json`] — mapping from JSON/NDJSON payloads to canonical events.
 
 pub mod codec;
+pub mod column;
+pub mod columnar;
 pub mod event;
 pub mod json;
 pub mod otlp;

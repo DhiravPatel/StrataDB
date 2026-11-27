@@ -15,48 +15,66 @@
 [meta]
 hw_profile = "HW-REF-7"
 cpu_model = "Apple M4"
-load_average_at_write = "{ 4.08 5.92 6.60 }"
+load_average_at_write = "{ 3.25 3.52 4.02 }"
 runs = 20
 unit_kind = "cpu_ns"
 
 [operator.crc32c]
 unit = "cpu_ns_per_kib"
 description = "CRC-32C over 1 MiB (WAL frames, segment chunks)"
-measured = 46.4750
-noise_band = 0.0284
+measured = 32.3131
+noise_band = 0.0076
 
 [operator.event_batch_decode]
 unit = "cpu_ns_per_row"
 description = "decode a 1,000-event WAL batch payload (WAL replay path)"
-measured = 1211.6117
-noise_band = 0.1125
+measured = 772.0881
+noise_band = 0.0176
+
+[operator.columnar_batch_decode]
+unit = "cpu_ns_per_row"
+description = "decode a 1,000-event columnar WAL payload (WAL v3 replay path, LZ4)"
+measured = 759.5929
+noise_band = 0.0115
+
+[operator.event_batch_encode]
+unit = "cpu_ns_per_row"
+description = "encode 1,000 events as a row WAL payload (WAL v2 write path)"
+measured = 88.3295
+noise_band = 0.0221
+
+[operator.columnar_batch_encode]
+unit = "cpu_ns_per_row"
+description = "encode 1,000 events as a columnar WAL payload (WAL v3 write path, LZ4)"
+measured = 181.4646
+noise_band = 0.0148
 
 [operator.scan_filter_count]
 unit = "cpu_ns_per_row_scanned"
 description = "SELECT count(*) WHERE severity = 'ERROR' (1 thread)"
-measured = 7.1524
-noise_band = 0.0644
+measured = 1.6508
+noise_band = 0.0041
 
 [operator.like_substring_count]
 unit = "cpu_ns_per_row_scanned"
 description = "SELECT count(*) WHERE body LIKE '%TIMEOUT%' (1 thread)"
-measured = 100.3940
-noise_band = 0.0292
+measured = 54.2805
+noise_band = 0.0046
 
 [operator.group_by_high_cardinality]
 unit = "cpu_ns_per_row_scanned"
 description = "GROUP BY attributes['user_id'] ORDER BY count DESC LIMIT 10 (1 thread)"
-measured = 103.0665
-noise_band = 0.0406
+measured = 60.7206
+noise_band = 0.0041
 
 [operator.group_by_low_cardinality]
 unit = "cpu_ns_per_row_scanned"
 description = "GROUP BY severity (1 thread)"
-measured = 68.3837
-noise_band = 0.0528
+measured = 13.4883
+noise_band = 0.0063
 
 [operator.top_k_order_by_time]
 unit = "cpu_ns_per_row_scanned"
 description = "ORDER BY event_time DESC LIMIT 10 (1 thread)"
-measured = 264.5225
-noise_band = 0.0463
+measured = 137.2763
+noise_band = 0.0045

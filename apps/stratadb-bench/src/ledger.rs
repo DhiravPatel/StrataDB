@@ -51,7 +51,13 @@ const EVENTS: usize = 100_000;
 /// Minimum CPU time per ledger sample (50 ms).
 const MIN_SAMPLE_CPU_NS: f64 = 50e6;
 
-fn ops(engine: Arc<Engine>, tenant: TenantId, batch: Arc<Vec<u8>>) -> Vec<Op> {
+fn ops(
+    engine: Arc<Engine>,
+    tenant: TenantId,
+    batch: Arc<Vec<u8>>,
+    sample: Arc<Vec<stratadb_schema::Event>>,
+) -> Vec<Op> {
+    let columnar = Arc::new(stratadb_schema::columnar::encode_batch(&sample).unwrap_or_default());
     let q = |sql: &'static str| {
         let (engine, tenant) = (Arc::clone(&engine), tenant.clone());
         Box::new(move || {
@@ -100,6 +106,55 @@ fn ops(engine: Arc<Engine>, tenant: TenantId, batch: Arc<Vec<u8>>) -> Vec<Op> {
                 }
                 Ok((t.stop().thread_cpu.as_secs_f64() * 1e9, rows as f64))
             }),
+        },
+        Op {
+            name: "columnar_batch_decode",
+            unit: "cpu_ns_per_row",
+            description: "decode a 1,000-event columnar WAL payload (WAL v3 replay path, LZ4)",
+            run: Box::new(move || {
+                let lim = DecodeLimits::default();
+                let t = CpuTimer::start();
+                let mut rows = 0usize;
+                for _ in 0..10 {
+                    rows += stratadb_schema::columnar::decode_batch(std::hint::black_box(&columnar), &lim)?
+                        .len();
+                }
+                Ok((t.stop().thread_cpu.as_secs_f64() * 1e9, rows as f64))
+            }),
+        },
+        Op {
+            name: "event_batch_encode",
+            unit: "cpu_ns_per_row",
+            description: "encode 1,000 events as a row WAL payload (WAL v2 write path)",
+            run: {
+                let sample = Arc::clone(&sample);
+                Box::new(move || {
+                    let t = CpuTimer::start();
+                    let mut bytes = 0usize;
+                    for _ in 0..10 {
+                        bytes += encode_batch(std::hint::black_box(&sample)).len();
+                    }
+                    std::hint::black_box(bytes);
+                    Ok((t.stop().thread_cpu.as_secs_f64() * 1e9, 10.0 * sample.len() as f64))
+                })
+            },
+        },
+        Op {
+            name: "columnar_batch_encode",
+            unit: "cpu_ns_per_row",
+            description: "encode 1,000 events as a columnar WAL payload (WAL v3 write path, LZ4)",
+            run: {
+                let sample = Arc::clone(&sample);
+                Box::new(move || {
+                    let t = CpuTimer::start();
+                    let mut bytes = 0usize;
+                    for _ in 0..10 {
+                        bytes += stratadb_schema::columnar::encode_batch(std::hint::black_box(&sample))?.len();
+                    }
+                    std::hint::black_box(bytes);
+                    Ok((t.stop().thread_cpu.as_secs_f64() * 1e9, 10.0 * sample.len() as f64))
+                })
+            },
         },
         Op {
             name: "scan_filter_count",
@@ -157,7 +212,7 @@ pub fn measure(runs: usize) -> Result<Vec<Measured>> {
     engine.flush()?;
     let batch = Arc::new(encode_batch(&sample));
     let mut out = Vec::new();
-    for op in ops(Arc::clone(&engine), tenant, batch) {
+    for op in ops(Arc::clone(&engine), tenant, batch, Arc::new(sample.clone())) {
         (op.run)()?; // warmup
         let mut per = Vec::with_capacity(runs);
         for _ in 0..runs {
@@ -375,8 +430,15 @@ mod tests {
     fn measures_every_operator() {
         let got = measure(5).unwrap();
         let names: Vec<&str> = got.iter().map(|x| x.name).collect();
-        assert_eq!(names.len(), 7);
-        assert!(names.contains(&"group_by_high_cardinality"));
+        assert_eq!(names.len(), 10);
+        for op in [
+            "group_by_high_cardinality",
+            "event_batch_encode",
+            "columnar_batch_encode",
+            "columnar_batch_decode",
+        ] {
+            assert!(names.contains(&op), "{op} missing from {names:?}");
+        }
         for x in &got {
             assert!(x.median > 0.0 && x.median.is_finite(), "{x:?}");
             assert!(x.noise_band >= 0.0);

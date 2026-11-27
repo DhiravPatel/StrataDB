@@ -7,11 +7,12 @@ case-insensitive. `--` starts a comment to end of line.
 ```ebnf
 statement   = [ "EXPLAIN" [ "ANALYZE" ] ] query [ ";" ] ;
 query       = "SELECT" ( "*" | item { "," item } )
-              "FROM" "logs"
+              "FROM" table
               [ "WHERE" expr ]
               [ "GROUP" "BY" expr { "," expr } ]
               [ "ORDER" "BY" order { "," order } ]
               [ "LIMIT" integer ] ;
+table       = "logs" | "system" "." "query_log" ;
 item        = expr [ "AS" ident ] ;
 order       = ( expr | integer | alias ) [ "ASC" | "DESC" ] ;
 expr        = and { "OR" and } ;

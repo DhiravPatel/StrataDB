@@ -1,0 +1,57 @@
+# Group commit (spec STRATA-SYS-07-004): ingest latency at low and high
+# arrival rates and throughput with 1 and 8 closed-loop writers, durability
+# group_commit with a 2 ms maximum delay. Compare `adaptive_group_delay =
+# true` (default) with `false` (fixed delay); run in the foreground.
+name = "group_commit"
+description = "Ingest latency/throughput under group commit: low rate, high rate, 1 and 8 writers"
+
+[dataset]
+profile = "app-logs"
+events = 20000
+tenants = 1
+seed = 1
+batch_size = 1000
+
+[engine]
+wal_format_version = 2
+durability = "group_commit"
+group_commit_delay_ms = 2
+adaptive_group_delay = true
+
+[run]
+warmup = 1
+repetitions = 5
+
+[[load]]
+id = "ingest_open_20"
+kind = "ingest"
+mode = "open"
+rate_per_s = 20
+duration_s = 6
+workers = 4
+batch_size = 10
+
+[[load]]
+id = "ingest_open_400"
+kind = "ingest"
+mode = "open"
+rate_per_s = 400
+duration_s = 6
+workers = 8
+batch_size = 10
+
+[[load]]
+id = "ingest_closed_1"
+kind = "ingest"
+mode = "closed"
+duration_s = 4
+workers = 1
+batch_size = 10
+
+[[load]]
+id = "ingest_closed_8"
+kind = "ingest"
+mode = "closed"
+duration_s = 4
+workers = 8
+batch_size = 10

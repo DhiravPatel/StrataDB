@@ -9,10 +9,13 @@
 use std::collections::BTreeSet;
 
 use stratadb_common::{Error, Result};
+use stratadb_schema::column::ColumnId;
 use stratadb_schema::{Severity, Value};
-use stratadb_segment::bloom::BloomField;
-use stratadb_segment::ngram::NgramField;
-use stratadb_segment::ColumnId;
+use stratadb_storage::scan::IndexField;
+/// Per-source pruning predicates, defined by storage (spec STRATA-ARCH-01-003):
+/// the planner states them, storage evaluates them against its statistics
+/// and indexes.
+pub use stratadb_storage::scan::Pruning;
 
 use crate::ast::*;
 
@@ -34,29 +37,11 @@ pub enum OutputSource {
     Agg(usize),
 }
 
-/// Segment pruning predicates. Each is implied by the filter, so a segment
-/// failing any of them cannot contain a matching row.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Pruning {
-    /// Inclusive event_time bounds.
-    pub time_lo: Option<i64>,
-    pub time_hi: Option<i64>,
-    /// Attribute keys that must be present for any row to match.
-    pub required_attrs: BTreeSet<String>,
-    pub required_resource: BTreeSet<String>,
-    /// Severity numbers one of which a matching row must have.
-    pub severities: Option<BTreeSet<u8>>,
-    /// Bloom-filter probes: a matching row has one of these string values in
-    /// the field. Only string literals are recorded (see segment::bloom).
-    pub bloom: Vec<(BloomField, Vec<String>)>,
-    /// Trigram probes from `LIKE`/`ILIKE` conjuncts: a matching row's field
-    /// contains every one of these folded trigrams (see segment::ngram).
-    pub ngram: Vec<(NgramField, Vec<String>)>,
-}
-
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub explain: ExplainMode,
+    /// The table to read.
+    pub table: Table,
     pub output_names: Vec<String>,
     pub outputs: Vec<OutputSource>,
     pub filter: Option<Expr>,
@@ -76,7 +61,7 @@ pub struct Plan {
     /// Attribute (resp. resource) keys referenced only as whole `GROUP BY`
     /// keys (`GROUP BY attributes['k']` and nowhere else, except as that
     /// group's output column): scans need only their encoded bytes, so they
-    /// may be read undecoded (`SegmentReader::read_shredded_raw`).
+    /// may be returned undecoded (`ColumnRequest::raw_attr_keys`).
     pub raw_group_attr_keys: BTreeSet<String>,
     pub raw_group_resource_keys: BTreeSet<String>,
 }
@@ -202,13 +187,15 @@ fn require_key(c: &ColumnRef, p: &mut Pruning) {
     }
 }
 
-fn bloom_field(c: &ColumnRef) -> Option<BloomField> {
+/// The storage field an equality predicate on `c` names (string-valued
+/// identifier and attribute columns).
+fn equals_field(c: &ColumnRef) -> Option<IndexField> {
     Some(match c {
-        ColumnRef::TraceId => BloomField::TraceId,
-        ColumnRef::SpanId => BloomField::SpanId,
-        ColumnRef::EventId => BloomField::EventId,
-        ColumnRef::Attr(k) => BloomField::Attr(k.clone()),
-        ColumnRef::Resource(k) => BloomField::Resource(k.clone()),
+        ColumnRef::TraceId => IndexField::TraceId,
+        ColumnRef::SpanId => IndexField::SpanId,
+        ColumnRef::EventId => IndexField::EventId,
+        ColumnRef::Attr(k) => IndexField::Attr(k.clone()),
+        ColumnRef::Resource(k) => IndexField::Resource(k.clone()),
         _ => return None,
     })
 }
@@ -261,8 +248,8 @@ pub fn extract_pruning(filter: &Expr) -> Pruning {
                         p.time_hi = Some(p.time_hi.map_or(hi, |x| x.min(hi)));
                     }
                 }
-                if let (CmpOp::Eq, Value::String(v), Some(f)) = (op, lit, bloom_field(col)) {
-                    p.bloom.push((f, vec![v.clone()]));
+                if let (CmpOp::Eq, Value::String(v), Some(f)) = (op, lit, equals_field(col)) {
+                    p.add_equals(&f, vec![v.clone()]);
                 }
                 if let (ColumnRef::Severity, CmpOp::Eq) = (col, op) {
                     if let Some(code) = severity_code(lit) {
@@ -282,8 +269,8 @@ pub fn extract_pruning(filter: &Expr) -> Pruning {
                     }
                     let strings: Option<Vec<String>> =
                         list.iter().map(|v| v.as_str().map(str::to_owned)).collect();
-                    if let (Some(f), Some(vals)) = (bloom_field(col), strings) {
-                        p.bloom.push((f, vals));
+                    if let (Some(f), Some(vals)) = (equals_field(col), strings) {
+                        p.add_equals(&f, vals);
                     }
                 }
             }
@@ -296,14 +283,13 @@ pub fn extract_pruning(filter: &Expr) -> Pruning {
                 if let Expr::Column(col) = expr.as_ref() {
                     require_key(col, &mut p);
                     let field = match col {
-                        ColumnRef::Body => Some(NgramField::Body),
-                        ColumnRef::Attr(k) => Some(NgramField::Attr(k.clone())),
-                        ColumnRef::Resource(k) => Some(NgramField::Resource(k.clone())),
+                        ColumnRef::Body => Some(IndexField::Body),
+                        ColumnRef::Attr(k) => Some(IndexField::Attr(k.clone())),
+                        ColumnRef::Resource(k) => Some(IndexField::Resource(k.clone())),
                         _ => None,
                     };
-                    let probes = stratadb_segment::ngram::probes(pattern);
-                    if let (Some(f), false) = (field, probes.is_empty()) {
-                        p.ngram.push((f, probes));
+                    if let Some(f) = field {
+                        p.add_like(&f, pattern);
                     }
                 }
             }
@@ -466,6 +452,7 @@ impl Plan {
         let pruning = q.filter.as_ref().map(extract_pruning).unwrap_or_default();
         Ok(Plan {
             explain: stmt.explain,
+            table: q.table,
             output_names,
             outputs,
             filter: q.filter,

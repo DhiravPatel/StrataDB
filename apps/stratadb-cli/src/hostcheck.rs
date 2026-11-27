@@ -49,19 +49,7 @@ pub fn cpu_model() -> Option<String> {
 
 /// Physical memory in bytes (Linux `/proc/meminfo`, macOS/BSD `sysctl`).
 pub fn total_memory() -> Option<u64> {
-    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
-        for line in s.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-                return kb.checked_mul(1024);
-            }
-        }
-    }
-    let out = Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    stratadb_common::memory::physical_memory()
 }
 
 /// Minimal bounded DER reader (definite lengths only, as DER requires).

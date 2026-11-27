@@ -1,5 +1,9 @@
 # WAL format v2
 
+> Since 2026-11-26 new segments are written as [v3](wal-v3.md), which keeps
+> this layout and adds columnar record types. v2 is still written when
+> `[storage] wal_format_version = 2` is set (rollback window).
+
 Written since StrataDB 0.0.1 (2026-11-25). Readers accept v1 and v2
 ([wal-v1.md](wal-v1.md)); a segment's version is in its header and fixes the
 frame layout for the whole segment. Golden fixture: `tests/fixtures/wal-v2/`

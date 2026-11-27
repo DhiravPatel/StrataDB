@@ -106,3 +106,18 @@ Review the network values (`bbr` needs the `tcp_bbr` module) and size
 - NVMe power-loss protection (needs NVMe identify);
 - the C-state configuration;
 - io_uring opcodes (no io_uring backend yet).
+
+## `strata doctor storage`: commit-path latency (spec STRATA-SYS-07-008)
+
+```
+strata doctor storage --dir <data-dir>/wal [--iterations 1000]
+```
+
+This times `iterations` × (4 KiB write + fdatasync) on a temporary file in
+`--dir`, using the same call the WAL uses for each group commit, and prints
+p50, p99, max and mean in µs. It also prints the implied commit rate of one
+writer (`1 / p50`). Group commit multiplies that rate by the group size. The
+adaptive delay waits at most about one fsync latency to gather a group. The
+temporary file is removed afterwards. Run it on the device and filesystem
+the WAL will use, while that device is otherwise idle.
+

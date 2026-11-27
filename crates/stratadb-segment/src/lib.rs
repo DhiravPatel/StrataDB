@@ -20,7 +20,6 @@ mod columns;
 pub mod ngram;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use stratadb_common::checksum::crc32c;
@@ -66,13 +65,8 @@ impl Default for WriteOptions {
     }
 }
 
-/// Which attribute map a shredded column belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum Scope {
-    Attributes = 0,
-    Resource = 1,
-}
+/// Which attribute map a shredded column belongs to (persisted as its `u8`).
+pub use stratadb_schema::column::Scope;
 
 /// Directory entry for one shredded attribute key (format v3).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -574,6 +568,33 @@ pub fn write_segment_sealed(
     opts: &WriteOptions,
     keys: Option<&stratadb_crypto::Keyring>,
 ) -> Result<WrittenSegment> {
+    write_segment_io(
+        &*stratadb_common::io::default_io(),
+        path,
+        segment_id,
+        tenant,
+        rows,
+        created_ms,
+        extensions,
+        opts,
+        keys,
+    )
+}
+
+/// [`write_segment_sealed`] writing through `io` (spec STRATA-SYS-04-001):
+/// temporary file, fsync, rename, directory fsync.
+#[allow(clippy::too_many_arguments)]
+pub fn write_segment_io(
+    io: &dyn stratadb_common::io::IoEngine,
+    path: &Path,
+    segment_id: u64,
+    tenant: &TenantId,
+    rows: &mut [RowRef<'_>],
+    created_ms: i64,
+    extensions: Vec<Extension>,
+    opts: &WriteOptions,
+    keys: Option<&stratadb_crypto::Keyring>,
+) -> Result<WrittenSegment> {
     if rows.is_empty() {
         return Err(Error::internal("refusing to write an empty segment"));
     }
@@ -735,15 +756,14 @@ pub fn write_segment_sealed(
 
     let tmp = fsutil::tmp_path(path);
     fsutil::remove_if_exists(&tmp)?;
-    let mut f = fsutil::create_new_file(&tmp)?;
+    let f = io.create_new(&tmp)?;
     if let Some(action) = failpoint::eval("segment::torn_write") {
-        let _ = f.write_all(&bytes[..bytes.len() / 2]);
-        let _ = f.sync_all();
+        let _ = stratadb_common::io::write_all_at(&*f, &bytes[..bytes.len() / 2], 0);
+        let _ = f.sync(false);
         failpoint::fire("segment::torn_write", action)?;
     }
-    f.write_all(&bytes)
-        .ctx(|| format!("writing segment {}", tmp.display()))?;
-    fsutil::sync_file(&f, &tmp, false).ctx(|| format!("fsyncing {}", tmp.display()))?;
+    stratadb_common::io::write_all_at(&*f, &bytes, 0)?;
+    f.sync(false)?;
     drop(f);
     std::fs::rename(&tmp, path).ctx(|| format!("renaming {}", tmp.display()))?;
     let parent = path

@@ -222,10 +222,14 @@ fn serve(r: Resolved) -> Result<()> {
     if let Some(n) = r.max_open_files {
         stratadb_common::io::configure_max_open_files(n)?;
     }
+    if let Some(n) = r.io_max_inflight_per_device {
+        stratadb_common::io::configure_max_inflight_per_device(n)?;
+    }
     let io = stratadb_common::io::default_io();
     tracing::info!(
         component = "server",
         max_open_files = io.stats().max_open_files,
+        max_inflight_per_device = io.stats().max_inflight_per_device,
         backend = io.name(),
         "storage I/O engine"
     );
@@ -246,17 +250,66 @@ fn serve(r: Resolved) -> Result<()> {
         scan_threads = pool.workers(),
         "scan worker pool started"
     );
-    let engine = Arc::new(Engine::open(r.engine.clone())?);
+    // Memory budget and regions (spec VIII.5.2, STRATA-SYS-02-029).
+    let detected = stratadb_common::memory::detect_memory_limit();
+    let mplan = r.memory.plan(detected)?;
+    let mem = stratadb_server::memory::ServerMemory::new(mplan.clone(), r.server.quotas.clone());
+    let mut eopts = r.engine.clone();
+    eopts.memory = Some(Arc::clone(&mem.ingest));
+    eopts.cache_memory = Some(Arc::clone(&mem.cache));
+    eopts.background_memory = Some(Arc::clone(&mem.background));
+    // Flush well before the ingest region fills (active + frozen memtables).
+    let cap = usize::try_from(mplan.ingest / 4)
+        .unwrap_or(usize::MAX)
+        .max(1 << 20);
+    if eopts.memtable_max_bytes > cap {
+        tracing::info!(
+            component = "memory",
+            configured = eopts.memtable_max_bytes,
+            capped = cap,
+            "memtable_max_bytes capped to a quarter of the ingest memory region"
+        );
+        eopts.memtable_max_bytes = cap;
+    }
+    tracing::info!(
+        component = "memory",
+        budget = mplan.budget,
+        source = mplan.source,
+        detected = detected.map(|d| d.0),
+        ingest = mplan.ingest,
+        cache = mplan.cache,
+        background = mplan.background,
+        query_pool = mplan.query,
+        per_query = mplan.per_query,
+        "memory budget"
+    );
+    let engine = Arc::new(Engine::open(eopts.clone())?);
+    let query_log = if r.query_log.enabled {
+        let q = stratadb_server::query_log::QueryLog::open(&r.data_dir, &eopts, &r.query_log)?;
+        tracing::info!(
+            component = "query_log",
+            dir = %stratadb_server::query_log::dir(&r.data_dir).display(),
+            flush_ms = r.query_log.flush_interval.as_millis() as u64,
+            retention_days = r.query_log.retention.as_secs() / 86_400,
+            "system.query_log enabled"
+        );
+        Some(Arc::new(q))
+    } else {
+        None
+    };
     let audit = AuditLog::open(&r.data_dir)?;
     audit.record(
         "server_start",
         None,
         json!({"listen": r.listen.to_string(), "tls": tls.is_some()}),
     )?;
-    let app = router(
-        AppState::new(Arc::clone(&engine), tokens, r.server.clone())
-            .with_audit(AuditLog::open(&r.data_dir)?),
-    );
+    let mut state = AppState::new(Arc::clone(&engine), tokens, r.server.clone())
+        .with_audit(AuditLog::open(&r.data_dir)?)
+        .with_memory(Arc::clone(&mem));
+    if let Some(q) = &query_log {
+        state = state.with_query_log(Arc::clone(q));
+    }
+    let app = router(state);
     let net_id = std::sync::atomic::AtomicUsize::new(0);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -276,6 +329,17 @@ fn serve(r: Resolved) -> Result<()> {
         .map_err(|e| Error::io("starting runtime", e))?;
     let listen = r.listen;
     rt.block_on(async move {
+        // RSS vs tracked memory every 10 s (STRATA-SYS-05-009), off the
+        // async workers since reading RSS may spawn `ps` outside Linux.
+        let sampler = Arc::clone(&mem);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                tick.tick().await;
+                let m = Arc::clone(&sampler);
+                let _ = tokio::task::spawn_blocking(move || m.sample()).await;
+            }
+        });
         let listener = tokio::net::TcpListener::bind(listen)
             .await
             .map_err(|e| Error::io(format!("binding {listen}"), e))?;
@@ -298,6 +362,15 @@ fn serve(r: Resolved) -> Result<()> {
     tracing::info!(component = "server", "shutting down; flushing");
     if let Err(e) = audit.record("server_stop", None, json!({})) {
         tracing::error!(component = "audit", error = %e, "audit record could not be written");
+    }
+    if let Some(q) = query_log {
+        // Writes the buffered entries; a failure loses only query log entries.
+        q.shutdown();
+        if let Ok(q) = Arc::try_unwrap(q) {
+            if let Err(e) = q.close() {
+                tracing::warn!(component = "query_log", error = %e, "closing the query log");
+            }
+        }
     }
     match Arc::try_unwrap(engine) {
         Ok(e) => e.close(),

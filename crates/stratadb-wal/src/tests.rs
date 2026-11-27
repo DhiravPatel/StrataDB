@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)] // tests read and corrupt files on purpose, bypassing the I/O engine
 use super::*;
 use proptest::prelude::*;
 use stratadb_common::ErrorKind;
@@ -9,6 +10,10 @@ fn opts(d: Durability) -> WalOptions {
         max_record_bytes: 1 << 20,
         recovery: RecoveryPolicy::TruncateTornTail,
         keys: None,
+        adaptive_group_delay: true,
+        group_bytes: 1 << 20,
+        io: None,
+        format_version: format::FORMAT_VERSION,
     }
 }
 
@@ -420,7 +425,10 @@ fn v1_segments_are_read_and_not_appended_to() {
     let files = segment_files(dir.path());
     assert_eq!(files.len(), 2, "{files:?}");
     let new = fs::read(&files[1]).unwrap();
-    assert_eq!(format::decode_header(&new, "t").unwrap().version, 2);
+    assert_eq!(
+        format::decode_header(&new, "t").unwrap().version,
+        format::FORMAT_VERSION
+    );
     let (_, recs, _) = collect(dir.path(), opts(Durability::Sync), 0).unwrap();
     assert_eq!(recs.len(), 3);
 
@@ -477,7 +485,11 @@ fn generate_wal_v2_fixture() {
     let out = fixture_dir();
     assert!(!out.exists(), "fixture exists; never regenerate it");
     let tmp = tempfile::tempdir().unwrap();
-    let (wal, _, _) = collect(tmp.path(), opts(Durability::Sync), 0).unwrap();
+    let o = WalOptions {
+        format_version: 2,
+        ..opts(Durability::Sync)
+    };
+    let (wal, _, _) = collect(tmp.path(), o, 0).unwrap();
     for i in 1..=4 {
         wal.append(RecordType::EventBatch, &fixture_payload(i))
             .unwrap();
@@ -489,6 +501,166 @@ fn generate_wal_v2_fixture() {
         out.join(format::segment_file_name(1)),
     )
     .unwrap();
+}
+
+/// Records of any type, for the v3 tests.
+type TypedRecords = Vec<(u64, RecordType, Vec<u8>)>;
+
+fn collect_typed(dir: &Path, o: WalOptions) -> Result<(Wal, TypedRecords)> {
+    let mut out = Vec::new();
+    let (wal, _) = Wal::open(dir, o, 0, |seq, t, p| {
+        out.push((seq, t, p.to_vec()));
+        Ok(())
+    })?;
+    Ok((wal, out))
+}
+
+fn v3_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/wal-v3")
+}
+
+/// Records of the v3 fixture: one of each record type.
+fn v3_fixture_records() -> TypedRecords {
+    [
+        RecordType::EventBatch,
+        RecordType::IdempotentEventBatch,
+        RecordType::ColumnarEventBatch,
+        RecordType::IdempotentColumnarEventBatch,
+    ]
+    .into_iter()
+    .zip(1u64..)
+    .map(|(t, i)| (i, t, format!("wal-v3 fixture record {i}").into_bytes()))
+    .collect()
+}
+
+/// Golden WAL v3 directory: one segment, records 1..=4 of types 1..=4,
+/// `synced_through` 0..=3. Never regenerate to fix a failure.
+#[test]
+fn reads_wal_v3_fixture() {
+    let dir = tempfile::tempdir().unwrap();
+    for f in fs::read_dir(v3_fixture_dir()).unwrap() {
+        let f = f.unwrap();
+        fs::copy(f.path(), dir.path().join(f.file_name())).unwrap();
+    }
+    let data = fs::read(dir.path().join(format::segment_file_name(1))).unwrap();
+    assert_eq!(format::decode_header(&data, "fixture").unwrap().version, 3);
+    let (_, recs) = collect_typed(dir.path(), opts(Durability::Sync)).unwrap();
+    assert_eq!(recs, v3_fixture_records());
+}
+
+/// One-off generator for `tests/fixtures/wal-v3` (refuses to overwrite).
+#[test]
+#[ignore = "writes tests/fixtures/wal-v3; run once when introducing the format"]
+fn generate_wal_v3_fixture() {
+    let out = v3_fixture_dir();
+    assert!(!out.exists(), "fixture exists; never regenerate it");
+    let tmp = tempfile::tempdir().unwrap();
+    let o = WalOptions {
+        format_version: 3,
+        ..opts(Durability::Sync)
+    };
+    let (wal, _) = collect_typed(tmp.path(), o).unwrap();
+    for (_, t, p) in v3_fixture_records() {
+        wal.append(t, &p).unwrap();
+    }
+    drop(wal);
+    fs::create_dir_all(&out).unwrap();
+    fs::copy(
+        tmp.path().join(format::segment_file_name(1)),
+        out.join(format::segment_file_name(1)),
+    )
+    .unwrap();
+}
+
+/// Writing v2 (rollback window): only v2 record types, v2 segments. Switching
+/// to v3 starts a new segment; both are read back in order.
+#[test]
+fn format_version_2_rollback_window_and_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let v2 = WalOptions {
+        format_version: 2,
+        ..opts(Durability::Sync)
+    };
+    let (wal, _) = collect_typed(dir.path(), v2.clone()).unwrap();
+    wal.append(RecordType::EventBatch, b"one").unwrap();
+    let err = wal
+        .append(RecordType::ColumnarEventBatch, b"x")
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+    drop(wal);
+    let files = segment_files(dir.path());
+    assert_eq!(
+        format::decode_header(&fs::read(&files[0]).unwrap(), "t")
+            .unwrap()
+            .version,
+        2
+    );
+    // Upgrade: v3 is written to a new segment.
+    let (wal, recs) = collect_typed(dir.path(), opts(Durability::Sync)).unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(
+        wal.append(RecordType::ColumnarEventBatch, b"two").unwrap(),
+        2
+    );
+    drop(wal);
+    let files = segment_files(dir.path());
+    assert_eq!(files.len(), 2);
+    assert_eq!(
+        format::decode_header(&fs::read(&files[1]).unwrap(), "t")
+            .unwrap()
+            .version,
+        3
+    );
+    // A v2-only reader configuration still reads everything (reading is not
+    // limited by the write version) but appends to a new v2 segment.
+    let (wal, recs) = collect_typed(dir.path(), v2).unwrap();
+    assert_eq!(
+        recs.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(),
+        vec![
+            (1, RecordType::EventBatch),
+            (2, RecordType::ColumnarEventBatch)
+        ]
+    );
+    assert_eq!(wal.append(RecordType::EventBatch, b"three").unwrap(), 3);
+    drop(wal);
+    assert_eq!(segment_files(dir.path()).len(), 3);
+    // Out-of-range write versions are refused.
+    for bad in [1, 4] {
+        let o = WalOptions {
+            format_version: bad,
+            ..opts(Durability::Sync)
+        };
+        assert!(collect_typed(dir.path(), o).is_err(), "{bad}");
+    }
+}
+
+/// A checksum-valid columnar record inside a v2 segment cannot have been
+/// written by StrataDB: replay fails closed.
+#[test]
+fn columnar_record_in_a_v2_segment_is_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut b = format::encode_header(&format::SegmentHeader {
+        base_seq: 1,
+        created_ms: 0,
+        version: 2,
+        encryption: None,
+    });
+    let payload = b"columnar";
+    let mut frame = vec![0u8; FRAME_HEADER_LEN];
+    format::encode_frame_into(
+        &mut frame,
+        RecordType::ColumnarEventBatch,
+        1,
+        0,
+        payload.len() as u32,
+        crc32c(payload),
+    );
+    b.extend_from_slice(&frame);
+    b.extend_from_slice(payload);
+    fs::write(dir.path().join(format::segment_file_name(1)), b).unwrap();
+    let err = collect_typed(dir.path(), opts(Durability::Sync)).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Corruption, "{err}");
+    assert!(err.to_string().contains("in a v2 segment"), "{err}");
 }
 
 fn keyring(dir: &Path) -> Arc<stratadb_crypto::Keyring> {
@@ -592,4 +764,126 @@ fn encrypted_reordered_tail_is_truncated() {
         rep.truncation.unwrap().kind,
         format::InvalidTail::UnsyncedReordered
     );
+}
+
+/// Group commit is adaptive (spec STRATA-SYS-07-004).
+mod adaptive_group_commit {
+    use super::*;
+    use std::time::Instant;
+
+    fn wal(dir: &Path, max_delay: Duration, adaptive: bool, group_bytes: u64) -> Wal {
+        let o = WalOptions {
+            durability: Durability::GroupCommit { max_delay },
+            segment_max_bytes: 64 << 20,
+            adaptive_group_delay: adaptive,
+            group_bytes,
+            ..opts(Durability::Sync)
+        };
+        collect(dir, o, 0).unwrap().0
+    }
+
+    fn sequential(w: &Wal, n: usize) -> Duration {
+        let t = Instant::now();
+        for i in 0..n {
+            let seq = w
+                .append(RecordType::EventBatch, format!("r{i}").as_bytes())
+                .unwrap();
+            assert!(w.durable_seq() >= seq);
+        }
+        t.elapsed()
+    }
+
+    #[test]
+    fn a_lone_writer_does_not_wait_for_a_group() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let delay = Duration::from_millis(40);
+        let n = 12;
+        // Fixed delay: every commit waits ~40 ms for writers that never come.
+        let fixed = sequential(&wal(a.path(), delay, false, 1 << 20), n);
+        assert!(fixed >= delay * (n as u32 - 1), "{fixed:?}");
+        // Adaptive: arrival rate x fsync latency < 1 -> flush immediately.
+        let w = wal(b.path(), delay, true, 1 << 20);
+        let adaptive = sequential(&w, n);
+        assert!(
+            adaptive * 2 < fixed,
+            "adaptive {adaptive:?} vs fixed {fixed:?}"
+        );
+        let m = w.metrics();
+        // Leader waits recorded; with one writer they are (almost) zero.
+        assert_eq!(m.group_delay_seconds.count, n as u64);
+        assert!(
+            m.group_delay_seconds.sum < 0.010 * n as f64,
+            "{}",
+            m.group_delay_seconds.sum
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_are_batched_and_never_wait_past_max_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let max_delay = Duration::from_millis(5);
+        let w = Arc::new(wal(dir.path(), max_delay, true, 1 << 20));
+        let (threads, per) = (8, 40);
+        let hs: Vec<_> = (0..threads)
+            .map(|t| {
+                let w = Arc::clone(&w);
+                std::thread::spawn(move || {
+                    for i in 0..per {
+                        let seq = w
+                            .append(RecordType::EventBatch, format!("t{t}-{i}").as_bytes())
+                            .unwrap();
+                        assert!(w.durable_seq() >= seq, "acknowledged => durable");
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        let m = w.metrics();
+        let records = (threads * per) as f64;
+        let syncs = m.group_size.count as f64;
+        // Batching: clearly fewer fsyncs than records.
+        assert!(
+            syncs < records / 2.0,
+            "{syncs} fsyncs for {records} records"
+        );
+        assert!(
+            (m.group_size.sum - records).abs() < 1.0,
+            "every record synced once"
+        );
+        // Leaders wait until a deadline of at most max_delay. The measured
+        // wait also includes re-acquiring the WAL lock and being scheduled
+        // after the deadline, which on a loaded test machine (the whole
+        // suite runs in parallel) adds milliseconds, so allow 4x slack on
+        // the mean and a loose bound on the worst case.
+        let mean = m.group_delay_seconds.sum / m.group_delay_seconds.count.max(1) as f64;
+        assert!(mean <= 4.0 * max_delay.as_secs_f64(), "mean wait {mean}");
+        let p100 = m.group_delay_seconds.quantile_upper_bound(1.0).unwrap();
+        assert!(p100 <= 0.5, "{p100}");
+    }
+
+    #[test]
+    fn a_full_group_is_flushed_before_the_delay_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        // Huge delay, tiny byte threshold: groups flush as soon as anything is pending.
+        let w = Arc::new(wal(dir.path(), Duration::from_secs(5), true, 1));
+        let t = Instant::now();
+        let hs: Vec<_> = (0..4)
+            .map(|k| {
+                let w = Arc::clone(&w);
+                std::thread::spawn(move || {
+                    for i in 0..20 {
+                        w.append(RecordType::EventBatch, format!("{k}/{i}").as_bytes())
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+        assert_eq!(w.durable_seq(), w.last_seq());
+    }
 }

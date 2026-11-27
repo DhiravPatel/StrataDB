@@ -1,0 +1,46 @@
+# Layer of every workspace crate (spec IX.1.1; STRATA-ARCH-01-001/002/003).
+# Checked by `scripts/check_layers.py`, which runs in `scripts/check.sh` and CI.
+#
+# Rule (ARCH-01-001): a crate may depend on crates of its own layer, of the
+# layer directly below its lowest layer, and of L1. Anything else is an
+# upward or a skip-level dependency and fails the check, unless it is listed
+# under [[allow]] with the spec section that sanctions it.
+#
+# A crate may span adjacent layers (`layers = [3, 4]`) when it has not been
+# split yet; the rule then applies to its lowest layer for "directly below"
+# and to its highest layer for "upward".
+#
+# `role = "root"` marks composition roots and harnesses: binaries that
+# assemble or exercise the whole system (spec IX.11 lists strata-bench,
+# strata-doctor and strata-sim outside the layers). They may depend on any
+# crate; no layered crate may depend on them.
+#
+# Dev-dependencies (tests) may skip layers, since a test stands up a whole
+# system, but may never point upward, and never at a root.
+
+[crates]
+"stratadb-common" = { layers = [1] }   # errors, codecs, CRC, I/O engine, threads (strata-common/-io)
+"stratadb-crypto" = { layers = [1] }   # envelope encryption, sealed containers
+"stratadb-schema" = { layers = [1] }   # event model and column types (strata-types, ARCH-11-001)
+"stratadb-wal" = { layers = [2] }
+"stratadb-segment" = { layers = [2] }   # part format writer/reader
+"stratadb-storage" = { layers = [2] }   # engine, memtable, manifest, ScanSource
+"stratadb-query" = { layers = [3, 4] }  # executor (L3) and StrataQL parser/planner (L4)
+"stratadb-server" = { layers = [5, 6] } # admission, quotas, registry (L5); HTTP, TLS, auth (L6)
+"stratadb-client" = { layers = [7] }    # Rust SDK
+"stratadb-cli" = { role = "root" }      # `strata`: local admin, offline verify/repair, doctor
+"stratadb-bench" = { role = "root" }    # `strata-bench`
+"stratadb-testkit" = { role = "root" }  # synthetic datasets for benches and tests
+"stratadb-fuzz" = { role = "root" }     # fuzz harness library
+
+# Edges a layer rule alone would reject, each sanctioned by the spec.
+[[allow]]
+from = "stratadb-server"
+to = "stratadb-storage"
+reason = "INSERT data flow (spec IX.1.4): L5 admission hands the batch to the L2 table engine; queries still go through L4."
+
+# Edges that are forbidden even though the layer rule would allow them.
+[[forbid]]
+from = "stratadb-query"
+to = ["stratadb-segment", "stratadb-wal"]
+reason = "STRATA-ARCH-01-003: the execution engine must not know file formats; it reads through stratadb_storage::ScanSource."

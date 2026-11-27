@@ -1,0 +1,58 @@
+# Queries over unflushed data (spec STRATA-ARCH-02-012/013): 200k app-log
+# events stay in the memtable (4 tenants, ~50k rows each) after one flushed
+# segment per tenant. Run with:
+#   strata-bench scenario benchmarks/scenarios/memtable.toml --out <dir> --hw-profile <HW-REF-n>
+name = "memtable"
+description = "Log queries over 200k memtable rows (4 tenants) plus one flushed segment per tenant"
+
+[dataset]
+profile = "app-logs"
+events = 240000
+tenants = 4
+seed = 3
+batch_size = 1000
+# One segment per tenant from the first 40k events; the rest stay unflushed
+# (replayed from the WAL when the harness reopens the engine).
+flush_every = 40000
+max_flushes = 1
+final_flush = false
+
+[engine]
+durability = "group_commit"
+group_commit_delay_ms = 2
+memtable_max_bytes = 4294967296
+memtable_max_rows = 10000000
+memtable_max_age_s = 3600
+
+[run]
+warmup = 2
+repetitions = 10
+cache = "warm"
+
+[[query]]
+id = "m01_trace_id_lookup"
+sql = "SELECT event_time, body FROM logs WHERE trace_id = '{trace_id}'"
+
+[[query]]
+id = "m02_recent_errors"
+sql = "SELECT event_time, service, body FROM logs WHERE event_time >= {t_recent} AND severity = 'ERROR' ORDER BY event_time DESC LIMIT 100"
+[query.expect]
+memory_chunks_pruned = ">= 1"
+
+[[query]]
+id = "m03_old_time_range"
+sql = "SELECT count(*) FROM logs WHERE event_time >= {t_mid_lo} AND event_time < {t_mid_hi}"
+[query.expect]
+memory_chunks_pruned = ">= 1"
+
+[[query]]
+id = "m04_service_count"
+sql = "SELECT service, count(*) AS n FROM logs GROUP BY service ORDER BY n DESC"
+
+[[query]]
+id = "m05_fatal_only"
+sql = "SELECT count(*) FROM logs WHERE severity = 'FATAL'"
+
+[[query]]
+id = "m06_limit_scan"
+sql = "SELECT event_time, body FROM logs LIMIT 20"

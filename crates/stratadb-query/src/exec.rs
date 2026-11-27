@@ -1,8 +1,8 @@
 //! Budgeted executor over a tenant-scoped storage [`Snapshot`] (spec §13.5, §13.6).
 //!
-//! Data flows as columnar batches: segments contribute only the column chunks
-//! the plan needs (each checksummed on read); memtable rows are converted into
-//! the same representation. The filter, projection, grouping and sort keys are
+//! Data flows as columnar batches from storage [`ScanSource`]s (segments and
+//! memtable chunks alike, spec STRATA-ARCH-01-003): the executor states which
+//! columns and attribute keys it needs and never sees a file format. The filter, projection, grouping and sort keys are
 //! evaluated per row over a batch.
 
 use std::collections::{BTreeMap, HashMap};
@@ -12,15 +12,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use stratadb_common::codec::Encoder;
+use stratadb_common::memory::{Accountant, MemoryTracker, DEFAULT_BATCH_BYTES};
 use stratadb_common::{Error, ErrorKind, Result, TenantId};
-use stratadb_schema::{Event, Severity, Value};
-use stratadb_segment::{ColumnData, ColumnId, RawValues, Scope};
-use stratadb_storage::{SegmentHandle, Snapshot};
+use stratadb_schema::column::{ColumnData, ColumnId, RawValues, Scope, StrColumn};
+use stratadb_schema::{Severity, Value};
+use stratadb_storage::scan::{ColumnRequest, Pruned, ScanSource};
+use stratadb_storage::Snapshot;
 
-use crate::ast::{AggFunc, CmpOp, ColumnRef, ExplainMode, Expr};
+use crate::ast::{AggFunc, CmpOp, ColumnRef, ExplainMode, Expr, Table};
 use crate::eval::{self, Datum, Truth};
 use crate::page::{self, Cursor};
-use crate::plan::{OutputSource, Plan, Pruning, SortSource};
+use crate::plan::{OutputSource, Plan, SortSource};
 
 /// Per-query resource budget and switches. Defaults are conservative.
 #[derive(Debug, Clone)]
@@ -28,8 +30,15 @@ pub struct QueryOptions {
     pub timeout: Duration,
     pub max_rows_scanned: u64,
     pub max_result_rows: usize,
-    /// Approximate bound on memory held by result rows and aggregation groups.
+    /// Memory limit of the query: result rows, aggregation groups and the
+    /// column batches being scanned (reserved before they are read).
     pub max_memory_bytes: usize,
+    /// Parent tracker of the query's memory (tenant / query pool, spec
+    /// VIII.5.2). `None`: the query is accounted on its own.
+    pub memory: Option<Arc<MemoryTracker>>,
+    /// How long a reservation may wait for memory to be released before the
+    /// query fails with `MEMORY_LIMIT_EXCEEDED` (0 = fail fast).
+    pub memory_wait: Duration,
     pub cancel: Option<Arc<AtomicBool>>,
     /// Segment pruning by statistics. Disabling it must never change results.
     pub enable_pruning: bool,
@@ -61,6 +70,8 @@ impl Default for QueryOptions {
             max_rows_scanned: 100_000_000,
             max_result_rows: 100_000,
             max_memory_bytes: 256 * 1024 * 1024,
+            memory: None,
+            memory_wait: Duration::ZERO,
             cancel: None,
             enable_pruning: true,
             enable_vectorized: true,
@@ -92,6 +103,8 @@ pub struct QueryStats {
     pub indexes_used: Vec<String>,
     pub segments_scanned: usize,
     pub memory_rows_scanned: u64,
+    /// Memtable chunk windows skipped by their zone maps (time, severity).
+    pub memory_chunks_pruned: u64,
     pub rows_scanned: u64,
     pub rows_matched: u64,
     pub bytes_read: u64,
@@ -111,6 +124,14 @@ pub struct QueryStats {
     /// Estimated single-core CPU ms of the segment scan (drives the degree
     /// of parallelism, STRATA-SYS-11-008).
     pub est_cpu_ms: f64,
+    /// CPU time of the query: the executing thread (parse, plan, scan,
+    /// merge) plus the scan-pool workers that helped (STRATA-SYS-13-009).
+    pub cpu: Duration,
+    /// The table read (`logs`, `system.query_log`).
+    pub table: &'static str,
+    /// Peak memory reserved by the query on its tracker (operator state and
+    /// column batches, in reservation batches).
+    pub memory_reserved_peak: u64,
 }
 
 /// Result of a query. `rows[i][j]` is `None` when the value is missing.
@@ -123,16 +144,64 @@ pub struct QueryOutput {
     pub explain: Option<String>,
 }
 
-/// Parse, plan, and run `sql` against `snapshot`.
-pub fn execute(snapshot: &Snapshot, sql: &str, opts: &QueryOptions) -> Result<QueryOutput> {
+/// Resolves the tables a query names to tenant-scoped snapshots (spec §17).
+/// A bare [`Snapshot`] is a catalog holding only `logs`.
+pub trait Catalog {
+    /// The tenant every resolved snapshot must belong to.
+    fn tenant(&self) -> &TenantId;
+    /// A snapshot of `table` for [`Catalog::tenant`].
+    fn snapshot(&self, table: Table) -> Result<std::borrow::Cow<'_, Snapshot>>;
+}
+
+impl Catalog for Snapshot {
+    fn tenant(&self) -> &TenantId {
+        Snapshot::tenant(self)
+    }
+
+    fn snapshot(&self, table: Table) -> Result<std::borrow::Cow<'_, Snapshot>> {
+        match table {
+            Table::Logs => Ok(std::borrow::Cow::Borrowed(self)),
+            t => Err(Error::unsupported(format!(
+                "table {} is not available here",
+                t.name()
+            ))),
+        }
+    }
+}
+
+/// The plan's table from `catalog`, checked to be the catalog's tenant
+/// (defense in depth: a query never reads another tenant's snapshot).
+fn resolve<'c, C: Catalog + ?Sized>(
+    catalog: &'c C,
+    plan: &Plan,
+) -> Result<std::borrow::Cow<'c, Snapshot>> {
+    let snap = catalog.snapshot(plan.table)?;
+    if snap.tenant() != catalog.tenant() {
+        return Err(Error::internal(
+            "catalog returned another tenant's snapshot",
+        ));
+    }
+    Ok(snap)
+}
+
+/// Parse, plan, and run `sql` against the tables of `catalog` (a
+/// [`Snapshot`] for `logs` only).
+pub fn execute<C: Catalog + ?Sized>(
+    catalog: &C,
+    sql: &str,
+    opts: &QueryOptions,
+) -> Result<QueryOutput> {
+    let cpu = stratadb_common::cpu::thread_cpu_time();
     let t = Instant::now();
     let stmt = crate::parser::parse(sql, &opts.parse_limits)?;
     let parsed = t.elapsed();
     let plan = Plan::new(stmt)?;
     let planned = t.elapsed() - parsed;
-    let mut res = run(snapshot, &plan, opts, None)?;
+    let snapshot = resolve(catalog, &plan)?;
+    let mut res = run(&snapshot, &plan, opts, None)?;
     res.output.stats.parse = parsed;
     res.output.stats.plan = planned;
+    res.output.stats.cpu += stratadb_common::cpu::thread_cpu_time().saturating_sub(cpu);
     if res.output.explain.is_none() && res.rows.len() > opts.max_result_rows {
         return Err(Error::resource_exhausted(format!(
             "result has more than {} rows; add a LIMIT or paginate",
@@ -174,12 +243,13 @@ pub struct Page {
 ///
 /// The cursor is bound to the tenant and the query text. Aggregate and
 /// `EXPLAIN` queries cannot be paginated.
-pub fn execute_page(
-    snapshot: &Snapshot,
+pub fn execute_page<C: Catalog + ?Sized>(
+    catalog: &C,
     sql: &str,
     opts: &QueryOptions,
     req: &PageRequest,
 ) -> Result<Page> {
+    let cpu = stratadb_common::cpu::thread_cpu_time();
     let t = Instant::now();
     let stmt = crate::parser::parse(sql, &opts.parse_limits)?;
     let parsed = t.elapsed();
@@ -202,6 +272,7 @@ pub fn execute_page(
             req.page_size, opts.max_result_rows
         )));
     }
+    let snapshot = resolve(catalog, &plan)?;
     let fp = page::fingerprint(snapshot.tenant(), sql);
     let cursor = match &req.cursor {
         None => None,
@@ -246,9 +317,10 @@ pub fn execute_page(
         // One extra row tells whether another page exists.
         k: take.saturating_add(1),
     };
-    let mut res = run(snapshot, &plan, opts, Some(pctx))?;
+    let mut res = run(&snapshot, &plan, opts, Some(pctx))?;
     res.output.stats.parse = parsed;
     res.output.stats.plan = planned;
+    res.output.stats.cpu += stratadb_common::cpu::thread_cpu_time().saturating_sub(cpu);
     let more = res.rows.len() > take && remaining.is_none_or(|r| (take as u64) < r);
     res.rows.truncate(take);
     let next_cursor = match (more, res.rows.last()) {
@@ -369,7 +441,12 @@ pub(crate) struct Batch<'a> {
 /// Where one group key's values come from in a batch — resolved once per
 /// batch, so per-row encoding does no map lookups or key clones.
 enum KeySrc<'b> {
-    Strs(&'b [Option<String>]),
+    Strs(&'b StrColumn),
+    /// A dictionary-encoded string column: each distinct value's key
+    /// encoding computed once (index = code; 0 = missing).
+    Dict(Vec<Vec<u8>>, &'b [u32]),
+    /// A one-byte code column (severity): key encoding per code value.
+    Byte(Box<[Vec<u8>]>, &'b [u8]),
     Values(&'b [Datum]),
     /// Already encoded: copied verbatim (no decode, no allocation).
     Raw(&'b RawValues),
@@ -386,7 +463,9 @@ impl KeySrc<'_> {
             None => enc.put_u8(eval::MISSING_KEY_TAG),
         };
         match self {
-            KeySrc::Strs(v) => match &v[i] {
+            KeySrc::Dict(encoded, codes) => enc.put_raw(&encoded[codes[i] as usize]),
+            KeySrc::Byte(encoded, codes) => enc.put_raw(&encoded[codes[i] as usize]),
+            KeySrc::Strs(v) => match v.get(i) {
                 Some(s) => encode_string_value(enc, s),
                 None => enc.put_u8(eval::MISSING_KEY_TAG),
             },
@@ -399,49 +478,6 @@ impl KeySrc<'_> {
             KeySrc::Eval(e) => val(enc, eval_expr(e, b, i)?.as_ref()),
         }
         Ok(())
-    }
-}
-
-fn opt_str(e: &Event, id: ColumnId) -> Option<String> {
-    match id {
-        ColumnId::Service => e.service.clone(),
-        ColumnId::SeverityText => e.severity_text.clone(),
-        ColumnId::TraceId => e.trace_id.clone(),
-        ColumnId::SpanId => e.span_id.clone(),
-        _ => e.event_id.clone(),
-    }
-}
-
-fn column_from_events(id: ColumnId, evs: &[&Event]) -> ColumnData {
-    match id {
-        ColumnId::EventTime => ColumnData::Ints(evs.iter().map(|e| e.event_time).collect()),
-        ColumnId::IngestTime => ColumnData::Ints(evs.iter().map(|e| e.ingest_time).collect()),
-        ColumnId::SchemaVersion => {
-            ColumnData::Ints(evs.iter().map(|e| i64::from(e.schema_version)).collect())
-        }
-        // Filled from the memtable rows by `memory_column`.
-        ColumnId::Seq | ColumnId::Idx => ColumnData::Ints(vec![0; evs.len()]),
-        ColumnId::Severity => ColumnData::U8s(evs.iter().map(|e| e.severity.as_u8()).collect()),
-        ColumnId::Service
-        | ColumnId::SeverityText
-        | ColumnId::TraceId
-        | ColumnId::SpanId
-        | ColumnId::EventId => ColumnData::Strs(evs.iter().map(|e| opt_str(e, id)).collect()),
-        ColumnId::Body => ColumnData::Values(evs.iter().map(|e| e.body.clone()).collect()),
-        ColumnId::Attributes => {
-            ColumnData::Maps(evs.iter().map(|e| e.attributes.clone()).collect())
-        }
-        ColumnId::ResourceAttributes => {
-            ColumnData::Maps(evs.iter().map(|e| e.resource_attributes.clone()).collect())
-        }
-    }
-}
-
-fn memory_column(id: ColumnId, rows: &[stratadb_storage::MemRow], evs: &[&Event]) -> ColumnData {
-    match id {
-        ColumnId::Seq => ColumnData::Ints(rows.iter().map(|r| r.seq as i64).collect()),
-        ColumnId::Idx => ColumnData::Ints(rows.iter().map(|r| i64::from(r.idx)).collect()),
-        _ => column_from_events(id, evs),
     }
 }
 
@@ -479,7 +515,20 @@ impl Batch<'_> {
                     _ => ColumnId::EventId,
                 };
                 match self.col(id)? {
-                    ColumnData::Strs(v) => KeySrc::Strs(v),
+                    ColumnData::Strs(v) => match v.dict() {
+                        Some((dict, codes)) => {
+                            use stratadb_schema::codec::encode_string_value;
+                            let mut encoded = Vec::with_capacity(dict.len() + 1);
+                            encoded.push(vec![eval::MISSING_KEY_TAG]);
+                            for s in dict {
+                                let mut e = Encoder::new();
+                                encode_string_value(&mut e, s);
+                                encoded.push(e.into_inner());
+                            }
+                            KeySrc::Dict(encoded, codes)
+                        }
+                        None => KeySrc::Strs(v),
+                    },
                     _ => return Err(Error::internal("expected string column")),
                 }
             }
@@ -504,6 +553,23 @@ impl Batch<'_> {
             ColumnRef::Body => match self.col(ColumnId::Body)? {
                 ColumnData::Values(v) => KeySrc::Values(v),
                 _ => return Err(Error::internal("expected value column")),
+            },
+            // The severity name, encoded once per code (exactly what
+            // evaluating the column per row would encode).
+            ColumnRef::Severity => match self.col(ColumnId::Severity)? {
+                ColumnData::U8s(v) => {
+                    use stratadb_schema::codec::encode_value;
+                    let encoded: Box<[Vec<u8>]> = (0..=255u8)
+                        .map(|c| {
+                            let name = Severity::from_u8(c).unwrap_or_default().as_str();
+                            let mut e = Encoder::new();
+                            encode_value(&mut e, &Value::String(name.to_owned()));
+                            e.into_inner()
+                        })
+                        .collect();
+                    KeySrc::Byte(encoded, v)
+                }
+                _ => return Err(Error::internal("expected severity column")),
             },
             // Cheap scalars (no heap) and whole maps: evaluate normally.
             _ => KeySrc::Eval(e),
@@ -530,7 +596,7 @@ impl Batch<'_> {
         };
         let strs = |id| -> Result<Datum> {
             match self.col(id)? {
-                ColumnData::Strs(v) => Ok(v[i].clone().map(Value::String)),
+                ColumnData::Strs(v) => Ok(v.get(i).map(|s| Value::String(s.to_owned()))),
                 _ => Err(Error::internal("expected string column")),
             }
         };
@@ -886,16 +952,37 @@ struct Ctx<'a> {
     /// Rows and memory already added to `budget`.
     reported_rows: u64,
     reported_mem: i64,
+    /// This worker's reservation on the query's memory tracker.
+    acct: Accountant,
+    /// Estimated bytes of the column batch being scanned.
+    batch_mem: u64,
 }
 
 /// Rows scanned and memory held across all workers of one query, so budgets
 /// stay query-wide under parallel scans; `stop` makes workers give up after
 /// another worker failed.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SharedBudget {
     rows: std::sync::atomic::AtomicU64,
     mem: std::sync::atomic::AtomicI64,
     stop: AtomicBool,
+    /// The query's node in the memory hierarchy (limit `max_memory_bytes`).
+    tracker: Arc<MemoryTracker>,
+}
+
+impl SharedBudget {
+    fn new(opts: &QueryOptions) -> Self {
+        let limit = opts.max_memory_bytes as u64;
+        Self {
+            rows: Default::default(),
+            mem: Default::default(),
+            stop: Default::default(),
+            tracker: match &opts.memory {
+                Some(parent) => parent.child("exec", limit),
+                None => MemoryTracker::root("query", limit),
+            },
+        }
+    }
 }
 
 impl<'a> Ctx<'a> {
@@ -921,9 +1008,15 @@ impl<'a> Ctx<'a> {
             keep,
             key_buf: Vec::new(),
             vfilter,
+            acct: Accountant::new(
+                Some(Arc::clone(&budget.tracker)),
+                DEFAULT_BATCH_BYTES,
+                opts.memory_wait,
+            ),
             budget,
             reported_rows: 0,
             reported_mem: 0,
+            batch_mem: 0,
         }
     }
 }
@@ -966,13 +1059,50 @@ impl Ctx<'_> {
             )));
         }
         self.stats.peak_memory_bytes = self.stats.peak_memory_bytes.max(mem);
-        if mem > self.opts.max_memory_bytes {
-            return Err(Error::resource_exhausted(format!(
-                "query memory exceeded {} bytes",
-                self.opts.max_memory_bytes
-            )));
-        }
-        Ok(())
+        // This worker's operator state plus the batch it holds, reserved on
+        // the query tracker (and so on every ancestor pool).
+        self.acct
+            .set_usage(self.mem as u64 + self.batch_mem)
+            .map_err(|e| self.memory_error(e))
+    }
+
+    /// A reservation failure, with the query's own limit spelled out.
+    fn memory_error(&self, e: Error) -> Error {
+        Error::resource_exhausted(format!(
+            "{} (query limit {} bytes)",
+            e.to_string().trim_start_matches("resource_exhausted: "),
+            self.opts.max_memory_bytes
+        ))
+    }
+
+    /// Read `src` (reserving its estimated batch memory first,
+    /// STRATA-SYS-05-005) and process its rows.
+    fn scan(
+        &mut self,
+        src: &dyn ScanSource,
+        needed: &[ColumnId],
+        tenant: &TenantId,
+        projection: bool,
+    ) -> Result<()> {
+        let req = column_request(self.plan, needed, projection);
+        self.batch_mem = src.estimated_read_bytes(&req);
+        self.acct
+            .set_usage(self.mem as u64 + self.batch_mem)
+            .map_err(|e| self.memory_error(e))?;
+        let b = src.read(tenant, &req)?;
+        self.stats.bytes_read += b.bytes_read;
+        self.stats.shredded_reads += b.dedicated_key_reads;
+        let batch = Batch {
+            len: b.rows,
+            tenant,
+            cols: b.columns,
+            shredded: b.keys,
+            raw: b.raw,
+        };
+        let r = self.process(&batch);
+        drop(batch);
+        self.batch_mem = 0;
+        r
     }
 
     /// Rows are sorted before output (explicit ORDER BY or pagination).
@@ -1002,6 +1132,62 @@ impl Ctx<'_> {
         }
     }
 
+    /// Whether every row of a batch is kept (no filter, no page bound): the
+    /// selection is then the dense range, never materialized.
+    fn keeps_all(&self) -> bool {
+        self.plan.filter.is_none() && self.page.is_none()
+    }
+
+    /// The rows of `b[start..end)` that the query keeps: visible to the
+    /// page (`seq <= as_of`) and matching the filter. A selection, not a
+    /// compacted copy: later work reads only these rows (spec
+    /// STRATA-ARCH-03-006).
+    fn select(&self, b: &Batch<'_>, start: usize, end: usize, sel: &mut Vec<u32>) -> Result<()> {
+        sel.clear();
+        let truth = match (&self.plan.filter, &self.vfilter) {
+            (Some(_), Some(vf)) => Some(vf.eval(b, start, end)?),
+            _ => None,
+        };
+        if let (None, Some(t)) = (&self.page, &truth) {
+            // Common case: vectorized filter, no page bound.
+            sel.extend(
+                t.iter()
+                    .enumerate()
+                    .filter(|(_, v)| **v == Some(true))
+                    .map(|(j, _)| (start + j) as u32),
+            );
+            return Ok(());
+        }
+        for i in start..end {
+            if let Some(p) = &self.page {
+                if b.id(i)?.0 > p.as_of {
+                    continue; // committed after the first page
+                }
+            }
+            let keep = match (&self.plan.filter, &truth) {
+                (None, _) => true,
+                (Some(_), Some(t)) => t[i - start] == Some(true),
+                (Some(f), None) => eval_truth(f, b, i)? == Some(true),
+            };
+            if keep {
+                sel.push(i as u32);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the plan is a global `count(*)`-only aggregate: counted from
+    /// selection sizes, without visiting rows.
+    fn count_only(&self) -> bool {
+        let p = self.plan;
+        p.aggregate
+            && p.group_by.is_empty()
+            && !p.aggregates.is_empty()
+            && p.aggregates
+                .iter()
+                .all(|(f, a)| *f == AggFunc::Count && a.is_none())
+    }
+
     fn process(&mut self, b: &Batch<'_>) -> Result<()> {
         let plan = self.plan;
         let key_srcs: Vec<KeySrc<'_>> = if plan.aggregate {
@@ -1012,108 +1198,132 @@ impl Ctx<'_> {
         } else {
             Vec::new()
         };
-        // Vectorized filter results for rows chunk_start..chunk_end.
-        let (mut chunk_start, mut chunk_end) = (0usize, 0usize);
-        let mut truth: Vec<Truth> = Vec::new();
-        for i in 0..b.len {
-            if i % 1024 == 0 {
-                self.check_budget()?;
-            }
+        let count_only = self.count_only();
+        let mut sel: Vec<u32> = Vec::with_capacity(crate::vector::CHUNK);
+        let mut start = 0usize;
+        while start < b.len {
+            let end = (start + crate::vector::CHUNK).min(b.len);
+            self.check_budget()?;
             if self.limit_reached() {
                 self.stats.early_stop = true;
                 return Ok(());
             }
-            self.stats.rows_scanned += 1;
-            let id = match &self.page {
-                Some(p) => {
-                    let id = b.id(i)?;
-                    if id.0 > p.as_of {
-                        continue; // committed after the first page
-                    }
-                    id
-                }
-                None => (0, 0),
-            };
-            if let Some(f) = &self.plan.filter {
-                let t = match &self.vfilter {
-                    Some(vf) => {
-                        if i >= chunk_end {
-                            chunk_start = i;
-                            chunk_end = (i + crate::vector::CHUNK).min(b.len);
-                            truth = vf.eval(b, chunk_start, chunk_end)?;
+            let dense = self.keeps_all();
+            if !dense {
+                self.select(b, start, end, &mut sel)?;
+            }
+            let selected = if dense { end - start } else { sel.len() };
+            if count_only {
+                self.stats.rows_scanned += (end - start) as u64;
+                self.stats.rows_matched += selected as u64;
+                if selected > 0 {
+                    let h = self.groups.hash(&[]);
+                    let idx = match self.groups.find(h, &[]) {
+                        Some(g) => g,
+                        None => {
+                            self.mem += 64 + 48 * plan.aggregates.len();
+                            let states = plan.aggregates.iter().map(|(f, _)| AggState::new(*f));
+                            self.groups.insert(h, &[], states)
                         }
-                        truth[i - chunk_start]
-                    }
-                    None => eval_truth(f, b, i)?,
-                };
-                if t != Some(true) {
-                    continue;
-                }
-            }
-            self.stats.rows_matched += 1;
-            if self.plan.aggregate {
-                // Group key: per key a u32 length then its group_key_bytes,
-                // built in a reused buffer straight from the batch.
-                let mut enc = Encoder::from_vec(std::mem::take(&mut self.key_buf));
-                for src in &key_srcs {
-                    let at = enc.len();
-                    enc.put_u32(0);
-                    src.encode(b, i, &mut enc)?;
-                    let n = (enc.len() - at - 4) as u32;
-                    let mut buf = enc.into_inner();
-                    buf[at..at + 4].copy_from_slice(&n.to_le_bytes());
-                    enc = Encoder::from_vec(buf);
-                }
-                let mut kb = enc.into_inner();
-                let h = self.groups.hash(&kb);
-                let idx = match self.groups.find(h, &kb) {
-                    Some(g) => g,
-                    None => {
-                        // New group: only its key bytes are stored; key
-                        // values are decoded from them once, at output.
-                        self.mem += kb.len() * 3 + 64 + 48 * self.plan.aggregates.len();
-                        let states = self.plan.aggregates.iter().map(|(f, _)| AggState::new(*f));
-                        self.groups.insert(h, &kb, states)
-                    }
-                };
-                kb.clear();
-                self.key_buf = kb;
-                for (j, (_, arg)) in self.plan.aggregates.iter().enumerate() {
-                    let d = match arg {
-                        Some(a) => eval_expr(a, b, i)?,
-                        None => None,
                     };
-                    self.groups.states_mut(idx)[j].update(arg.is_none(), d)?;
-                }
-            } else {
-                let out: Vec<Datum> = self
-                    .plan
-                    .outputs
-                    .iter()
-                    .map(|o| match o {
-                        OutputSource::Row(e) => eval_expr(e, b, i),
-                        _ => Err(Error::internal("non-row output in row query")),
-                    })
-                    .collect::<Result<_>>()?;
-                let keys: Vec<Datum> = self
-                    .plan
-                    .order
-                    .iter()
-                    .map(|(s, _)| match s {
-                        SortSource::Hidden(e) => eval_expr(e, b, i),
-                        SortSource::Output(j) => Ok(out[*j].clone()),
-                    })
-                    .collect::<Result<_>>()?;
-                if let Some((ak, aid)) = self.page.as_ref().and_then(|p| p.after.as_ref()) {
-                    if cmp_position(&self.plan.order, (&keys, id), (ak, *aid)).is_le() {
-                        continue; // at or before the cursor: returned already
+                    for st in self.groups.states_mut(idx) {
+                        if let AggState::Count(n) = st {
+                            *n += selected as u64;
+                        }
                     }
                 }
-                let r = Row { out, keys, id };
-                self.mem += row_size(&r);
-                self.rows.push(r);
-                self.maybe_compact();
+                start = end;
+                continue;
             }
+            let mut scanned_to = end;
+            let rows = if dense {
+                Selected::Dense(start..end)
+            } else {
+                Selected::Rows(sel.iter())
+            };
+            for i in rows {
+                if self.limit_reached() {
+                    // Count rows up to the stopping point, as a row-at-a-time
+                    // scan would.
+                    scanned_to = i;
+                    self.stats.early_stop = true;
+                    break;
+                }
+                let id = match &self.page {
+                    Some(_) => b.id(i)?,
+                    None => (0, 0),
+                };
+                self.stats.rows_matched += 1;
+                if self.plan.aggregate {
+                    // Group key: per key a u32 length then its group_key_bytes,
+                    // built in a reused buffer straight from the batch.
+                    let mut enc = Encoder::from_vec(std::mem::take(&mut self.key_buf));
+                    for src in &key_srcs {
+                        let at = enc.len();
+                        enc.put_u32(0);
+                        src.encode(b, i, &mut enc)?;
+                        let n = (enc.len() - at - 4) as u32;
+                        let mut buf = enc.into_inner();
+                        buf[at..at + 4].copy_from_slice(&n.to_le_bytes());
+                        enc = Encoder::from_vec(buf);
+                    }
+                    let mut kb = enc.into_inner();
+                    let h = self.groups.hash(&kb);
+                    let idx = match self.groups.find(h, &kb) {
+                        Some(g) => g,
+                        None => {
+                            // New group: only its key bytes are stored; key
+                            // values are decoded from them once, at output.
+                            self.mem += kb.len() * 3 + 64 + 48 * self.plan.aggregates.len();
+                            let states =
+                                self.plan.aggregates.iter().map(|(f, _)| AggState::new(*f));
+                            self.groups.insert(h, &kb, states)
+                        }
+                    };
+                    kb.clear();
+                    self.key_buf = kb;
+                    for (j, (_, arg)) in self.plan.aggregates.iter().enumerate() {
+                        let d = match arg {
+                            Some(a) => eval_expr(a, b, i)?,
+                            None => None,
+                        };
+                        self.groups.states_mut(idx)[j].update(arg.is_none(), d)?;
+                    }
+                } else {
+                    let out: Vec<Datum> = self
+                        .plan
+                        .outputs
+                        .iter()
+                        .map(|o| match o {
+                            OutputSource::Row(e) => eval_expr(e, b, i),
+                            _ => Err(Error::internal("non-row output in row query")),
+                        })
+                        .collect::<Result<_>>()?;
+                    let keys: Vec<Datum> = self
+                        .plan
+                        .order
+                        .iter()
+                        .map(|(s, _)| match s {
+                            SortSource::Hidden(e) => eval_expr(e, b, i),
+                            SortSource::Output(j) => Ok(out[*j].clone()),
+                        })
+                        .collect::<Result<_>>()?;
+                    if let Some((ak, aid)) = self.page.as_ref().and_then(|p| p.after.as_ref()) {
+                        if cmp_position(&self.plan.order, (&keys, id), (ak, *aid)).is_le() {
+                            continue; // at or before the cursor: returned already
+                        }
+                    }
+                    let r = Row { out, keys, id };
+                    self.mem += row_size(&r);
+                    self.rows.push(r);
+                    self.maybe_compact();
+                }
+            }
+            self.stats.rows_scanned += (scanned_to - start) as u64;
+            if self.stats.early_stop {
+                return Ok(());
+            }
+            start = end;
         }
         Ok(())
     }
@@ -1126,62 +1336,6 @@ fn row_size(r: &Row) -> usize {
         .chain(r.keys.iter())
         .map(datum_size)
         .sum::<usize>()
-}
-
-/// Why a segment was pruned, if it was.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Pruned {
-    Time,
-    Keys,
-    Severity,
-    Bloom(usize),
-    Ngram(usize),
-}
-
-fn prune(seg: &SegmentHandle, p: &Pruning) -> Option<Pruned> {
-    let e = &seg.entry;
-    if p.time_lo.is_some_and(|lo| e.max_event_time < lo)
-        || p.time_hi.is_some_and(|hi| e.min_event_time > hi)
-    {
-        return Some(Pruned::Time);
-    }
-    let f = seg.reader.footer();
-    if p.required_attrs
-        .iter()
-        .any(|k| !f.attribute_keys.may_contain(k))
-        || p.required_resource
-            .iter()
-            .any(|k| !f.resource_keys.may_contain(k))
-    {
-        return Some(Pruned::Keys);
-    }
-    if let Some(sevs) = &p.severities {
-        if !sevs
-            .iter()
-            .any(|s| f.severity_counts.get(s).is_some_and(|n| *n > 0))
-        {
-            return Some(Pruned::Severity);
-        }
-    }
-    if let Some(bs) = seg.bloom() {
-        for (i, (field, vals)) in p.bloom.iter().enumerate() {
-            if let Some(b) = bs.get(field) {
-                if !vals.iter().any(|v| b.may_contain(v)) {
-                    return Some(Pruned::Bloom(i));
-                }
-            }
-        }
-    }
-    if !p.ngram.is_empty() {
-        if let Some(ns) = seg.ngram() {
-            for (i, (field, probes)) in p.ngram.iter().enumerate() {
-                if !ns.may_match(field, probes) {
-                    return Some(Pruned::Ngram(i));
-                }
-            }
-        }
-    }
-    None
 }
 
 /// True when the first `ORDER BY` key is the plain `event_time` column.
@@ -1200,123 +1354,62 @@ fn first_key_is_event_time(plan: &Plan) -> bool {
 /// row is returned only if `seq <= as_of` and its position sorts strictly
 /// after the cursor, which requires (ingest order) `seq >= cursor seq`, or
 /// (first key `event_time`) `event_time` on the far side of the cursor's.
-fn cursor_prunes(seg: &SegmentHandle, plan: &Plan, p: &PageCtx) -> bool {
-    let e = &seg.entry;
-    if e.min_seq > p.as_of {
+fn cursor_prunes(seg: &dyn ScanSource, plan: &Plan, p: &PageCtx) -> bool {
+    let (min_seq, max_seq) = seg.seq_range();
+    if min_seq > p.as_of {
         return true;
     }
     let Some((keys, (seq, _))) = &p.after else {
         return false;
     };
     if plan.order.is_empty() {
-        return e.max_seq < *seq;
+        return max_seq < *seq;
     }
     if let (true, Some(Some(Value::Timestamp(t)))) = (first_key_is_event_time(plan), keys.first()) {
+        let (min_t, max_t) = seg.event_time_range();
         let desc = plan.order[0].1;
-        return if desc {
-            e.min_event_time > *t
-        } else {
-            e.max_event_time < *t
-        };
+        return if desc { min_t > *t } else { max_t < *t };
     }
     false
 }
 
-/// Read the columns a plan needs from one segment (shredded attribute
-/// columns when they cover every referenced key of a scope).
-fn load_batch<'t>(
-    seg: &SegmentHandle,
-    plan: &Plan,
-    needed: &[ColumnId],
-    tenant: &'t TenantId,
-    stats: &mut QueryStats,
+/// What a plan needs from a source. Attribute scopes the plan references
+/// only through specific keys are requested per key.
+fn column_request<'p>(
+    plan: &'p Plan,
+    needed: &'p [ColumnId],
     projection: bool,
-) -> Result<Batch<'t>> {
-    let mut cols = HashMap::new();
-    let mut shredded = HashMap::new();
-    let mut raw = HashMap::new();
-    let footer = seg.reader.footer();
-    // When a scope is referenced only through specific keys, read just those
-    // keys (shredded chunks, or a projection of the residual map chunk that
-    // skips every other value) instead of materializing whole maps.
-    // With projection disabled, only scopes whose referenced keys are all
-    // shredded in this segment are read per key (the pre-projection rule).
-    let project = |scope: Scope, keys: &std::collections::BTreeSet<String>, whole: bool| {
-        !whole
-            && !keys.is_empty()
-            && (projection || keys.iter().all(|k| footer.shredded(scope, k).is_some()))
-    };
-    let proj_attr = project(Scope::Attributes, &plan.attr_keys, plan.whole_attributes);
-    let proj_res = project(Scope::Resource, &plan.resource_keys, plan.whole_resource);
-    for id in needed {
-        let skip = (*id == ColumnId::Attributes && proj_attr)
-            || (*id == ColumnId::ResourceAttributes && proj_res);
-        if skip {
-            continue;
-        }
-        cols.insert(*id, seg.reader.read_column(*id)?);
-        stats.bytes_read += footer.column(*id).map_or(0, |c| c.len);
-        // Full maps also read their shredded chunks.
-        let scope = match id {
-            ColumnId::Attributes => Some(Scope::Attributes),
-            ColumnId::ResourceAttributes => Some(Scope::Resource),
-            _ => None,
-        };
-        if let Some(scope) = scope {
-            stats.bytes_read += footer
-                .shredded
-                .iter()
-                .filter(|c| c.scope == scope)
-                .map(|c| c.len)
-                .sum::<u64>();
+) -> ColumnRequest<'p> {
+    ColumnRequest {
+        columns: needed,
+        attr_keys: &plan.attr_keys,
+        whole_attributes: plan.whole_attributes,
+        resource_keys: &plan.resource_keys,
+        whole_resource: plan.whole_resource,
+        raw_attr_keys: &plan.raw_group_attr_keys,
+        raw_resource_keys: &plan.raw_group_resource_keys,
+        projection,
+    }
+}
+
+/// The rows of a chunk that a query keeps (spec STRATA-ARCH-03-006): the
+/// whole range when nothing filters, otherwise the selected indices. Rows
+/// are never copied or compacted.
+enum Selected<'a> {
+    Dense(std::ops::Range<usize>),
+    Rows(std::slice::Iter<'a, u32>),
+}
+
+impl Iterator for Selected<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            Selected::Dense(r) => r.next(),
+            Selected::Rows(it) => it.next().map(|&i| i as usize),
         }
     }
-    for (scope, keys, on) in [
-        (Scope::Attributes, &plan.attr_keys, proj_attr),
-        (Scope::Resource, &plan.resource_keys, proj_res),
-    ] {
-        if !on {
-            continue;
-        }
-        if keys.iter().all(|k| footer.shredded(scope, k).is_some()) {
-            stats.shredded_reads += 1;
-        }
-        // Shredded keys needed only as group keys stay encoded.
-        let raw_keys = match scope {
-            Scope::Attributes => &plan.raw_group_attr_keys,
-            Scope::Resource => &plan.raw_group_resource_keys,
-        };
-        let mut decode: Vec<String> = Vec::with_capacity(keys.len());
-        for k in keys {
-            match footer.shredded(scope, k) {
-                Some(c) if raw_keys.contains(k) => {
-                    if let Some(r) = seg.reader.read_shredded_raw(scope, k)? {
-                        stats.bytes_read += c.len;
-                        raw.insert((scope, k.clone()), r);
-                        continue;
-                    }
-                    decode.push(k.clone());
-                }
-                _ => decode.push(k.clone()),
-            }
-        }
-        let keys = decode;
-        if keys.is_empty() {
-            continue;
-        }
-        let (vals, bytes) = seg.reader.read_map_keys(scope, &keys)?;
-        stats.bytes_read += bytes;
-        for (k, col) in keys.into_iter().zip(vals) {
-            shredded.insert((scope, k), col);
-        }
-    }
-    Ok(Batch {
-        len: footer.row_count as usize,
-        tenant,
-        cols,
-        shredded,
-        raw,
-    })
 }
 
 /// Result of scanning one segment in a parallel work item.
@@ -1326,6 +1419,9 @@ struct Partial {
     /// Groups in first-seen order: (key bytes, key values, states).
     groups: crate::groups::GroupTable<AggState>,
     mem: usize,
+    /// The worker's reservation for `rows` and `groups`, handed over with
+    /// them.
+    acct: Accountant,
 }
 
 /// Everything a scan task needs, owned so tasks can run on the shared pool
@@ -1340,7 +1436,7 @@ struct ScanShared {
     vfilter: Option<crate::vector::Filter>,
     budget: Arc<SharedBudget>,
     hasher: ahash::RandomState,
-    segs: Vec<Arc<SegmentHandle>>,
+    segs: Vec<Arc<dyn ScanSource>>,
     needed: Vec<ColumnId>,
     tenant: TenantId,
     /// Next segment index to claim.
@@ -1354,7 +1450,9 @@ struct ScanShared {
 
 impl ScanShared {
     /// Claim and scan segments until none are left or the query stops.
-    fn work(&self) {
+    /// `helper`: running on a pool worker, whose CPU time is recorded in its
+    /// partial results (the calling thread measures its own).
+    fn work(&self, helper: bool) {
         let mut first = true;
         loop {
             if self.budget.stop.load(AtomicOrdering::Relaxed) {
@@ -1374,7 +1472,11 @@ impl ScanShared {
                 i,
                 done: false,
             };
-            let r = self.scan_one(i);
+            let cpu = helper.then(stratadb_common::cpu::thread_cpu_time);
+            let mut r = self.scan_one(i);
+            if let (Some(c), Ok(p)) = (cpu, r.as_mut()) {
+                p.stats.cpu = stratadb_common::cpu::thread_cpu_time().saturating_sub(c);
+            }
             if r.is_err() {
                 self.budget.stop.store(true, AtomicOrdering::Relaxed);
             }
@@ -1396,15 +1498,12 @@ impl ScanShared {
             crate::groups::GroupTable::with_hasher(self.plan.aggregates.len(), self.hasher.clone());
         p.check_budget()?;
         p.stats.segments_scanned += 1;
-        let batch = load_batch(
-            &self.segs[i],
-            &self.plan,
+        p.scan(
+            &*self.segs[i],
             &self.needed,
             &self.tenant,
-            &mut p.stats,
             self.opts.enable_map_projection,
         )?;
-        p.process(&batch)?;
         p.check_budget()?;
         let empty = crate::groups::GroupTable::new(0);
         Ok(Partial {
@@ -1412,6 +1511,10 @@ impl ScanShared {
             rows: std::mem::take(&mut p.rows),
             groups: std::mem::replace(&mut p.groups, empty),
             mem: p.mem,
+            acct: std::mem::replace(
+                &mut p.acct,
+                Accountant::new(None, DEFAULT_BATCH_BYTES, Duration::ZERO),
+            ),
         })
     }
 }
@@ -1497,11 +1600,11 @@ pub const SMALL_QUERY_MAX_WORKERS: usize = 4;
 /// `target_ms_per_worker = 0` always uses `min(parallelism, segments)`.
 pub(crate) fn scan_dop(
     plan: &Plan,
-    segs: &[&Arc<SegmentHandle>],
+    segs: &[&Arc<dyn ScanSource>],
     opts: &QueryOptions,
     idle_workers: usize,
 ) -> (usize, f64) {
-    let rows: u64 = segs.iter().map(|s| s.reader.footer().row_count).sum();
+    let rows: u64 = segs.iter().map(|s| s.rows()).sum();
     let est_ms = rows as f64 * est_ns_per_row(plan) / 1e6;
     let max = opts.parallelism.max(1).min(segs.len().max(1));
     if opts.target_ms_per_worker <= 0.0 {
@@ -1525,7 +1628,7 @@ pub(crate) fn scan_dop(
 /// (lowest index) determines the error.
 fn scan_parallel(
     ctx: &mut Ctx<'_>,
-    segs: &[&Arc<SegmentHandle>],
+    segs: &[&Arc<dyn ScanSource>],
     needed: &[ColumnId],
     tenant: &TenantId,
     workers: usize,
@@ -1541,7 +1644,7 @@ fn scan_parallel(
         vfilter: ctx.vfilter.clone(),
         budget: Arc::clone(&ctx.budget),
         hasher: ctx.groups.hasher(),
-        segs: segs.iter().map(|s| Arc::clone(s)).collect(),
+        segs: segs.iter().map(|s| Arc::clone(*s)).collect(),
         needed: needed.to_vec(),
         tenant: tenant.clone(),
         next: std::sync::atomic::AtomicUsize::new(0),
@@ -1553,12 +1656,12 @@ fn scan_parallel(
     let mut queued = 0;
     for _ in 0..helpers {
         let s = Arc::clone(&shared);
-        match pool.try_submit(Box::new(move || s.work())) {
+        match pool.try_submit(Box::new(move || s.work(true))) {
             Ok(()) => queued += 1,
             Err(_) => break, // saturated: this thread does the rest
         }
     }
-    shared.work();
+    shared.work(false);
     // No index is claimed after this; every claimed index gets filled.
     let claimed = shared.next.fetch_max(n, AtomicOrdering::Relaxed).min(n);
     let results: Vec<Option<Result<Partial>>> = {
@@ -1598,8 +1701,10 @@ fn scan_parallel(
         s.rows_matched += p.stats.rows_matched;
         s.bytes_read += p.stats.bytes_read;
         s.shredded_reads += p.stats.shredded_reads;
+        s.cpu += p.stats.cpu;
         s.peak_memory_bytes = s.peak_memory_bytes.max(p.stats.peak_memory_bytes);
         ctx.mem += p.mem;
+        ctx.acct.absorb(p.acct);
         ctx.rows.extend(p.rows);
         ctx.maybe_compact();
         // Partial groups in their first-seen order → global first-seen order.
@@ -1639,13 +1744,15 @@ fn run(
             .as_ref()
             .filter(|_| opts.enable_vectorized)
             .map(crate::vector::Filter::new),
-        Arc::new(SharedBudget::default()),
+        Arc::new(SharedBudget::new(opts)),
     );
+    ctx.stats.table = plan.table.name();
     let tenant = snapshot.tenant();
+    let sources = snapshot.sources();
     let mut to_scan = Vec::new();
-    for seg in snapshot.segments() {
+    for seg in &sources {
         ctx.stats.segments_total += 1;
-        if &seg.entry.tenant != tenant || &seg.reader.footer().tenant_id != tenant {
+        if !seg.owned_by(tenant) {
             return Err(Error::internal(
                 "snapshot contains another tenant's segment",
             ));
@@ -1653,34 +1760,27 @@ fn run(
         if ctx
             .page
             .as_ref()
-            .is_some_and(|p| cursor_prunes(seg, plan, p))
+            .is_some_and(|p| cursor_prunes(&**seg, plan, p))
         {
             ctx.stats.segments_pruned_cursor += 1;
             continue;
         }
-        match opts
+        let why = opts
             .enable_pruning
-            .then(|| prune(seg, &plan.pruning))
-            .flatten()
-        {
+            .then(|| seg.prune(&plan.pruning))
+            .flatten();
+        match why {
             Some(Pruned::Time) => ctx.stats.segments_pruned_time += 1,
             Some(Pruned::Keys) => ctx.stats.segments_pruned_keys += 1,
             Some(Pruned::Severity) => ctx.stats.segments_pruned_severity += 1,
-            Some(Pruned::Bloom(i)) => {
-                ctx.stats.segments_pruned_bloom += 1;
-                let name = plan.pruning.bloom[i].0.describe();
-                if !ctx.stats.indexes_used.contains(&name) {
-                    ctx.stats.indexes_used.push(name);
-                }
-            }
-            Some(Pruned::Ngram(i)) => {
-                ctx.stats.segments_pruned_ngram += 1;
-                let name = plan.pruning.ngram[i].0.describe();
-                if !ctx.stats.indexes_used.contains(&name) {
-                    ctx.stats.indexes_used.push(name);
-                }
-            }
+            Some(Pruned::Equals(_)) => ctx.stats.segments_pruned_bloom += 1,
+            Some(Pruned::Like(_)) => ctx.stats.segments_pruned_ngram += 1,
             None => to_scan.push(seg),
+        }
+        if let Some(name) = why.and_then(|w| plan.pruning.index_name(w)) {
+            if !ctx.stats.indexes_used.contains(&name) {
+                ctx.stats.indexes_used.push(name);
+            }
         }
     }
     if plan.explain == ExplainMode::Plan {
@@ -1723,39 +1823,24 @@ fn run(
             }
             ctx.check_budget()?;
             ctx.stats.segments_scanned += 1;
-            let batch = load_batch(
-                seg,
-                plan,
-                &needed,
-                tenant,
-                &mut ctx.stats,
-                opts.enable_map_projection,
-            )?;
-            ctx.process(&batch)?;
+            ctx.scan(&**seg, &needed, tenant, opts.enable_map_projection)?;
         }
     }
-    for chunk in snapshot.memory_rows().chunks(4096) {
+    for chunk in snapshot.memory_chunks(4096) {
         if ctx.limit_reached() {
             ctx.stats.early_stop = true;
             break;
         }
         ctx.check_budget()?;
-        let evs: Vec<&Event> = chunk.iter().map(|r| r.event.as_ref()).collect();
-        if evs.iter().any(|e| &e.tenant_id != tenant) {
+        if !chunk.owned_by(tenant) {
             return Err(Error::internal("snapshot contains another tenant's row"));
         }
-        let cols = needed
-            .iter()
-            .map(|id| (*id, memory_column(*id, chunk, &evs)))
-            .collect();
-        ctx.stats.memory_rows_scanned += evs.len() as u64;
-        ctx.process(&Batch {
-            len: evs.len(),
-            tenant,
-            cols,
-            shredded: HashMap::new(),
-            raw: HashMap::new(),
-        })?;
+        if opts.enable_pruning && chunk.prune(&plan.pruning).is_some() {
+            ctx.stats.memory_chunks_pruned += 1;
+            continue;
+        }
+        ctx.stats.memory_rows_scanned += chunk.rows();
+        ctx.scan(&chunk, &needed, tenant, false)?;
     }
     ctx.check_budget()?;
 
@@ -1826,6 +1911,7 @@ fn run(
         ctx.rows.truncate(k);
     }
     ctx.stats.peak_memory_bytes = ctx.stats.peak_memory_bytes.max(ctx.mem);
+    ctx.stats.memory_reserved_peak = ctx.budget.tracker.peak();
     ctx.stats.elapsed = started.elapsed();
     if plan.explain == ExplainMode::Analyze {
         let text = explain_text(plan, snapshot, &ctx.stats, ctx.stats.segments_scanned, true);
@@ -1945,22 +2031,18 @@ fn explain_text(
         s.segments_pruned_ngram,
         to_scan
     );
-    let _ = writeln!(t, "  memtable rows: {}", snap.memory_rows().len());
-    if !p.bloom.is_empty() || !p.ngram.is_empty() {
-        let c: Vec<String> = p
-            .bloom
-            .iter()
-            .map(|(f, v)| format!("{} ({} value(s))", f.describe(), v.len()))
-            .collect();
-        let c: Vec<String> = c
-            .into_iter()
-            .chain(
-                p.ngram
-                    .iter()
-                    .map(|(f, g)| format!("{} ({} trigram(s))", f.describe(), g.len())),
-            )
-            .collect();
-        let _ = writeln!(t, "  index candidates: [{}]", c.join(", "));
+    let _ = writeln!(
+        t,
+        "  memtable rows: {}, chunk windows pruned: {}",
+        snap.memory_row_count(),
+        s.memory_chunks_pruned
+    );
+    if p.has_index_candidates() {
+        let _ = writeln!(
+            t,
+            "  index candidates: [{}]",
+            p.index_candidates().join(", ")
+        );
     }
     let _ = writeln!(
         t,
@@ -1990,6 +2072,7 @@ fn explain_text(
 mod parallel_budget_tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use stratadb_schema::Event;
     use stratadb_storage::{Durability, Engine, EngineOptions};
 
     /// Workers must stop soon after the query-wide row budget is exceeded,
@@ -2019,7 +2102,7 @@ mod parallel_budget_tests {
             crate::parser::parse("SELECT count(*) FROM logs", &opts.parse_limits).unwrap(),
         )
         .unwrap();
-        let budget = Arc::new(SharedBudget::default());
+        let budget = Arc::new(SharedBudget::new(&opts));
         let mut ctx = Ctx::new(
             &plan,
             &opts,
@@ -2029,7 +2112,8 @@ mod parallel_budget_tests {
             None,
             Arc::clone(&budget),
         );
-        let segs: Vec<&Arc<SegmentHandle>> = snap.segments().iter().collect();
+        let srcs = snap.sources();
+        let segs: Vec<&Arc<dyn ScanSource>> = srcs.iter().collect();
         assert_eq!(segs.len(), 40);
         let needed: Vec<ColumnId> = plan.columns.iter().copied().collect();
         let err =
@@ -2048,6 +2132,7 @@ mod parallel_budget_tests {
 mod pool_tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use stratadb_schema::Event;
     use stratadb_storage::{Durability, Engine, EngineOptions};
 
     fn engine(dir: &std::path::Path, segments: i64, rows: i64) -> (Engine, TenantId) {
@@ -2075,11 +2160,74 @@ mod pool_tests {
     }
 
     #[test]
+    fn cpu_time_includes_pool_workers_and_tables_resolve_through_the_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let (e, t) = engine(dir.path(), 8, 4000);
+        let snap = e.snapshot(&t);
+        let sql = "SELECT service, count(*) FROM logs GROUP BY service ORDER BY service";
+        let seq = execute(
+            &snap,
+            sql,
+            &QueryOptions {
+                parallelism: 1,
+                ..QueryOptions::default()
+            },
+        )
+        .unwrap();
+        let par = execute(
+            &snap,
+            sql,
+            &QueryOptions {
+                parallelism: 4,
+                target_ms_per_worker: 0.0,
+                ..QueryOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(seq.rows, par.rows);
+        assert_eq!(seq.stats.table, "logs");
+        assert!(seq.stats.cpu > Duration::ZERO);
+        // Work done by pool helpers is counted: the same scan costs about the
+        // same CPU however it is split. Without helper accounting, a 4-way
+        // scan would report about a quarter of it.
+        assert!(par.stats.scan_workers >= 1);
+        assert!(
+            par.stats.cpu.as_secs_f64() >= 0.4 * seq.stats.cpu.as_secs_f64(),
+            "parallel {:?} vs sequential {:?} (workers {})",
+            par.stats.cpu,
+            seq.stats.cpu,
+            par.stats.scan_workers
+        );
+        // A bare snapshot only holds `logs`.
+        let err = execute(
+            &snap,
+            "SELECT count(*) FROM system.query_log",
+            &QueryOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported, "{err}");
+        // A catalog must not hand out another tenant's snapshot.
+        struct Wrong<'a>(&'a Snapshot, TenantId);
+        impl Catalog for Wrong<'_> {
+            fn tenant(&self) -> &TenantId {
+                &self.1
+            }
+            fn snapshot(&self, _: Table) -> Result<std::borrow::Cow<'_, Snapshot>> {
+                Ok(std::borrow::Cow::Borrowed(self.0))
+            }
+        }
+        let other = TenantId::new("other").unwrap();
+        let err = execute(&Wrong(&snap, other), sql, &QueryOptions::default()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Internal, "{err}");
+    }
+
+    #[test]
     fn degree_of_parallelism_follows_estimated_work_and_idle_capacity() {
         let dir = tempfile::tempdir().unwrap();
         let (e, t) = engine(dir.path(), 8, 1000);
         let snap = e.snapshot(&t);
-        let segs: Vec<&Arc<SegmentHandle>> = snap.segments().iter().collect();
+        let srcs = snap.sources();
+        let segs: Vec<&Arc<dyn ScanSource>> = srcs.iter().collect();
         let opts = |par: usize, target: f64| QueryOptions {
             parallelism: par,
             target_ms_per_worker: target,
@@ -2124,7 +2272,8 @@ mod pool_tests {
         let dir2 = tempfile::tempdir().unwrap();
         let (e2, t2) = engine(dir2.path(), 8, 3000);
         let snap2 = e2.snapshot(&t2);
-        let segs2: Vec<&Arc<SegmentHandle>> = snap2.segments().iter().collect();
+        let srcs2 = snap2.sources();
+        let segs2: Vec<&Arc<dyn ScanSource>> = srcs2.iter().collect();
         let (d, est2) = scan_dop(&rows, &segs2, &opts(8, 5.0), 100);
         assert!(est2 >= SMALL_QUERY_MS, "{est2}");
         assert_eq!(d, 8);
@@ -2169,9 +2318,10 @@ mod pool_tests {
                 }
             }));
         }
-        let segs: Vec<&Arc<SegmentHandle>> = snap.segments().iter().collect();
+        let srcs = snap.sources();
+        let segs: Vec<&Arc<dyn ScanSource>> = srcs.iter().collect();
         let needed: Vec<ColumnId> = p.columns.iter().copied().collect();
-        let budget = Arc::new(SharedBudget::default());
+        let budget = Arc::new(SharedBudget::new(&opts));
         let mut ctx = Ctx::new(
             &p,
             &opts,

@@ -27,7 +27,7 @@ Unknown keys are rejected.
 |---|---|
 | top | `name`, `description` |
 | `[dataset]` | `profile` (testkit profile), `events`, `tenants`, `seed`, `batch_size`, `flush_every` (optional: deterministic segment layout) |
-| `[engine]` | `durability` = `async` \| `sync` \| `group_commit` (**required**, Part V.8), `group_commit_delay_ms`, `bloom`, `ngram`, `compression`, `shredding`, `memtable_max_bytes` |
+| `[engine]` | `durability` = `async` \| `sync` \| `group_commit` (**required**, Part V.8), `group_commit_delay_ms`, `bloom`, `ngram`, `compression`, `shredding`, `memtable_max_bytes`, `adaptive_group_delay`, `memory_accounting` (default true: a server-like, unlimited memory tracker tree; `false` for A/B) |
 | `[query_options]` | `parallelism` (0 = default), `vectorized`, `map_projection`, `target_ms_per_worker` (0 = always `parallelism` workers) |
 | `[run]` | `warmup`, `repetitions` (≥ 5, STRATA-SYS-19-001), `cache` (only `"warm"`: a valid cold run needs a dropped page cache and an idle device, STRATA-SYS-01-009) |
 | `[[query]]` | `id`, `sql` (placeholders `{trace_id}`, `{request_id}`, `{t_start}`, `{t_end}`, `{t_recent}`, `{t_mid_lo}`, `{t_mid_hi}`), `tenant`, `[query.expect]` |

@@ -92,3 +92,20 @@ exhaustively enumerated (random sampling, 2–4 variants per crash point).
 Golden v1 data directory in `tests/fixtures/storage-v1/` (2 tenants, 2 segments,
 6 unflushed WAL rows, all value types). Must decode exactly; never regenerate
 to fix a failure.
+
+## Injected I/O faults (spec STRATA-SYS-04-002; `tests/io_write_faults.rs`, `query/tests/io_faults.rs`)
+Real engine, faults injected by `stratadb_common::io::FaultyIo` (ADR-0027).
+
+| Fault | Where | Expected result | Status |
+|---|---|---|---|
+| Short writes | WAL, segments, manifest | completed by resubmission; data intact, also after reopen | ✅ tested |
+| Short reads | segment reads, WAL replay, manifest load | completed by resubmission; identical results | ✅ tested |
+| Read EIO once | segment read | retried once; identical results | ✅ tested |
+| Read EIO persistent | segment read / manifest load | query fails naming the segment / open fails naming `MANIFEST`; no partial result | ✅ tested |
+| fsync EIO | WAL group commit | `Indeterminate`, engine fails stop; recovery keeps every acknowledged row, the failed batch all-or-nothing | ✅ tested |
+| ENOSPC | segment write during flush | flush fails `resource_exhausted`, engine healthy, retry succeeds, no `.tmp` left | ✅ tested |
+| fsync EIO | manifest commit | fail stop; reopen uses the old manifest + WAL replay, all rows, `verify` passes | ✅ tested |
+
+Since 2026-11-26 (ADR-0031) every case runs with WAL v3 (columnar record
+types). The v1/v2 read paths stay covered by the `storage-v1`, `wal-v2` and
+`encrypted-v1` fixtures and by `compat_wal_v3.rs::upgrade_and_rollback_window`.

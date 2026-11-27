@@ -38,4 +38,11 @@ its decision; it is superseded by a new ADR. Status meanings:
 | [0024](0024-encryption-at-rest.md) | Encryption at rest | Accepted |
 | [0025](0025-parquet-import-export.md) | Parquet import/export (CLI) | Accepted |
 | [0026](0026-performance-architecture-adoption.md) | Adopting spec Parts IV–IX: phase plan, conflicts, hardware honesty | Accepted |
-| [0027](0027-io-engine.md) | Storage I/O engine (pread + sim backends), segment file cache under a descriptor budget | Accepted (read path) |
+| [0027](0027-io-engine.md) | Storage I/O engine (pread + sim backends), segment file cache under a descriptor budget | Accepted (read and write paths) |
+| [0028](0028-layering-and-scan-source.md) | Mechanical layer check; ScanSource seam between storage and executor | Accepted |
+| [0029](0029-query-log.md) | `system.query_log`, query fingerprints, per-query CPU time | Accepted |
+| [0030](0030-memory-accounting.md) | Memory accounting hierarchy: budget, regions, tenant/query trackers, RSS gap | Accepted |
+| [0031](0031-columnar-wal.md) | WAL v3: columnar, LZ4-compressed batch payloads; v2 rollback window | Accepted |
+| [0032](0032-commit-wakeups-and-inflight-io.md) | One fsync per WAL; group-commit wake-up measured (parking_lot kept); per-device in-flight I/O bound | Accepted |
+| [0033](0033-columnar-memtable.md) | Columnar memtable: column chunks, published row counts, zone maps, O(1) freeze, replay into columns | Accepted |
+| [0034](0034-typed-string-columns-and-selections.md) | Typed string columns (plain/dictionary), dictionary filter and group-key kernels, selection vectors, count fast path | Accepted |

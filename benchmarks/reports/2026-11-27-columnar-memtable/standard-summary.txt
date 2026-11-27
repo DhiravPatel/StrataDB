@@ -1,0 +1,16 @@
+  q01_trace_id_lookup                 2.888    2.866  0.992  True
+  q02_request_id_lookup               1.671    1.659  0.993  True
+  q03_recent_errors                   1.481    1.482  1.000  True
+  q04_service_severity                4.784    4.745  0.992  True
+  q05_time_range_scan                 1.325    1.323  0.998  True
+  q06_message_token_search           10.754   10.425  0.969  True
+  q07_attribute_equality              6.457    6.493  1.006  True
+  q08_high_cardinality_agg            3.915    4.028  1.029  True
+  q09_service_time_bucket             4.373    4.434  1.014  True
+  q10_top_error_codes                27.212   27.883  1.025  True
+  q12_historical_wide_range           2.595    2.601  1.002  True
+  q13_absent_substring_search         0.003    0.003  1.000  True
+geomean (excl. q13): 1.002
+A/A spread within base, median: 1.126
+dataset load base: events/s [51639, 49261, 50060] cpu ns/event [4750, 4606, 4503] final flush ms [0, 0, 0]
+dataset load columnar: events/s [48866, 49994, 50824] cpu ns/event [5306, 4584, 4820] final flush ms [0, 0, 0]

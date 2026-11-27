@@ -187,13 +187,7 @@ impl Parser {
             Some(items)
         };
         self.expect_kw("FROM")?;
-        match self.next() {
-            Tok::Ident(t) | Tok::QuotedIdent(t) if t.eq_ignore_ascii_case("logs") => {}
-            _ => {
-                self.i -= 1;
-                return Err(self.err("only the table `logs` exists"));
-            }
-        }
+        let table = self.table()?;
         let filter = if self.eat_kw("WHERE") {
             Some(self.expr()?)
         } else {
@@ -263,12 +257,34 @@ impl Parser {
             None
         };
         Ok(Query {
+            table,
             select,
             filter,
             group_by,
             order_by,
             limit,
         })
+    }
+
+    /// `logs` or `system.query_log`.
+    fn table(&mut self) -> Result<Table> {
+        let name = |t: &Tok| match t {
+            Tok::Ident(t) | Tok::QuotedIdent(t) => Some(t.to_ascii_lowercase()),
+            _ => None,
+        };
+        let first = name(self.peek());
+        if first.as_deref() == Some("logs") {
+            self.i += 1;
+            return Ok(Table::Logs);
+        }
+        if first.as_deref() == Some("system")
+            && self.peek_at(1) == &Tok::Dot
+            && name(self.peek_at(2)).as_deref() == Some("query_log")
+        {
+            self.i += 3;
+            return Ok(Table::QueryLog);
+        }
+        Err(self.err("unknown table; the tables are `logs` and `system.query_log`"))
     }
 
     fn select_item(&mut self) -> Result<SelectItem> {
@@ -601,6 +617,27 @@ mod tests {
         .unwrap();
         assert_eq!(s.query.group_by.len(), 2);
         assert_eq!(s.query.order_by[0].key, OrderKey::Position(3));
+    }
+
+    #[test]
+    fn tables() {
+        assert_eq!(p("SELECT * FROM logs").unwrap().query.table, Table::Logs);
+        assert_eq!(p("SELECT * FROM LOGS").unwrap().query.table, Table::Logs);
+        for q in [
+            "SELECT * FROM system.query_log",
+            "SELECT * FROM SYSTEM.Query_Log",
+        ] {
+            assert_eq!(p(q).unwrap().query.table, Table::QueryLog);
+        }
+        for bad in [
+            "SELECT * FROM system",
+            "SELECT * FROM system.",
+            "SELECT * FROM system.parts",
+            "SELECT * FROM other",
+        ] {
+            let e = p(bad).unwrap_err().to_string();
+            assert!(e.contains("unknown table"), "{bad}: {e}");
+        }
     }
 
     #[test]

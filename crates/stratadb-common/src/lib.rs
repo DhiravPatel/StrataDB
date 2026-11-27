@@ -12,6 +12,7 @@ pub mod failpoint;
 pub mod fsutil;
 pub mod ids;
 pub mod io;
+pub mod memory;
 pub mod metrics;
 #[cfg(feature = "simfs")]
 pub mod simfs;

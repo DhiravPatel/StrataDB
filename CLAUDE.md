@@ -22,21 +22,25 @@ requirements (spec Parts IV–IX): `docs/project/PERF_INVENTORY.md` (edit
 ## Workflow
 1. Pick the next dependency-ready task from `docs/project/TASKS.md`.
 2. State invariants; implement the smallest complete unit with tests.
-3. Run `scripts/check.sh` (fmt, clippy -D warnings, tests). All must pass.
+3. Run `scripts/check.sh` (fmt, layer check, clippy -D warnings, tests). All must pass.
+   A new crate needs a layer in `docs/architecture/layers.toml` (ADR-0028).
 4. Update `docs/project/IMPLEMENTATION_STATUS.md`, `docs/project/TASKS.md`, `docs/project/KNOWN_LIMITATIONS.md`,
    relevant docs/ADRs, and `docs/project/NEXT_SESSION.md`.
 
 ## Layout
 - `crates/stratadb-common` errors, CRC-32C, bounded codec, durable fs ops, failpoints, time
-- `crates/stratadb-schema` event model, typed values, validation, JSON mapping, event codec
+- `crates/stratadb-schema` event model, typed values, column types (`column`), validation, JSON mapping, event codec
 - `crates/stratadb-wal` WAL format, group commit, recovery, reclamation
 - `crates/stratadb-segment` segment format v1 writer/reader/verify
-- `crates/stratadb-storage` engine: memtable, flush protocol, manifest, recovery, snapshots
-- `crates/stratadb-query` StrataQL parser, planner (pruning), budgeted executor
+- `crates/stratadb-storage` engine: memtable, flush protocol, manifest, recovery, snapshots,
+  `scan::ScanSource` (the only way the executor reads data; ADR-0028)
+- `crates/stratadb-query` StrataQL parser, planner (pruning), budgeted executor (must not
+  depend on segment/WAL crates)
 - `crates/stratadb-testkit` seeded synthetic datasets (spec §27.3 profiles)
 - `apps/stratadb-cli` `strata` binary (local admin)
 - `apps/stratadb-bench` `strata-bench` harness → raw JSON (see docs/benchmarks)
-- `apps/stratadb-server` `strata-server` HTTP API v1 + token management (ADR-0018, docs/api/http.md)
+- `apps/stratadb-server` `strata-server` HTTP API v1 + token management (ADR-0018, docs/api/http.md),
+  `system.query_log` (ADR-0029)
 
 ## Conventions
 - Storage engine is synchronous (ADR-0017); async only at the network edge.

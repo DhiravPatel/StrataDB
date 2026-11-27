@@ -57,6 +57,15 @@ pub struct Dataset {
     /// flushing as in production.
     #[serde(default)]
     pub flush_every: Option<usize>,
+    /// Flush after loading (default true). `false` leaves the last
+    /// `flush_every` remainder (or, without `flush_every`, everything) in
+    /// the memtable, to measure queries over unflushed data.
+    #[serde(default = "yes")]
+    pub final_flush: bool,
+    /// Stop the explicit `flush_every` flushes after this many (default:
+    /// no limit); later rows stay in the memtable.
+    #[serde(default)]
+    pub max_flushes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -78,6 +87,28 @@ pub struct EngineCfg {
     /// Memtable flush threshold (bytes); default: the engine's.
     #[serde(default)]
     pub memtable_max_bytes: Option<usize>,
+    /// Memtable flush thresholds by rows and age (s); default: the engine's.
+    #[serde(default)]
+    pub memtable_max_rows: Option<usize>,
+    #[serde(default)]
+    pub memtable_max_age_s: Option<u64>,
+    /// Adaptive group-commit delay (default true; false = fixed delay).
+    #[serde(default = "yes")]
+    pub adaptive_group_delay: bool,
+    /// Account memory in a server-like tracker tree (ingest, cache,
+    /// background regions and a query pool, all unlimited) — the
+    /// production code path. `false`: no regions; each query is accounted
+    /// on its own tracker only.
+    #[serde(default = "yes")]
+    pub memory_accounting: bool,
+    /// WAL format written: 3 (columnar payloads, default) or 2 (row
+    /// payloads; for A/B).
+    #[serde(default = "wal_v3")]
+    pub wal_format_version: u16,
+}
+
+fn wal_v3() -> u16 {
+    stratadb_storage::WAL_FORMAT_VERSION
 }
 
 fn default_delay() -> u64 {
@@ -296,6 +327,7 @@ const STAT_KEYS: &[&str] = &[
     "segments_pruned_ngram",
     "shredded_reads",
     "memory_rows_scanned",
+    "memory_chunks_pruned",
     "early_stop",
     "scan_workers",
 ];
@@ -322,6 +354,7 @@ fn stat(s: &QueryStats, result_rows: usize, key: &str) -> f64 {
         "segments_pruned_ngram" => s.segments_pruned_ngram as u64,
         "shredded_reads" => s.shredded_reads,
         "memory_rows_scanned" => s.memory_rows_scanned,
+        "memory_chunks_pruned" => s.memory_chunks_pruned,
         "early_stop" => u64::from(s.early_stop),
         "scan_workers" => s.scan_workers as u64,
         _ => 0,
@@ -457,6 +490,9 @@ struct QueryResult {
     rows_scanned: u64,
     segments_total: usize,
     segments_scanned: usize,
+    /// Memtable rows scanned and chunk windows pruned by zone maps.
+    memory_rows_scanned: u64,
+    memory_chunks_pruned: u64,
     indexes_used: Vec<String>,
     plan_us_median: f64,
     /// Workers that scanned segments in the last repetition.
@@ -499,6 +535,8 @@ pub fn run(text: &str, out_dir: &Path, hw_profile: &str, data_dir: Option<PathBu
         .ok_or_else(|| Error::invalid_input("unknown profile"))?;
     let mut opts = EngineOptions::new(&dir);
     opts.wal.durability = durability(&sc.engine);
+    opts.wal.adaptive_group_delay = sc.engine.adaptive_group_delay;
+    opts.wal.format_version = sc.engine.wal_format_version;
     opts.bloom_enabled = sc.engine.bloom;
     opts.ngram_enabled = sc.engine.ngram;
     opts.segment_compression = sc.engine.compression;
@@ -506,6 +544,23 @@ pub fn run(text: &str, out_dir: &Path, hw_profile: &str, data_dir: Option<PathBu
     if let Some(b) = sc.engine.memtable_max_bytes {
         opts.memtable_max_bytes = b;
     }
+    if let Some(r) = sc.engine.memtable_max_rows {
+        opts.memtable_max_rows = r;
+    }
+    if let Some(a) = sc.engine.memtable_max_age_s {
+        opts.memtable_max_age = Duration::from_secs(a);
+    }
+    // Server-like memory tree, unlimited: measures the mechanism, never
+    // changes results.
+    let memory = sc.engine.memory_accounting.then(|| {
+        use stratadb_common::memory::MemoryTracker;
+        let root = MemoryTracker::root("process", 0);
+        opts.memory = Some(root.child("ingest", 0));
+        opts.cache_memory = Some(root.child("cache", 0));
+        opts.background_memory = Some(root.child("background", 0));
+        let pool = root.child("query", 0);
+        (root, pool.private_child("tenant:bench", 0))
+    });
     let deterministic = sc.dataset.flush_every.is_some();
     let background = opts.background;
     if deterministic {
@@ -553,6 +608,9 @@ pub fn run(text: &str, out_dir: &Path, hw_profile: &str, data_dir: Option<PathBu
             .query_options
             .target_ms_per_worker
             .unwrap_or(QueryOptions::default().target_ms_per_worker),
+        memory: memory
+            .as_ref()
+            .map(|(_, tenant)| std::sync::Arc::clone(tenant)),
         ..QueryOptions::default()
     };
     let mut queries = Vec::new();
@@ -593,6 +651,8 @@ pub fn run(text: &str, out_dir: &Path, hw_profile: &str, data_dir: Option<PathBu
             rows_scanned: s.rows_scanned,
             segments_total: s.segments_total,
             segments_scanned: s.segments_scanned,
+            memory_rows_scanned: s.memory_rows_scanned,
+            memory_chunks_pruned: s.memory_chunks_pruned,
             indexes_used: s.indexes_used.clone(),
             plan_us_median: summarize(&plan).median,
             scan_workers: s.scan_workers,
@@ -692,6 +752,7 @@ fn load_dataset(engine: &Engine, gen: &mut Generator, d: &Dataset) -> Result<J> 
     let t = CpuTimer::start();
     let mut written = 0usize;
     let mut next_flush = d.flush_every.unwrap_or(usize::MAX);
+    let mut flushes = 0usize;
     while written < d.events {
         let n = d.batch_size.min(d.events - written);
         let mut by_tenant: BTreeMap<TenantId, Vec<Event>> = BTreeMap::new();
@@ -704,14 +765,17 @@ fn load_dataset(engine: &Engine, gen: &mut Generator, d: &Dataset) -> Result<J> 
             ack.push(t0.elapsed().as_secs_f64() * 1e3);
         }
         written += n;
-        if written >= next_flush {
+        if written >= next_flush && d.max_flushes.is_none_or(|m| flushes < m) {
+            flushes += 1;
             engine.flush()?;
             next_flush = next_flush.saturating_add(d.flush_every.unwrap_or(usize::MAX));
         }
     }
     let s = t.stop();
     let flush_t = Instant::now();
-    engine.flush()?;
+    if d.final_flush {
+        engine.flush()?;
+    }
     let flush_ms = flush_t.elapsed().as_secs_f64() * 1e3;
     let st = engine.stats();
     Ok(json!({
@@ -725,6 +789,8 @@ fn load_dataset(engine: &Engine, gen: &mut Generator, d: &Dataset) -> Result<J> 
         "final_flush_ms": flush_ms,
         "segments": st.segments,
         "segment_bytes": st.segment_bytes,
+        "wal_bytes_appended": st.wal.bytes_appended,
+        "wal_bytes_per_event": st.wal.bytes_appended as f64 / (d.events as f64).max(1.0),
     }))
 }
 
@@ -765,18 +831,15 @@ fn run_load(
                 .collect();
             let batches = std::sync::Mutex::new(batches.into_iter().map(Some).collect::<Vec<_>>());
             let work = |i: usize| -> Result<()> {
-                let evs = {
+                // Take a pre-generated batch under the lock, then release
+                // it before writing: holding it across `write_batch` (which
+                // waits for an fsync) would serialize every writer.
+                let pooled = {
                     let mut b = batches.lock().unwrap_or_else(|e| e.into_inner());
                     let len = b.len();
-                    match b[i % len].take() {
-                        Some(evs) => evs,
-                        None => {
-                            return engine
-                                .write_batch(&tenant, regen(&tenant, per, i))
-                                .map(|_| ())
-                        }
-                    }
+                    b[i % len].take()
                 };
+                let evs = pooled.unwrap_or_else(|| regen(&tenant, per, i));
                 engine.write_batch(&tenant, evs).map(|_| ())
             };
             Ok(if l.mode == "open" {

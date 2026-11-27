@@ -12,6 +12,7 @@ use std::time::Duration;
 
 mod doctor;
 mod doctor_host;
+mod doctor_storage;
 mod export;
 mod hostcheck;
 #[cfg(feature = "parquet")]
@@ -274,6 +275,15 @@ enum DoctorCmd {
         /// inspecting a mounted host image).
         #[arg(long, hide = true, default_value = "/")]
         root: PathBuf,
+    },
+    /// Commit-path device latency: fdatasync p50/p99 of 4 KiB writes in a
+    /// directory (use the WAL directory) and the implied commit rate.
+    Storage {
+        /// Directory to measure (e.g. <data-dir>/wal).
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long, default_value_t = 1000)]
+        iterations: usize,
     },
 }
 
@@ -904,6 +914,14 @@ fn run(cli: Cli) -> Result<bool> {
                 print!("{}", r.to_text());
             }
             return Ok(!r.has_fail());
+        }
+        Cmd::Doctor {
+            sub: Some(DoctorCmd::Storage { dir, iterations }),
+            ..
+        } => {
+            let r = doctor_storage::measure(&dir, iterations)?;
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+            return Ok(true);
         }
         Cmd::Doctor {
             sub: None,

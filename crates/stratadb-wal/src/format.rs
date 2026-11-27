@@ -1,5 +1,11 @@
 //! WAL on-disk format. Normative descriptions: docs/storage-format/wal-v1.md
-//! (read-only since 0.0.1) and docs/storage-format/wal-v2.md (written).
+//! and wal-v2.md (read), wal-v3.md (written by default; v2 can still be
+//! written for a rollback window, `WalOptions::format_version`).
+//!
+//! v3 has the v2 frame layout and adds record types 3 and 4 (columnar event
+//! batches, docs/storage-format/event-batch-columnar-v1.md). A v3 header
+//! tells older readers, which reject it with `FormatVersion`, before they
+//! meet a record type they cannot decode.
 //!
 //! v2 differs from v1 only in the frame header, which gains `synced_through`
 //! (see [`classify_invalid_tail`]):
@@ -38,8 +44,11 @@ use stratadb_common::checksum::{crc32c, crc32c_append};
 use stratadb_common::{Error, Result};
 
 pub const MAGIC: [u8; 8] = *b"STRWAL\r\n";
-/// Version written by this build. Readers accept [`MIN_READ_VERSION`]..=this.
-pub const FORMAT_VERSION: u16 = 2;
+/// Newest version (written by default). Readers accept
+/// [`MIN_READ_VERSION`]..=this.
+pub const FORMAT_VERSION: u16 = 3;
+/// Oldest version this build can still write (`WalOptions::format_version`).
+pub const MIN_WRITE_VERSION: u16 = 2;
 pub const MIN_READ_VERSION: u16 = 1;
 pub const HEADER_LEN: usize = 32;
 /// Frame header length of the version written by this build.
@@ -67,6 +76,10 @@ pub enum RecordType {
     /// `idempotency::encode_record`). Added in StrataDB 0.0.1; readers that
     /// predate it report `Unsupported` rather than skipping it.
     IdempotentEventBatch = 2,
+    /// A columnar event batch (schema crate `columnar::encode_batch`; WAL v3).
+    ColumnarEventBatch = 3,
+    /// A columnar event batch with an idempotency key header (WAL v3).
+    IdempotentColumnarEventBatch = 4,
 }
 
 impl RecordType {
@@ -74,7 +87,17 @@ impl RecordType {
         match v {
             1 => Some(RecordType::EventBatch),
             2 => Some(RecordType::IdempotentEventBatch),
+            3 => Some(RecordType::ColumnarEventBatch),
+            4 => Some(RecordType::IdempotentColumnarEventBatch),
             _ => None,
+        }
+    }
+
+    /// Oldest segment format version that may contain this record type.
+    pub fn min_version(self) -> u16 {
+        match self {
+            RecordType::EventBatch | RecordType::IdempotentEventBatch => 1,
+            RecordType::ColumnarEventBatch | RecordType::IdempotentColumnarEventBatch => 3,
         }
     }
 }
@@ -423,7 +446,7 @@ mod tests {
 
     #[test]
     fn header_roundtrip_versions_and_corruption() {
-        for version in [1, 2] {
+        for version in [1, 2, 3] {
             let h = SegmentHeader {
                 base_seq: 42,
                 created_ms: 7,
@@ -435,7 +458,7 @@ mod tests {
             b[13] ^= 1;
             assert!(decode_header(&b, "x").is_err());
         }
-        for version in [0, 3] {
+        for version in [0, FORMAT_VERSION + 1] {
             let b = encode_header(&SegmentHeader {
                 base_seq: 1,
                 created_ms: 0,

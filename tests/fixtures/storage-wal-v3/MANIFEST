@@ -1,0 +1,28 @@
+STRATADB-MANIFEST v1 crc32c=4dbbcf6f len=603
+{
+  "format_version": 1,
+  "version": 2,
+  "next_segment_id": 2,
+  "flushed_through_seq": 1,
+  "segments": [
+    {
+      "id": 1,
+      "tenant": "gamma",
+      "segment_format_version": 3,
+      "min_schema_version": 1,
+      "max_schema_version": 2,
+      "min_event_time": 1790000000000000000,
+      "max_event_time": 1790000000019000057,
+      "min_seq": 1,
+      "max_seq": 1,
+      "row_count": 20,
+      "file_bytes": 1499,
+      "footer_crc": 2272887128,
+      "created_ms": 1795707496516,
+      "state": "committed",
+      "lineage": []
+    }
+  ],
+  "obsolete_segments": [],
+  "retention": {}
+}

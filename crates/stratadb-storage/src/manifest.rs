@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use stratadb_common::checksum::crc32c;
-use stratadb_common::{fsutil, Error, Result, TenantId};
+use stratadb_common::{Error, Result, TenantId};
 
 pub const MANIFEST_FILE: &str = "MANIFEST";
 pub const MANIFEST_FORMAT_VERSION: u32 = 1;
@@ -259,6 +259,16 @@ impl Manifest {
 
     /// Durably and atomically publish this manifest (sealed when `keys`).
     pub fn commit(&self, dir: &Path, keys: Option<&stratadb_crypto::Keyring>) -> Result<()> {
+        self.commit_with(dir, keys, &*stratadb_common::io::default_io())
+    }
+
+    /// [`Manifest::commit`] writing through `io` (spec STRATA-SYS-04-001).
+    pub fn commit_with(
+        &self,
+        dir: &Path,
+        keys: Option<&stratadb_crypto::Keyring>,
+        io: &dyn stratadb_common::io::IoEngine,
+    ) -> Result<()> {
         self.validate()?;
         let mut bytes = self.encode()?;
         if let Some(k) = keys {
@@ -268,7 +278,7 @@ impl Manifest {
                 &bytes,
             )?;
         }
-        fsutil::atomic_write(&dir.join(MANIFEST_FILE), &bytes, "manifest")
+        stratadb_common::io::atomic_write(io, &dir.join(MANIFEST_FILE), &bytes, "manifest")
     }
 }
 

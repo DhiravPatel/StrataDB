@@ -1,0 +1,74 @@
+{
+  "build": {
+    "allocator": "system",
+    "debug_assertions": false,
+    "git_dirty": true,
+    "git_sha": "dccbfb4f7ca88abc25b0aaf8722d1832577f9807",
+    "opt_level": "3",
+    "profile": "release",
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "stratadb_version": "0.0.1",
+    "target": "aarch64-apple-darwin"
+  },
+  "dataset": {
+    "generator": "stratadb-testkit",
+    "generator_version": "0.0.1",
+    "spec": {
+      "batch_size": 1000,
+      "events": 20000,
+      "flush_every": null,
+      "profile": "app-logs",
+      "seed": 1,
+      "tenants": 1
+    }
+  },
+  "engine_settings": {
+    "engine": {
+      "adaptive_group_delay": true,
+      "bloom": true,
+      "compression": true,
+      "durability": "group_commit",
+      "group_commit_delay_ms": 2,
+      "memtable_max_bytes": null,
+      "ngram": true,
+      "shredding": true
+    },
+    "query_options": {
+      "map_projection": false,
+      "parallelism": 0,
+      "target_ms_per_worker": null,
+      "vectorized": false
+    },
+    "run": {
+      "cache": "warm",
+      "repetitions": 5,
+      "warmup": 1
+    }
+  },
+  "host": {
+    "arch": "aarch64",
+    "cpu_model": "Apple M4",
+    "filesystem": {
+      "mount_point": "/System/Volumes/Data",
+      "options": "apfs, local, journaled, nobrowse, protect, root data",
+      "type": "apfs"
+    },
+    "governor": "unknown",
+    "kernel": "Darwin 27.0.0",
+    "load_average": "{ 2.31 3.97 4.04 }",
+    "logical_cpus": 10,
+    "memory_bytes": 25769803776,
+    "microcode": "unknown",
+    "os": "macos",
+    "smt": "n/a (no SMT on Apple silicon)",
+    "storage": "unknown",
+    "sysctls": "unknown",
+    "thp": "unknown",
+    "turbo": "unknown"
+  },
+  "hw_profile": "HW-REF-7",
+  "manifest_version": 1,
+  "runner_fingerprint": "0b29fce902bcc9de",
+  "scenario_sha256": "52f7689434e451b8dd05a12696b5dba523147749d9b9ca9b19052f0eafb8913d",
+  "started_at": "2026-11-26T11:02:19.407406000Z"
+}

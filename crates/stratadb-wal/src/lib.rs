@@ -23,14 +23,15 @@
 
 pub mod format;
 
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
 use stratadb_common::checksum::crc32c;
+use stratadb_common::io::{read_file, write_all_at, IoEngine, WriteFile};
 use stratadb_common::{failpoint, fsutil, time, Error, IoResultExt, Result};
 
 pub use format::RecordType;
@@ -43,8 +44,10 @@ pub enum Durability {
     Async,
     /// Acknowledge after the record is fsynced. Concurrent appenders share syncs.
     Sync,
-    /// Like `Sync`, but the sync leader waits up to `max_delay` to gather more
-    /// records into one fsync. Bounded added latency, higher throughput.
+    /// Like `Sync`, but the sync leader may wait to gather more records into
+    /// one fsync. The wait is adaptive (spec STRATA-SYS-07-004; see
+    /// [`WalOptions::adaptive_group_delay`]) and never longer than
+    /// `max_delay`. The added latency is bounded and throughput is higher.
     GroupCommit { max_delay: Duration },
 }
 
@@ -71,6 +74,24 @@ pub struct WalOptions {
     /// encrypted segments. When set, a segment is never appended to by a
     /// later process (each segment's frame key sees every nonce at most once).
     pub keys: Option<Arc<stratadb_crypto::Keyring>>,
+    /// Group commit (spec STRATA-SYS-07-004).
+    /// * `true`: the leader does not wait when fewer than one more record is
+    ///   expected during an fsync (the arrival-rate estimate times the fsync
+    ///   latency estimate is below 1). Otherwise it waits at most
+    ///   `min(fsync latency, max_delay)`, stopping early once as many records
+    ///   are pending as the previous group had or `group_bytes` are pending.
+    /// * `false`: always wait the full `max_delay` (the old behaviour; for
+    ///   A/B comparisons).
+    pub adaptive_group_delay: bool,
+    /// Flush a group early once this many bytes are pending (1 MiB).
+    pub group_bytes: u64,
+    /// File I/O (spec STRATA-SYS-04-001): appends, fsyncs, truncation and
+    /// replay reads. `None`: the process-wide default engine.
+    pub io: Option<Arc<dyn IoEngine>>,
+    /// Segment format written: 3 (default; columnar record types) or 2 (no
+    /// record types newer than 2, readable by the previous release; for a
+    /// rollback window after upgrading). Reading accepts 1..=3 regardless.
+    pub format_version: u16,
 }
 
 impl Default for WalOptions {
@@ -83,7 +104,38 @@ impl Default for WalOptions {
             max_record_bytes: 32 * 1024 * 1024,
             recovery: RecoveryPolicy::TruncateTornTail,
             keys: None,
+            adaptive_group_delay: true,
+            group_bytes: 1 << 20,
+            io: None,
+            format_version: FORMAT_VERSION,
         }
+    }
+}
+
+/// Exponentially weighted moving average weight of a new sample.
+const EWMA_ALPHA: f64 = 0.2;
+
+/// Group-commit estimators (all in nanoseconds), updated under the WAL lock.
+#[derive(Debug, Default)]
+struct GroupStats {
+    /// EWMA of the time between consecutive appends.
+    interarrival_ns: f64,
+    last_append: Option<Instant>,
+    /// EWMA of fsync latency.
+    sync_ns: f64,
+    /// Records made durable by the previous group.
+    last_group: u64,
+    /// Bytes written since the current group's fsync started.
+    pending_bytes: u64,
+    /// The leader is waiting to gather a group.
+    gathering: bool,
+}
+
+fn ewma(old: f64, sample: f64) -> f64 {
+    if old == 0.0 {
+        sample
+    } else {
+        old + EWMA_ALPHA * (sample - old)
     }
 }
 
@@ -122,10 +174,14 @@ pub struct WalStats {
     pub last_seq: u64,
     pub durable_seq: u64,
     pub poisoned: Option<String>,
+    /// Frame bytes (headers + payloads) appended since open.
+    pub bytes_appended: u64,
+    /// Records appended since open.
+    pub records_appended: u64,
 }
 
 struct Inner {
-    file: Arc<File>,
+    file: Arc<dyn WriteFile>,
     path: PathBuf,
     base_seq: u64,
     len: u64,
@@ -140,14 +196,30 @@ struct Inner {
     durable_seq: u64,
     syncing: bool,
     poisoned: Option<String>,
+    group: GroupStats,
+    /// Frame bytes and records appended by this process.
+    bytes_appended: u64,
+    records_appended: u64,
 }
 
 /// The write-ahead log. Thread-safe; share via `Arc`.
 pub struct Wal {
     dir: PathBuf,
+    io: Arc<dyn IoEngine>,
     opts: WalOptions,
     inner: Mutex<Inner>,
+    /// Signals a completed sync (spec STRATA-SYS-07-006). parking_lot's
+    /// `notify_all` costs the sync leader one wake-up per group: the other
+    /// waiters are requeued onto the WAL mutex and handed off in user space
+    /// as each one releases it (ADR-0032 measures the alternatives).
     cv: Condvar,
+    /// When the last durable sequence was published (ns since `born`), for
+    /// `commit_wake_seconds`.
+    published_ns: AtomicU64,
+    born: Instant,
+    /// Wakes a gathering sync leader when a record is appended (so it can
+    /// stop waiting once its group is complete).
+    gather_cv: Condvar,
     /// fsync latency of the active segment (group commits and rotations).
     sync_seconds: stratadb_common::metrics::Histogram,
     /// Records made durable by one fsync (group-commit size, spec §8.4).
@@ -157,6 +229,11 @@ pub struct Wal {
     append_seconds: stratadb_common::metrics::Histogram,
     /// INSERT stage `group_commit_wait`: from written to durable (sync modes).
     commit_wait_seconds: stratadb_common::metrics::Histogram,
+    /// Time the sync leader waited to gather a group (adaptive delay).
+    group_delay_seconds: stratadb_common::metrics::Histogram,
+    /// From a group's durability being published to a covered writer
+    /// returning (the wake-up cost, STRATA-SYS-07-006).
+    commit_wake_seconds: stratadb_common::metrics::Histogram,
 }
 
 /// WAL latency/size distributions.
@@ -166,6 +243,9 @@ pub struct WalMetrics {
     pub group_size: stratadb_common::metrics::HistogramSnapshot,
     pub append_seconds: stratadb_common::metrics::HistogramSnapshot,
     pub commit_wait_seconds: stratadb_common::metrics::HistogramSnapshot,
+    pub group_delay_seconds: stratadb_common::metrics::HistogramSnapshot,
+    /// Group durability published → a covered writer returning.
+    pub commit_wake_seconds: stratadb_common::metrics::HistogramSnapshot,
 }
 
 impl std::fmt::Debug for Wal {
@@ -178,7 +258,7 @@ impl std::fmt::Debug for Wal {
 
 /// A newly created active segment.
 struct NewSegment {
-    file: File,
+    file: Arc<dyn WriteFile>,
     path: PathBuf,
     header_len: u64,
     frame_key: Option<stratadb_crypto::FrameKey>,
@@ -206,14 +286,16 @@ fn segment_frame_key(
 }
 
 fn create_segment(
+    io: &dyn IoEngine,
     dir: &Path,
     base_seq: u64,
     keys: Option<&stratadb_crypto::Keyring>,
+    version: u16,
 ) -> Result<NewSegment> {
     let path = dir.join(format::segment_file_name(base_seq));
     let tmp = fsutil::tmp_path(&path);
     fsutil::remove_if_exists(&tmp)?;
-    let mut f = fsutil::create_new_file(&tmp)?;
+    let f = io.create_new(&tmp)?;
     let encryption = match keys {
         Some(k) => {
             let mut salt = [0u8; 32];
@@ -228,32 +310,24 @@ fn create_segment(
     let h = format::SegmentHeader {
         base_seq,
         created_ms: time::now_unix_millis(),
-        version: FORMAT_VERSION,
+        version,
         encryption,
     };
     let frame_key = segment_frame_key(&h, keys, &path.display().to_string())?;
     let header = format::encode_header(&h);
-    f.write_all(&header)
-        .ctx(|| format!("writing WAL header {}", tmp.display()))?;
-    fsutil::sync_file(&f, &tmp, false).ctx(|| format!("fsyncing {}", tmp.display()))?;
+    write_all_at(&*f, &header, 0)?;
+    f.sync(false)?;
     drop(f);
     fs::rename(&tmp, &path).ctx(|| format!("renaming {}", tmp.display()))?;
     fsutil::fsync_dir(dir)?;
     failpoint::hit("wal::rotate::after_create")?;
-    let file = open_append(&path)?;
+    let file = io.open_write(&path)?;
     Ok(NewSegment {
         file,
         path,
         header_len: header.len() as u64,
         frame_key,
     })
-}
-
-fn open_append(path: &Path) -> Result<File> {
-    OpenOptions::new()
-        .append(true)
-        .open(path)
-        .ctx(|| format!("opening {} for append", path.display()))
 }
 
 impl Wal {
@@ -273,6 +347,16 @@ impl Wal {
     where
         F: FnMut(u64, RecordType, &[u8]) -> Result<()>,
     {
+        if !(format::MIN_WRITE_VERSION..=FORMAT_VERSION).contains(&opts.format_version) {
+            return Err(Error::invalid_input(format!(
+                "WAL format_version must be within {}..={FORMAT_VERSION}",
+                format::MIN_WRITE_VERSION
+            )));
+        }
+        let io: Arc<dyn IoEngine> = opts
+            .io
+            .clone()
+            .unwrap_or_else(stratadb_common::io::default_io);
         if opts.max_record_bytes > format::MAX_RECORD_BYTES {
             return Err(Error::invalid_input(
                 "max_record_bytes exceeds WAL format limit",
@@ -336,7 +420,7 @@ impl Wal {
                     ),
                 ));
             }
-            let data = fs::read(path).ctx(|| format!("reading {loc}"))?;
+            let data = read_file(&*io, path)?;
             let header = format::decode_header(&data, &loc)?;
             if header.base_seq != *base {
                 return Err(Error::corruption(
@@ -368,6 +452,17 @@ impl Wal {
                                 frame.record_type, frame.seq
                             ))
                         })?;
+                        // A checksum-valid frame whose type its segment's
+                        // version cannot hold was not written by StrataDB.
+                        if rtype.min_version() > header.version {
+                            return Err(Error::corruption(
+                                &loc,
+                                format!(
+                                    "record type {} at seq {} in a v{} segment",
+                                    frame.record_type, frame.seq, header.version
+                                ),
+                            ));
+                        }
                         if frame.seq > replay_after {
                             match &frame_key {
                                 Some(k) => {
@@ -412,12 +507,9 @@ impl Wal {
                                 ),
                             ));
                         }
-                        let f = OpenOptions::new()
-                            .write(true)
-                            .open(path)
-                            .ctx(|| format!("opening {loc} for truncation"))?;
-                        f.set_len(pos as u64).ctx(|| format!("truncating {loc}"))?;
-                        fsutil::sync_file(&f, path, false).ctx(|| format!("fsyncing {loc}"))?;
+                        let f = io.open_write(path)?;
+                        f.set_len(pos as u64)?;
+                        f.sync(false)?;
                         tracing::warn!(segment = %loc, offset = pos, bytes = data.len() - pos,
                             %reason, "truncated invalid WAL tail");
                         report.truncation = Some(Truncation {
@@ -446,18 +538,14 @@ impl Wal {
             // sequence numbers reused after a truncated tail never reuse a nonce.
             Some((base, path))
                 if prev_next == Some(next_seq)
-                    && last_version == FORMAT_VERSION
+                    && last_version == opts.format_version
                     && !last_encrypted
                     && opts.keys.is_none() =>
             {
-                let f = open_append(path)?;
+                let f = io.open_write(path)?;
                 // Make recovered (possibly unsynced) bytes durable before new appends.
-                fsutil::sync_file(&f, path, false)
-                    .ctx(|| format!("fsyncing {}", path.display()))?;
-                let len = f
-                    .metadata()
-                    .ctx(|| format!("stat {}", path.display()))?
-                    .len();
+                f.sync(false)?;
+                let len = f.len()?;
                 let closed = segs[..segs.len() - 1].to_vec();
                 (f, path.clone(), *base, len, closed, HEADER_LEN as u64)
             }
@@ -465,7 +553,13 @@ impl Wal {
                 // No WAL yet, the WAL ends before the manifest (e.g. Async
                 // tail lost on power failure after a flush), or encryption:
                 // start a new segment so sequence numbers never repeat in it.
-                let n = create_segment(dir, next_seq, opts.keys.as_deref())?;
+                let n = create_segment(
+                    &*io,
+                    dir,
+                    next_seq,
+                    opts.keys.as_deref(),
+                    opts.format_version,
+                )?;
                 frame_key_new = n.frame_key;
                 (
                     n.file,
@@ -480,9 +574,10 @@ impl Wal {
 
         let wal = Wal {
             dir: dir.to_path_buf(),
+            io,
             opts,
             inner: Mutex::new(Inner {
-                file: Arc::new(file),
+                file,
                 path,
                 base_seq,
                 len,
@@ -494,12 +589,20 @@ impl Wal {
                 durable_seq: last_seq,
                 syncing: false,
                 poisoned: None,
+                group: GroupStats::default(),
+                bytes_appended: 0,
+                records_appended: 0,
             }),
             cv: Condvar::new(),
+            published_ns: AtomicU64::new(0),
+            born: Instant::now(),
+            gather_cv: Condvar::new(),
             sync_seconds: stratadb_common::metrics::Histogram::latency(),
             group_size: stratadb_common::metrics::Histogram::sizes(),
             append_seconds: stratadb_common::metrics::Histogram::stage(),
             commit_wait_seconds: stratadb_common::metrics::Histogram::stage(),
+            group_delay_seconds: stratadb_common::metrics::Histogram::stage(),
+            commit_wake_seconds: stratadb_common::metrics::Histogram::stage(),
         };
         Ok((wal, report))
     }
@@ -515,6 +618,8 @@ impl Wal {
             group_size: self.group_size.snapshot(),
             append_seconds: self.append_seconds.snapshot(),
             commit_wait_seconds: self.commit_wait_seconds.snapshot(),
+            group_delay_seconds: self.group_delay_seconds.snapshot(),
+            commit_wake_seconds: self.commit_wake_seconds.snapshot(),
         }
     }
 
@@ -548,6 +653,13 @@ impl Wal {
     ///   reached the file; the record may or may not survive recovery.
     pub fn append(&self, record_type: RecordType, payload: &[u8]) -> Result<u64> {
         let started = Instant::now();
+        if record_type.min_version() > self.opts.format_version {
+            return Err(Error::invalid_input(format!(
+                "WAL record type {record_type:?} needs format v{}; this WAL writes v{}",
+                record_type.min_version(),
+                self.opts.format_version
+            )));
+        }
         if payload.len() > self.opts.max_record_bytes as usize {
             return Err(Error::invalid_input(format!(
                 "WAL record of {} bytes exceeds limit {}",
@@ -563,6 +675,13 @@ impl Wal {
         let mut g = self.inner.lock();
         Self::check_poisoned(&g)?;
         if g.len > g.header_len && g.len + frame.len() as u64 > self.opts.segment_max_bytes {
+            // One fsync in flight per WAL (spec STRATA-SYS-07-005): rotation
+            // syncs the old segment, so wait for a leader's sync to finish.
+            // No new leader can start while this holds the mutex.
+            while g.syncing {
+                self.cv.wait(&mut g);
+            }
+            Self::check_poisoned(&g)?;
             self.rotate_locked(&mut g)?;
         }
         let seq = g.next_seq;
@@ -599,18 +718,35 @@ impl Wal {
         failpoint::hit("wal::before_write")?;
         if let Some(action) = failpoint::eval("wal::torn_write") {
             // Simulate a crash in the middle of write(2).
-            let _ = (&*g.file).write_all(&frame[..frame.len() / 2]);
-            let _ = g.file.sync_data();
+            let _ = write_all_at(&*g.file, &frame[..frame.len() / 2], g.len);
+            let _ = g.file.sync(true);
             failpoint::fire("wal::torn_write", action)?;
         }
-        if let Err(e) = (&*g.file).write_all(&frame) {
+        if let Err(e) = write_all_at(&*g.file, &frame, g.len) {
             let why = format!("write to {} failed: {e}", g.path.display());
             Self::poison(&mut g, why.clone());
             return Err(Error::indeterminate(why));
         }
         g.len += frame.len() as u64;
+        g.bytes_appended += frame.len() as u64;
+        g.records_appended += 1;
         g.next_seq += 1;
         g.written_seq = seq;
+        {
+            let gs = &mut g.group;
+            if let Some(prev) = gs.last_append {
+                gs.interarrival_ns = ewma(
+                    gs.interarrival_ns,
+                    started.saturating_duration_since(prev).as_nanos() as f64,
+                );
+            }
+            gs.last_append = Some(started);
+            gs.pending_bytes += frame.len() as u64;
+            // Let a gathering leader re-check whether its group is complete.
+            if gs.gathering {
+                self.gather_cv.notify_one();
+            }
+        }
         if let Err(e) = failpoint::hit("wal::after_write") {
             Self::poison(&mut g, e.to_string());
             return Err(Error::indeterminate(e.to_string()));
@@ -625,6 +761,48 @@ impl Wal {
                 r
             }
         }
+    }
+
+    /// How long the sync leader waits to gather a group (it holds `syncing`;
+    /// appenders keep writing meanwhile). Returns the time waited.
+    fn gather(&self, g: &mut MutexGuard<'_, Inner>, max_delay: Duration) -> Duration {
+        if max_delay.is_zero() {
+            return Duration::ZERO;
+        }
+        let start = Instant::now();
+        let limit = if self.opts.adaptive_group_delay {
+            let gs = &g.group;
+            // Expected appends during one fsync; with too few, waiting only
+            // adds latency (low arrival rate: flush immediately).
+            let expected = if gs.interarrival_ns > 0.0 {
+                gs.sync_ns / gs.interarrival_ns
+            } else {
+                0.0
+            };
+            if gs.sync_ns == 0.0 || expected < 1.0 {
+                return Duration::ZERO;
+            }
+            max_delay.min(Duration::from_nanos(gs.sync_ns as u64))
+        } else {
+            max_delay
+        };
+        let deadline = start + limit;
+        // Stop early once the closed-loop writers of the previous group are
+        // back, or enough bytes are pending.
+        let want = g.durable_seq + g.group.last_group.max(1);
+        g.group.gathering = true;
+        while Instant::now() < deadline {
+            if self.opts.adaptive_group_delay
+                && (g.written_seq >= want || g.group.pending_bytes >= self.opts.group_bytes)
+            {
+                break;
+            }
+            if self.gather_cv.wait_until(g, deadline).timed_out() {
+                break;
+            }
+        }
+        g.group.gathering = false;
+        start.elapsed()
     }
 
     /// Leader/follower group commit: the first waiter that finds no sync in
@@ -642,44 +820,64 @@ impl Wal {
             }
             if g.syncing {
                 self.cv.wait(&mut g);
+                if g.durable_seq >= seq {
+                    self.commit_wake_seconds
+                        .observe_duration(self.since_published());
+                }
                 continue;
             }
             g.syncing = true;
             if let Durability::GroupCommit { max_delay } = self.opts.durability {
-                if !max_delay.is_zero() {
-                    let deadline = Instant::now() + max_delay;
-                    while !self.cv.wait_until(&mut g, deadline).timed_out() {}
-                }
+                let waited = self.gather(&mut g, max_delay);
+                self.group_delay_seconds.observe_duration(waited);
             }
+            g.group.pending_bytes = 0;
             let target = g.written_seq;
             let records = target.saturating_sub(g.durable_seq);
             let file = Arc::clone(&g.file);
-            let path = g.path.clone();
             let started = Instant::now();
             let res = MutexGuard::unlocked(&mut g, || -> Result<()> {
                 failpoint::hit("wal::before_sync")?;
-                fsutil::sync_file(&file, &path, true).ctx(|| "fsyncing WAL segment".to_owned())?;
+                file.sync(true)?;
                 failpoint::hit("wal::after_sync")?;
                 Ok(())
             });
             g.syncing = false;
             match res {
                 Ok(()) => {
-                    self.sync_seconds.observe_duration(started.elapsed());
+                    let took = started.elapsed();
+                    self.sync_seconds.observe_duration(took);
                     self.group_size.observe(records as f64);
+                    g.group.sync_ns = ewma(g.group.sync_ns, took.as_nanos() as f64);
+                    g.group.last_group = records;
                     g.durable_seq = g.durable_seq.max(target);
                 }
                 Err(e) => Self::poison(&mut g, format!("sync failed: {e}")),
             }
-            self.cv.notify_all();
+            self.publish();
         }
+    }
+
+    /// Wake every writer waiting for a sync (call with the WAL mutex held,
+    /// after updating `durable_seq` or poisoning).
+    fn publish(&self) {
+        self.published_ns.store(
+            u64::try_from(self.born.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+        self.cv.notify_all();
+    }
+
+    fn since_published(&self) -> Duration {
+        let now = u64::try_from(self.born.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        Duration::from_nanos(now.saturating_sub(self.published_ns.load(Ordering::Acquire)))
     }
 
     fn rotate_locked(&self, g: &mut MutexGuard<'_, Inner>) -> Result<()> {
         // The old segment must be fully durable before it becomes immutable.
         let started = Instant::now();
         let records = g.written_seq.saturating_sub(g.durable_seq);
-        if let Err(e) = fsutil::sync_file(&g.file, &g.path, true) {
+        if let Err(e) = g.file.sync(true) {
             let why = format!("sync before rotation failed: {e}");
             Self::poison(g, why.clone());
             return Err(Error::indeterminate(why));
@@ -689,15 +887,22 @@ impl Wal {
             self.group_size.observe(records as f64);
         }
         g.durable_seq = g.durable_seq.max(g.written_seq);
-        self.cv.notify_all();
+        self.publish();
         let base = g.next_seq;
-        let n = create_segment(&self.dir, base, self.opts.keys.as_deref()).inspect_err(|e| {
+        let n = create_segment(
+            &*self.io,
+            &self.dir,
+            base,
+            self.opts.keys.as_deref(),
+            self.opts.format_version,
+        )
+        .inspect_err(|e| {
             Self::poison(g, format!("segment rotation failed: {e}"));
         })?;
         let old_base = g.base_seq;
         let old_path = std::mem::replace(&mut g.path, n.path);
         g.closed.push((old_base, old_path));
-        g.file = Arc::new(n.file);
+        g.file = n.file;
         g.base_seq = base;
         g.len = n.header_len;
         g.header_len = n.header_len;
@@ -774,6 +979,8 @@ impl Wal {
             last_seq: g.written_seq,
             durable_seq: g.durable_seq,
             poisoned: g.poisoned.clone(),
+            bytes_appended: g.bytes_appended,
+            records_appended: g.records_appended,
         }
     }
 }

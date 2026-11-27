@@ -1,0 +1,17 @@
+best-of-3 run medians, process CPU ms: off / on / ratio   (plans identical)
+  q01_trace_id_lookup                 2.857    2.841  0.994  True
+  q02_request_id_lookup               1.659    1.649  0.994  True
+  q03_recent_errors                   1.470    1.468  0.999  True
+  q04_service_severity                4.692    4.671  0.996  True
+  q05_time_range_scan                 1.326    1.326  1.000  True
+  q06_message_token_search           10.343   10.262  0.992  True
+  q07_attribute_equality              6.095    6.066  0.995  True
+  q08_high_cardinality_agg            3.811    3.845  1.009  True
+  q09_service_time_bucket             4.301    4.287  0.997  True
+  q10_top_error_codes                25.625   26.445  1.032  True
+  q12_historical_wide_range           2.462    2.485  1.009  True
+  q13_absent_substring_search         0.003    0.003  1.200  True
+geomean (excl. q13): 1.001
+A/A spread within 'off' runs (max/min), median over queries: 1.018
+dataset load events/s off: [50074.0, 51714.0, 51660.0]  on: [51501.0, 51584.0, 50035.0]
+ingest keys: ['ack_ms', 'cpu_ns_per_event', 'events', 'events_per_s', 'final_flush_ms', 'label', 'process_cpu_s', 'segment_bytes', 'segments', 'wall_s']

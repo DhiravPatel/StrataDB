@@ -5,6 +5,15 @@ A query runs against a **snapshot of the authenticated tenant only**. There is
 no syntax to address another tenant; `tenant_id` is a constant column equal to
 the caller's tenant, so `WHERE tenant_id = 'other'` matches nothing.
 
+Two tables exist, both with the event schema:
+- `logs`: the tenant's events.
+- `system.query_log`: one row per query the tenant ran. See
+  `docs/api/http.md` for its columns.
+
+Each tenant sees only its own rows in either table. `system.query_log` is
+unavailable when it is disabled in the server configuration
+(`unsupported`), and in embedded use over a bare snapshot.
+
 ## Values
 | Column | Type |
 |--------|------|
@@ -74,8 +83,14 @@ set of segments). Budgets apply to the whole query.
 
 ## Budgets (QueryOptions)
 Timeout (default 30 s) → `timeout`; cancellation → `cancelled`; rows scanned
-(100 M), result rows (100 k; add `LIMIT`), approximate memory (256 MiB) →
-`resource_exhausted`. No partial results are returned in v0.
+(100 M), result rows (100 k; add `LIMIT`), memory (256 MiB embedded; the
+server uses `[memory] max_query_memory_bytes`) → `resource_exhausted`. No
+partial results are returned in v0.
+
+Memory counts the result rows and aggregation groups held, plus the column
+batch being scanned. The batch is reserved before it is read, from the
+source's metadata. A query is also limited by its tenant's
+`query_memory_bytes` quota and by the server's query pool (ADR-0030).
 
 ## EXPLAIN
 `EXPLAIN` plans without scanning: columns read, time range, required keys,

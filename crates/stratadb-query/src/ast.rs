@@ -319,8 +319,29 @@ pub struct OrderBy {
     pub desc: bool,
 }
 
+/// A table a query reads. Every table has the event schema; system tables
+/// are tenant-scoped like `logs` (spec §17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Table {
+    /// The tenant's events.
+    Logs,
+    /// `system.query_log`: one row per query the tenant ran (STRATA-SYS-13-009).
+    QueryLog,
+}
+
+impl Table {
+    pub fn name(self) -> &'static str {
+        match self {
+            Table::Logs => "logs",
+            Table::QueryLog => "system.query_log",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
+    /// The table in `FROM`.
+    pub table: Table,
     /// `None` = `SELECT *`.
     pub select: Option<Vec<SelectItem>>,
     pub filter: Option<Expr>,

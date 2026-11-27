@@ -46,9 +46,56 @@ and flushes. Beyond the window/capacity, delivery is at-least-once (ADR-0019).
 `stats` includes `scan_workers` (workers that scanned segments) and
 `est_cpu_ms` (the estimate that set the degree of parallelism), and the phase
 decomposition `queue_us`, `parse_us`, `plan_us` and `exec_us` (spec VIII.1.4; `queue + parse + plan + exec ≤ elapsed_ms`,
-and the remainder is serialization). Each successful query is also logged as
-a structured `query` event (target `query`) with these timings, the rows
-scanned and returned, and the bytes read. It contains no SQL text or values.
+and the remainder is serialization), plus `cpu_us`: the CPU time of the
+query, counting the executing thread and the scan-pool workers that helped.
+The body also carries `fingerprint`, the query's normalized 64-bit hash (16 hex
+digits; literals replaced, whitespace and keyword case ignored).
+
+Every query response also carries these headers, error responses included
+(STRATA-SYS-11-006):
+- `x-stratadb-query-id` and `x-stratadb-fingerprint`;
+- `x-stratadb-queue-us`, the wait for a worker;
+- on success, `x-stratadb-parse-us`, `x-stratadb-plan-us`,
+  `x-stratadb-exec-us` and `x-stratadb-cpu-us`, all in whole microseconds.
+
+Each successful query is also logged as a structured `query` event (target
+`query`) with these timings, the fingerprint, the rows scanned and returned,
+and the bytes read. It contains no SQL text or values.
+
+### `system.query_log`
+Every query is recorded once, whether it succeeded or failed (including one
+rejected for concurrency). Unauthenticated requests are not recorded. Read the
+log with an ordinary query: `SELECT ... FROM system.query_log`.
+- **Scope:** each tenant sees only its own entries.
+- **Schema:** the event schema, so pruning, aggregation, `ORDER BY` and
+  pagination work as for `logs`. Each entry is one row:
+  - `event_time`: when the request arrived;
+  - `event_id`: the query id;
+  - `service`: `strata`;
+  - `severity`: `INFO` if the query succeeded, `ERROR` if it failed;
+  - `body`: the normalized query text, with literals replaced by `?`, so
+    values a query names are not copied into the log;
+  - `attributes`: the measurements, listed below.
+- **Always present:** `query_id`, `fingerprint`, `status` (`ok` or the error
+  kind), `queue_us`, `elapsed_us`, `serialize_us` and `result_rows`.
+- **Present when the query ran:**
+  - the table read: `table`;
+  - phase timings and CPU: `parse_us`, `plan_us`, `exec_us`, `cpu_us`;
+  - work done: `rows_scanned`, `rows_matched`, `bytes_read`,
+    `segments_total`, `segments_scanned` and `memory_rows_scanned`;
+  - resources: `memory_peak` and `scan_workers`.
+- **Write timing:** entries are written every `[observability]
+  query_log_flush_ms` (default 7.5 s), so a crash loses at most that
+  interval's entries. Recording never blocks or fails a query: when the
+  queue is full, entries are dropped and counted
+  (`strata_query_log_dropped_total`).
+
+Top fingerprints by CPU:
+```sql
+SELECT attributes['fingerprint'] AS fp, count(*) AS n, sum(attributes['cpu_us']) AS cpu_us
+FROM system.query_log WHERE event_time >= TIMESTAMP '2026-11-26T00:00:00Z'
+GROUP BY attributes['fingerprint'] ORDER BY cpu_us DESC LIMIT 10
+```
 Missing values are **omitted** from row objects; null is JSON `null`.
 Duplicate column names get `#2`, `#3` suffixes. Timestamps are RFC 3339 strings.
 
@@ -98,6 +145,23 @@ Every response carries `x-request-id` (a client-supplied id matching
 JSON logs to stderr (`STRATADB_LOG`, default `info`): engine events plus one
 `access` line per request (method, path, status, latency, request id; never
 headers, bodies or credentials).
+
+### `GET /api/v1/admin/memory` (cluster.read)
+The memory budget and its regions, plus the live accounting tree (ADR-0030):
+- `plan`: the byte limits: `budget`, `source` (`cgroup`, `physical` or
+  `max_server_memory_bytes`), `control`, `ingest`, `cache`, `background`,
+  `query`, `per_query`;
+- `tracked_bytes`: the total held;
+- `tree`: `{name, used, peak, limit, children}` from `process` down to
+  `query/tenant:<id>/query:<id>/exec`.
+
+Tenants appear by name here, which is why it needs an operator token.
+
+A query refused for memory gets `429 resource_exhausted` (retryable). Its
+message starts with `MEMORY_LIMIT_EXCEEDED` and names:
+- the tracker path that refused it, with its limit and usage;
+- the requested bytes;
+- the top 5 consumers. Other tenants appear only as `<other>`.
 
 ### `GET /api/v1/admin/threads` (cluster.read)
 The thread inventory, StrataDB's equivalent of the spec's `system.threads`

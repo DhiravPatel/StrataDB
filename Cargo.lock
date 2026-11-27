@@ -1445,7 +1445,6 @@ dependencies = [
  "proptest",
  "stratadb-common",
  "stratadb-schema",
- "stratadb-segment",
  "stratadb-storage",
  "tempfile",
 ]
@@ -1454,6 +1453,7 @@ dependencies = [
 name = "stratadb-schema"
 version = "0.0.1"
 dependencies = [
+ "lz4_flex 0.14.2",
  "proptest",
  "serde_json",
  "stratadb-common",

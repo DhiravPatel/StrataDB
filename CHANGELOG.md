@@ -1,7 +1,140 @@
 # Changelog
 
 ## Unreleased (0.0.1)
+### Changed
+- **Typed string columns and selection vectors (ADR-0034).**
+  - **String columns:** they are now `StrColumn`, either plain (one text
+    buffer) or dictionary-encoded as decoded from segments. There is no
+    per-row allocation.
+  - **Dictionary kernels:** filters on dictionary columns evaluate once per
+    distinct value. `GROUP BY` on dictionary columns and on `severity` uses
+    pre-encoded keys.
+  - **Selections:** the executor walks per-chunk selections, and a global
+    `count(*)` counts selection sizes.
+  - **Effect:** 1.18× on the standard query suite and 2.9× on GROUP BY
+    severity; no query is slower.
+  - **API:** `ColumnData::Strs` now holds a `StrColumn`.
+- **Columnar memtable (ADR-0033).**
+  - **Storage:** unflushed rows are stored as per-tenant column chunks with
+    a published row count, instead of a vector of `Arc<Event>`.
+  - **Snapshots:** they copy chunk pointers (O(chunks)), where they used to
+    clone every row.
+  - **Pruning:** queries prune memtable chunks by their time and severity
+    zone maps (`memory_chunks_pruned` in query stats and `EXPLAIN`).
+  - **Freeze and replay:** freezing is O(1), and WAL replay decodes
+    columnar records straight into columns.
+  - **Effect:** 3.1–3.2× faster time- and severity-filtered queries over
+    unflushed data, at about +4–9% ingest CPU.
+  - **API:** `Snapshot::memory_rows()` is replaced by `memory_row_count()`
+    and `memory_views()`.
+### Fixed
+- **Concurrent fsync during rotation.** A WAL segment rotation could fsync
+  the old segment while a group-commit leader's fsync was still running.
+  Rotation now waits, so one fsync is ever in flight per WAL (spec
+  STRATA-SYS-07-005, ADR-0032).
 ### Added
+- **Per-device in-flight I/O bound.** Set with `[storage]
+  io_max_inflight_per_device` (default 128), with `strata_io_inflight*`
+  metrics.
+- **Commit wake-up histogram.** `strata_wal_commit_wake_seconds`.
+- **Wake-up alternatives measured.** Broadcast and sharded designs were
+  measured slower than the existing hand-off, which stays (ADR-0032).
+- **WAL v3: columnar batch payloads (ADR-0031, spec STRATA-SYS-07-002).**
+  - **Format:** WAL records now carry columnar batches: the tenant is stored
+    once, timestamps as deltas, `service` and `severity_text` as
+    dictionaries, and the body is LZ4-compressed from 16 KiB. This is new
+    record types 3–4 in WAL format v3.
+  - **Effect:** WAL bytes per event fall about 3.3× (232 → 70 B on the
+    app-logs profile), at about 19% more ingest CPU.
+  - **Compatibility:** v1–v2 WALs replay unchanged.
+  - **Rollback:** `[storage] wal_format_version = 2` keeps writing the row
+    format for a rollback window (see runbooks/upgrade.md).
+  - **Metrics:** `strata_wal_bytes_total` and `strata_wal_records_total`.
+  - **Upgrade note:** releases older than this cannot open a data directory
+    once it holds a v3 WAL segment.
+- **Memory accounting hierarchy (ADR-0030).**
+  - **Budget and regions:** a process budget (0.80 of the cgroup or
+    physical memory limit, `[memory]` settings) is split into control,
+    ingest, cache, background and query regions, with a node for each tenant
+    and each query.
+  - **Queries:** they reserve operator state, and column batches before
+    reading them. A refused query fails with `MEMORY_LIMIT_EXCEEDED`, naming
+    the tracker path and the top 5 consumers, with other tenants shown as
+    `<other>`. Queries can wait for memory (`memory_wait_timeout_ms`).
+  - **Ingest:** writes reserve memtable memory before the WAL append, stall
+    for a flush when the region is full, then fail retryably.
+  - **Compaction:** it is postponed when background memory is full.
+  - **Monitoring:** RSS is compared with tracked memory every 10 s
+    (`strata_memory_untracked_bytes`). New: `GET /api/v1/admin/memory`, the
+    `strata_memory_*` metrics, a `query_memory_bytes` tenant quota, and
+    `memory_reserved_peak` in `system.query_log`.
+  - **Behaviour change:** a query's memory limit now also covers the column
+    batch being scanned.
+- **`system.query_log` (ADR-0029).**
+  - **Recording:** every query, failed and rejected ones included, is
+    recorded under its tenant. Each entry holds a normalized 64-bit
+    fingerprint, `queue_us`, `parse_us`, `plan_us`, `exec_us`, `cpu_us`
+    (counting the scan-pool helpers), rows and bytes read, memory peak and
+    status.
+  - **Querying:** read it with `SELECT ... FROM system.query_log`. Each
+    tenant sees only its own entries, and top-N by CPU per fingerprint is an
+    ordinary `GROUP BY`.
+  - **No impact on queries:** recording is bounded and never blocks or fails
+    a query.
+  - **Settings:** `[observability] query_log`, `query_log_flush_ms`,
+    `query_log_retention_days` and `query_log_queue`.
+  - **Headers and response body:** query responses carry
+    `x-stratadb-query-id`, `-fingerprint`, `-queue-us`, `-parse-us`,
+    `-plan-us`, `-exec-us` and `-cpu-us`. The body gains `fingerprint` and
+    `stats.cpu_us`.
+  - **Library API:** `stratadb_query::execute` now takes a `Catalog`, and a
+    `Snapshot` still works.
+  - **Thread budget:** the fixed thread count rises from 4 to 6.
+- **Layer check and ScanSource seam (ADR-0028).**
+  - **Layer check:** `scripts/check_layers.py` compares the crate graph with
+    `docs/architecture/layers.toml`. It fails on upward, skip-level and
+    forbidden dependencies, on unlisted crates and on stale rules, and runs
+    in `scripts/check.sh` and CI (STRATA-ARCH-01-001/002).
+  - **ScanSource seam:** the executor now reads segments and memtable
+    chunks only through `stratadb_storage::ScanSource`. Storage does the
+    pruning, including Bloom and trigram filters, and serves column batches.
+    The query crate no longer depends on the segment crate
+    (STRATA-ARCH-01-003).
+  - **Column types:** they moved to `stratadb_schema::column`; the segment
+    crate re-exports them.
+  - **Unchanged:** query results, statistics and `EXPLAIN` output. Plans were
+    identical and there was no measurable CPU cost (report
+    2026-11-26-scan-source-seam).
+- **Write path through the I/O engine (ADR-0027).** These now go through
+  `stratadb_common::io`, so read and write faults can be injected under the
+  real engine:
+  - WAL appends, fsyncs, rotation, torn-tail truncation and replay;
+  - segment writes;
+  - manifest commits;
+  - backup copies.
+
+  New engine-level fault tests cover WAL fsync EIO (fail-stop, no
+  acknowledged data lost), ENOSPC during flush (retried), manifest fsync
+  EIO (fail-stop, recovered from the WAL) and short reads/writes. The
+  crash matrix and power-loss simulation are unchanged (0 violations).
+  Direct file reads and writes are now banned in the data-path crates.
+- **Adaptive group commit** (spec STRATA-SYS-07-004).
+  - The WAL sync leader no longer waits when no other writer is expected.
+    Under load it waits at most `min(fsync latency, max delay)` and stops as
+    soon as its group is complete.
+  - On the development laptop, single-writer and 8-writer ingest throughput
+    rose by about 50%, low-rate commit latency fell from about 6.1 ms to
+    3.8 ms, and the bulk load went from 140k to 217k events/s
+    (`benchmarks/reports/2026-11-26-adaptive-group-commit.md`).
+  - New settings `[storage] group_commit_max_delay_ms` and
+    `group_commit_adaptive`; new metric `strata_wal_group_delay_seconds`.
+- `strata doctor storage --dir`: fdatasync p50/p99 of 4 KiB writes and the
+  implied commit rate (STRATA-SYS-07-008).
+### Fixed
+- `strata-bench` closed-loop ingest held its batch-pool lock across
+  `write_batch` once the pre-generated batches ran out. That serialised the
+  writers and produced second-long false tail latencies. Open-loop ingest,
+  used by earlier reports, was not affected.
 - **`strata doctor host`** (spec VIII.2): host readiness report.
   - Checks: kernel, transparent huge pages, the 27-value sysctl baseline,
     CPU governor and clocksource, rlimits and cgroup limits, and, with

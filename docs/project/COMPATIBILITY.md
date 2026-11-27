@@ -2,8 +2,9 @@
 
 | Artifact | Current version | Reader accepts | Notes |
 |----------|-----------------|----------------|-------|
-| WAL segment | 2 | 1, 2 | v2 adds `synced_through` per frame (wal-v2.md); v1 segments are replayed, never appended to; fixtures `tests/fixtures/storage-v1` (v1), `tests/fixtures/wal-v2`; others → `FormatVersion` |
-| Event encoding | 1 | 1 | |
+| WAL segment | 3 (2 with `wal_format_version = 2`) | 1, 2, 3 | v2 adds `synced_through` per frame (wal-v2.md); v3 adds columnar record types 3–4 (wal-v3.md); older segments are replayed, never appended to; fixtures `tests/fixtures/storage-v1` (v1), `tests/fixtures/wal-v2`, `tests/fixtures/wal-v3`, `tests/fixtures/storage-wal-v3`; others → `FormatVersion` |
+| Event encoding (row) | 1 | 1 | WAL types 1–2 |
+| Columnar event batch | 1 | 1 | WAL types 3–4 (event-batch-columnar-v1.md) |
 | Segment | 3 (provisional) | 1, 2, 3 | v2: LZ4 chunks (RFC-0001); v3: shredded attributes (RFC-0002); compaction upgrades older segments |
 | Manifest | 1 | 1 | unknown JSON fields rejected |
 | Query language | StrataQL v0 | — | grammar in docs/query-language |

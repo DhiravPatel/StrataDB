@@ -17,8 +17,8 @@
 use std::cmp::Ordering;
 
 use stratadb_common::{Error, Result};
+use stratadb_schema::column::{ColumnData, ColumnId, Scope};
 use stratadb_schema::{Severity, Value};
-use stratadb_segment::{ColumnData, ColumnId, Scope};
 
 use crate::ast::{CmpOp, ColumnRef, Expr};
 use crate::eval::{self, LikePattern, Truth};
@@ -356,9 +356,26 @@ fn leaf_eval(
             let Ok(ColumnData::Strs(v)) = b.col(*id) else {
                 return Err(not_loaded(*id));
             };
-            for &i in rows {
-                let r = v[i].as_deref().map_or(VRef::Missing, VRef::Str);
-                out[i - base] = pred.eval(r, buf);
+            match v.dict() {
+                // Dictionary-encoded and not larger than the rows asked
+                // for: evaluate the predicate once per distinct value (and
+                // once for missing), then look it up per row by code.
+                Some((dict, codes)) if dict.len() <= rows.len() => {
+                    let mut table = Vec::with_capacity(dict.len() + 1);
+                    table.push(pred.eval(VRef::Missing, buf));
+                    for s in dict {
+                        table.push(pred.eval(VRef::Str(s), buf));
+                    }
+                    for &i in rows {
+                        out[i - base] = table[codes[i] as usize];
+                    }
+                }
+                _ => {
+                    for &i in rows {
+                        let r = v.get(i).map_or(VRef::Missing, VRef::Str);
+                        out[i - base] = pred.eval(r, buf);
+                    }
+                }
             }
         }
         Access::Body => {
@@ -548,10 +565,29 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            cols.insert(
-                id,
-                ColumnData::Strs(r.strs.iter().map(|s| s[j].clone()).collect()),
-            );
+            let vals: Vec<Option<String>> = r.strs.iter().map(|s| s[j].clone()).collect();
+            // Both representations: plain for even columns, dictionary for
+            // odd ones (the dictionary fast path must agree with scalar).
+            let col = if j % 2 == 0 {
+                stratadb_schema::column::StrColumn::from_options(vals).unwrap()
+            } else {
+                let mut dict: Vec<String> = Vec::new();
+                let codes = vals
+                    .iter()
+                    .map(|v| match v {
+                        None => 0,
+                        Some(s) => match dict.iter().position(|d| d == s) {
+                            Some(k) => k as u32 + 1,
+                            None => {
+                                dict.push(s.clone());
+                                dict.len() as u32
+                            }
+                        },
+                    })
+                    .collect();
+                stratadb_schema::column::StrColumn::from_dict(dict, codes).unwrap()
+            };
+            cols.insert(id, ColumnData::Strs(col));
         }
         cols.insert(ColumnId::Body, ColumnData::Values(r.body.clone()));
         cols.insert(ColumnId::Attributes, ColumnData::Maps(r.attrs.clone()));
