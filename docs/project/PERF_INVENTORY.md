@@ -9,7 +9,7 @@ HW-REF-1 runner exists), `PARTIAL`, `MISSING`, `BLOCKED` (cannot be done or
 verified in this environment), `DEFERRED` (later phase by decision, ADR-0026).
 Requirements without a status entry are `MISSING`.
 
-**416 requirements** — IMPLEMENTED 76, PARTIAL 80, MISSING 254, BLOCKED 4, DEFERRED 2. MUST only: IMPLEMENTED 73, PARTIAL 76, MISSING 188, BLOCKED 4, DEFERRED 1.
+**416 requirements** — IMPLEMENTED 78, PARTIAL 80, MISSING 252, BLOCKED 4, DEFERRED 2. MUST only: IMPLEMENTED 74, PARTIAL 76, MISSING 187, BLOCKED 4, DEFERRED 1.
 
 | Phase | Requirements | IMPLEMENTED | PARTIAL | MISSING | BLOCKED | DEFERRED |
 |---|---|---|---|---|---|---|
@@ -21,7 +21,7 @@ Requirements without a status entry are `MISSING`.
 | A0 | 18 | 5 | 9 | 4 | 0 | 0 |
 | A1 | 54 | 8 | 10 | 35 | 0 | 1 |
 | A2 | 37 | 0 | 2 | 35 | 0 | 0 |
-| A3 | 9 | 0 | 0 | 9 | 0 | 0 |
+| A3 | 9 | 2 | 0 | 7 | 0 | 0 |
 | A4 | 7 | 0 | 0 | 7 | 0 | 0 |
 
 ## Phase P0
@@ -469,8 +469,8 @@ Requirements without a status entry are `MISSING`.
 | ID | Level | Area | Status | Requirement | Evidence / note |
 |---|---|---|---|---|---|
 | STRATA-ARCH-09-001 | MUST | Result reuse | MISSING | Query result cache keyed by (normalized query text, parameter values, snapshot identity = set of part UUIDs + memtable LSN watermark, settings affecting results, effective row policies). Default off; per-query opt-in … |  |
-| STRATA-ARCH-09-002 | SHOULD | Result reuse | MISSING | *Partial result caching per part*: for aggregation queries over immutable parts, cache the partial aggregate state per (query fingerprint, part UUID). A repeated dashboard query recomputes only parts that are new sinc… |  |
-| STRATA-ARCH-09-003 | MUST | Result reuse | MISSING | Partial caches MUST be invalidated by part identity only (parts are immutable), never by time; merges create new part UUIDs, so cached states of merged-away parts naturally expire. |  |
+| STRATA-ARCH-09-002 | SHOULD | Result reuse | IMPLEMENTED | *Partial result caching per part*: for aggregation queries over immutable parts, cache the partial aggregate state per (query fingerprint, part UUID). A repeated dashboard query recomputes only parts that are new sinc… | stratadb_query::partial_cache: per-segment aggregate partials keyed by (query shape without event_time bounds, time part empty when the segment is covered, segment identity), verified on hit, rehashed and merged in segment order; tests/partial_cache.rs (on/off identical hit or miss, moving window hits covered segments, new data/compaction rescan only what changed, tenants never share, memory region accounting; 3 mutations caught), server tests/snapshots.rs; ADR-0045; opt-in ([limits] partial_cache_bytes, default 0); aggregates only |
+| STRATA-ARCH-09-003 | MUST | Result reuse | IMPLEMENTED | Partial caches MUST be invalidated by part identity only (parts are immutable), never by time; merges create new part UUIDs, so cached states of merged-away parts naturally expire. | entries keyed by ScanSource::identity (process-unique per opened segment; rewrites get new identities), never by time; tests/partial_cache.rs compaction_yields_new_identities_and_tenants_never_share |
 | STRATA-ARCH-09-004 | SHOULD | Result reuse | MISSING | Subquery and CTE results used more than once in a query SHOULD be materialized once (in memory, spillable) rather than recomputed. |  |
 | STRATA-ARCH-09-005 | SHOULD | Result reuse | MISSING | Prepared statements SHOULD bypass parsing and binding entirely, binding parameters into the cached physical plan template. |  |
 | STRATA-ARCH-10-001 | MUST | Hardware acceleration | MISSING | Each accelerator integration MUST keep a CPU fallback with identical results and MUST be selected per query by cost (including transfer and setup), never globally forced. |  |

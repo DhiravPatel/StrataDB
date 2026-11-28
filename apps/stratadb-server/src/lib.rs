@@ -75,6 +75,9 @@ pub struct ServerConfig {
     /// Plan cache bounds (0 disables it; spec VIII.16).
     pub plan_cache_entries: usize,
     pub plan_cache_bytes: usize,
+    /// Per-segment partial aggregate cache bytes (0 disables it; spec
+    /// STRATA-ARCH-09-002, ADR-0045). Capped at the cache memory region.
+    pub partial_cache_bytes: usize,
 }
 
 /// Limits for one tenant; `None` = unlimited.
@@ -130,6 +133,7 @@ impl Default for ServerConfig {
             workload: admission::WorkloadSettings::default(),
             plan_cache_entries: 10_000,
             plan_cache_bytes: 64 << 20,
+            partial_cache_bytes: 0,
         }
     }
 }
@@ -152,6 +156,8 @@ pub struct AppState {
     admission: Arc<admission::Admission>,
     /// Parsed and planned queries by text (spec VIII.16).
     plan_cache: Arc<plan_cache::PlanCache>,
+    /// Per-segment partial aggregates shared by all queries (ADR-0045).
+    partial_cache: Option<Arc<stratadb_query::PartialCache>>,
     running: Arc<std::sync::Mutex<std::collections::HashMap<String, Running>>>,
     auth_limiter: Arc<std::sync::Mutex<AuthLimiter>>,
     audit: Option<Arc<audit::AuditLog>>,
@@ -289,6 +295,12 @@ impl AppState {
                 cfg.plan_cache_entries,
                 cfg.plan_cache_bytes,
             )),
+            partial_cache: (cfg.partial_cache_bytes > 0).then(|| {
+                Arc::new(stratadb_query::PartialCache::new(
+                    cfg.partial_cache_bytes,
+                    None,
+                ))
+            }),
             running: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             auth_limiter: Arc::new(std::sync::Mutex::new(AuthLimiter {
                 window: Instant::now(),
@@ -322,6 +334,14 @@ impl AppState {
             self.cfg.workload.clone(),
             Some(Arc::clone(&m.query)),
         );
+        if self.cfg.partial_cache_bytes > 0 {
+            // Charged to the cache region and no larger than it.
+            let bytes = (self.cfg.partial_cache_bytes as u64).min(m.plan.cache);
+            self.partial_cache = Some(Arc::new(stratadb_query::PartialCache::new(
+                usize::try_from(bytes).unwrap_or(usize::MAX),
+                Some(Arc::clone(&m.cache)),
+            )));
+        }
         self.memory = Some(m);
         self
     }
@@ -1515,6 +1535,7 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
     let admission_wait = permit.waited;
     let started = Instant::now();
     let worker_life = Arc::clone(&life);
+    let partial_cache = st.partial_cache.clone();
     let memory = st.memory.as_ref().map(|m| {
         (
             m.query_parent(&principal.tenant, &query_id),
@@ -1545,6 +1566,7 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
                 } else {
                     stratadb_query::TARGET_MS_PER_WORKER
                 },
+                partial_cache: partial_cache.clone(),
                 ..QueryOptions::default()
             };
             if let Some((parent, limit, wait)) = memory {
@@ -1645,6 +1667,10 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
                     // rows skipped against the shared top-k bound.
                     "sort_runs_merged": s.sort_runs_merged,
                     "topk_rows_skipped": s.topk_rows_skipped,
+                    // Segments answered from the partial aggregate cache
+                    // and the rows they did not rescan (ADR-0045).
+                    "partials_from_cache": s.partials_from_cache,
+                    "rows_from_cache": s.rows_from_cache,
                     // Phase decomposition (spec VIII.1.4, STRATA-SYS-01-007):
                     // queue + parse + plan + exec (+ serialize) ≈ elapsed.
                     "queue_us": us(queued), "parse_us": us(s.parse),
@@ -2182,6 +2208,52 @@ async fn metrics(State(st): State<AppState>, headers: HeaderMap) -> Response {
             true,
         );
     }
+    if let Some(c) = st.partial_cache.as_ref().map(|c| c.stats()) {
+        for (name, kind, help, v) in [
+            (
+                "hits_total",
+                "counter",
+                "Segment aggregate partials reused from the cache.",
+                c.hits as f64,
+            ),
+            (
+                "misses_total",
+                "counter",
+                "Segment aggregate partials computed by a scan.",
+                c.misses as f64,
+            ),
+            (
+                "insertions_total",
+                "counter",
+                "Partials added.",
+                c.insertions as f64,
+            ),
+            (
+                "evictions_total",
+                "counter",
+                "Partials evicted (SLRU).",
+                c.evictions as f64,
+            ),
+            (
+                "bytes",
+                "gauge",
+                "Bytes of partials held (charged to the cache region).",
+                c.bytes as f64,
+            ),
+            ("entries", "gauge", "Partials held.", c.entries as f64),
+        ] {
+            out.push_str(&format!(
+                "# HELP strata_partial_cache_{name} {help}\n# TYPE strata_partial_cache_{name} {kind}\nstrata_partial_cache_{name} {v}\n"
+            ));
+        }
+        c.hit_seconds.render(
+            &mut out,
+            "strata_partial_cache_hit_seconds",
+            "Lookup latency of partial cache hits.",
+            "",
+            true,
+        );
+    }
     // Snapshots and retained obsolete segments (spec STRATA-SYS-17-005).
     let snaps = st.engine.snapshots();
     let oldest = snaps.open.iter().map(|s| s.age_ms).max().unwrap_or(0) as f64 / 1000.0;
@@ -2286,6 +2358,16 @@ async fn admin_caches(State(st): State<AppState>, headers: HeaderMap) -> Respons
             "capacity_bytes": c.capacity_bytes,
             "hit_p99_us": c.hit_seconds.quantile_upper_bound(0.99).map(|x| x * 1e6),
         })),
+        "partial_cache": st.partial_cache.as_ref().map(|c| {
+            let c = c.stats();
+            json!({
+                "hits": c.hits, "misses": c.misses, "insertions": c.insertions,
+                "evictions": c.evictions, "entries": c.entries, "bytes": c.bytes,
+                "protected_entries": c.protected_entries,
+                "capacity_bytes": c.capacity_bytes,
+                "hit_p99_us": c.hit_seconds.quantile_upper_bound(0.99).map(|x| x * 1e6),
+            })
+        }),
     }))
     .into_response()
 }

@@ -234,6 +234,8 @@ Requirement-level status: PERF_INVENTORY.md (generated; `scripts/spec_inventory.
    - ☐ A cost model (12-003: NDV sketches, histograms).
    - ☐ Granule skipping against the top-k bound for keys other than
      `event_time`.
-10. ☐ **StrataStudio follow-up:** use `whoami` for permissions and
+10. ✅ **ARCH-09-002/003** Per-segment partial aggregate cache: repeated
+    dashboards rescan only new and edge segments (ADR-0045).
+11. ☐ **StrataStudio follow-up:** use `whoami` for permissions and
     `schema` for the object browser, instead of probing and the fixed
     column list.

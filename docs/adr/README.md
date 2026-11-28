@@ -47,6 +47,7 @@ its decision; it is superseded by a new ADR. Status meanings:
 | [0033](0033-columnar-memtable.md) | Columnar memtable: column chunks, published row counts, zone maps, O(1) freeze, replay into columns | Accepted |
 | [0034](0034-typed-string-columns-and-selections.md) | Typed string columns (plain/dictionary), dictionary filter and group-key kernels, selection vectors, count fast path | Accepted |
 | [0035](0035-state-machine-metrics.md) | Spec IX.22 state machines: generic tracker, `strata_state_*` metrics, spec-conformance test, device health monitor | Accepted |
+| [0045](0045-partial-aggregate-cache.md) | Per-segment partial aggregate cache keyed by query shape, covered time window and segment identity; exact merge on hit | Accepted |
 | [0044](0044-columnar-json-serializer.md) | Columnar JSON result serializer (per-column blocks, itoa/zmij, byte-identical to serde_json), encoded on the blocking pool, exact-length chunked body | Accepted |
 | [0043](0043-normalized-key-sort-and-topk-bound.md) | Normalized-key sort (radix/pdqsort over a permutation), per-segment sorted runs merged by a loser tree, shared top-k bound; exact numeric ORDER BY | Accepted |
 | [0042](0042-column-cache-and-studio-endpoints.md) | Decoded column cache with SLRU scan resistance and shared column buffers; whoami/schema/queries/backup-list endpoints for StrataStudio | Accepted |

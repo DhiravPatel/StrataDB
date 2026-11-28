@@ -210,6 +210,18 @@ P3-1..4 are **done** (ADR-0040).
 `strata-studio serve`, see `docs/studio/README.md`). Its server requests are
 done (ADR-0042).
 
+The partial aggregate cache (ARCH-09-002/003) is **done** (ADR-0045).
+- **Code:**
+  - `stratadb_query::partial_cache` (`PartialCache`, `CachedPartial`);
+  - `groups::FrozenGroups`;
+  - `plan::TimeSplit`;
+  - `ScanSource::identity` (`SegmentHandle.uid`);
+  - in `exec`: `PartialKey` and the hit/miss handling in
+    `ScanShared::scan_one`.
+- **Configuration:** `[limits] partial_cache_bytes`, default 0; capped at
+  the cache region by `AppState::with_memory`.
+- **Stats:** `partials_from_cache` and `rows_from_cache`.
+
 P3-7 has started: the columnar JSON serializer is **done** (ADR-0044).
 - **Serializer:** `apps/stratadb-server/src/json_out.rs` provides
   `write_rows`, `envelope_parts` and `ChunkedBody`.

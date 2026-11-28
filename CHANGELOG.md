@@ -18,6 +18,15 @@
   queries) and `GET /api/v1/admin/backup` (backup list). A `page_size` on
   aggregate or EXPLAIN queries is now ignored (`"paginated": false`)
   instead of rejected.
+- **Partial aggregate cache (ADR-0045).** An opt-in
+  `[limits] partial_cache_bytes` caches each segment's aggregate partial.
+  - **Effect:** a repeated or refreshing dashboard query rescans only new
+    segments, the memtable, and the segments on the edge of its time
+    window.
+  - **Correctness:** results are identical whether a partial is cached or
+    not.
+  - **Observability:** `partials_from_cache` in the query stats,
+    `/admin/caches`, and the `strata_partial_cache_*` metrics.
 - **Faster query responses (ADR-0044).**
   - **Encoding:** result rows are encoded to JSON column by column (587
     MB/s per core, 3.2× the previous path) with byte-identical output.

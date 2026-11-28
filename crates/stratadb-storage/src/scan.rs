@@ -204,6 +204,15 @@ pub trait ScanSource: Send + Sync + std::fmt::Debug {
     /// reserve it before reading (STRATA-SYS-05-005). Computed from
     /// metadata only; no data is read.
     fn estimated_read_bytes(&self, req: &ColumnRequest<'_>) -> u64;
+    /// A process-unique identity of this source's rows when they can never
+    /// change (a flushed segment): two sources with the same identity hold
+    /// identical rows, and a rewrite (compaction, retention) yields a new
+    /// one. `None` for sources that can still change (memtable windows).
+    /// Caches of per-source results key on it (spec STRATA-ARCH-09-003).
+    fn identity(&self) -> Option<u64> {
+        None
+    }
+
     /// Exact row count per severity code, from metadata, when the source
     /// records it (aggregates answered without reading, STRATA-SYS-09-006).
     /// `None` when unknown.
@@ -249,6 +258,10 @@ fn foreign() -> Error {
 }
 
 impl ScanSource for SegmentHandle {
+    fn identity(&self) -> Option<u64> {
+        Some(self.uid())
+    }
+
     fn owned_by(&self, tenant: &TenantId) -> bool {
         &self.entry.tenant == tenant && &self.reader.footer().tenant_id == tenant
     }

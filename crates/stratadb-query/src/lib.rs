@@ -12,6 +12,7 @@ mod groups;
 pub mod lexer;
 pub mod page;
 pub mod parser;
+pub mod partial_cache;
 pub mod plan;
 pub mod pool;
 mod sort;
@@ -25,6 +26,7 @@ pub use exec::{
     TARGET_MS_PER_WORKER,
 };
 pub use fingerprint::{fingerprint, Fingerprint};
+pub use partial_cache::PartialCache;
 pub use pool::{
     configure_scan_pool, scan_pool, tenant_key, ClassUsage, PoolStats, Step, Tag, Task,
 };

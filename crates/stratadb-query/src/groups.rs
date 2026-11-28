@@ -217,6 +217,82 @@ impl<S> GroupTable<S> {
     }
 }
 
+/// A group table's groups without its hash index or seed: key bytes and
+/// states in first-seen order, merged into any table by rehashing (cached
+/// per-segment partials outlive the query whose seed built them; spec
+/// STRATA-ARCH-09-002).
+#[derive(Debug, Clone)]
+pub(crate) struct FrozenGroups<S> {
+    arena: Vec<u8>,
+    spans: Vec<(u32, u32)>,
+    states: Vec<S>,
+    n_aggs: usize,
+}
+
+impl<S: Clone> GroupTable<S> {
+    /// A copy of the groups (exactly sized), or `None` when the key arena
+    /// exceeds `u32` offsets.
+    pub(crate) fn freeze(&self) -> Option<FrozenGroups<S>> {
+        let spans = self
+            .spans
+            .iter()
+            .map(|&(s, e)| Some((u32::try_from(s).ok()?, u32::try_from(e).ok()?)))
+            .collect::<Option<Vec<_>>>()?;
+        Some(FrozenGroups {
+            arena: self.arena.clone(),
+            spans,
+            states: self.states.clone(),
+            n_aggs: self.n_aggs,
+        })
+    }
+}
+
+impl<S: Clone> FrozenGroups<S> {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    /// Heap bytes, with `state_bytes` per aggregate state.
+    pub(crate) fn heap_bytes(&self, state_bytes: usize) -> usize {
+        self.arena.len()
+            + self.spans.len() * std::mem::size_of::<(u32, u32)>()
+            + self.states.len() * state_bytes
+    }
+
+    /// Fold these groups into `dst` in first-seen order, exactly as merging
+    /// the original table would: existing groups are combined with
+    /// `merge`, new ones appended (states cloned). Keys are rehashed with
+    /// `dst`'s seed.
+    pub(crate) fn merge_into(
+        &self,
+        dst: &mut GroupTable<S>,
+        mut merge: impl FnMut(&mut S, &S) -> Result<()>,
+    ) -> Result<()> {
+        if self.n_aggs != dst.n_aggs {
+            return Err(Error::internal(
+                "cached groups have another aggregate count",
+            ));
+        }
+        for (g, &(s, e)) in self.spans.iter().enumerate() {
+            let kb = &self.arena[s as usize..e as usize];
+            let mine = &self.states[g * self.n_aggs..(g + 1) * self.n_aggs];
+            let h = dst.hash(kb);
+            match dst.find(h, kb) {
+                Some(idx) => {
+                    for (a, b) in dst.states_mut(idx).iter_mut().zip(mine) {
+                        merge(a, b)?;
+                    }
+                }
+                None => {
+                    dst.insert(h, kb, mine.iter().cloned());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Decode `n_keys` key values from group key bytes (the inverse of the
 /// encoding built by `Ctx::process`: per key a `u32` length, then
 /// `MISSING_KEY_TAG` or an `encode_value` encoding).
@@ -351,6 +427,61 @@ mod tests {
             let kb = a.group(g).0.to_vec();
             assert_eq!(a.find(a.hash(&kb), &kb), Some(g));
         }
+    }
+
+    /// Frozen groups merge into a table with another seed exactly like the
+    /// original table merges into one with its own seed.
+    #[test]
+    fn frozen_groups_merge_like_the_table_across_seeds() {
+        let build = |seed_of: Option<&GroupTable<u64>>, keys: &[u64]| {
+            let mut t = match seed_of {
+                Some(o) => GroupTable::with_hasher(1, o.hasher()),
+                None => GroupTable::new(1),
+            };
+            for &k in keys {
+                let kb = key_bytes(&[Some(Value::UInt(k % 7))]);
+                let h = t.hash(&kb);
+                match t.find(h, &kb) {
+                    Some(g) => t.states_mut(g)[0] += k,
+                    None => {
+                        t.insert(h, &kb, [k]);
+                    }
+                }
+            }
+            t
+        };
+        let dump = |t: &GroupTable<u64>| -> Vec<(Vec<u8>, u64)> {
+            (0..t.len())
+                .map(|g| (t.group(g).0.to_vec(), t.group(g).1[0]))
+                .collect()
+        };
+        let keys_a = [5u64, 9, 12, 3, 40];
+        let keys_b = [8u64, 5, 31, 2, 16, 23];
+        // Reference: same-seed merge of the original table.
+        let mut want = build(None, &keys_a);
+        build(Some(&want), &keys_b)
+            .merge_into(&mut want, |x, y| {
+                *x += y;
+                Ok(())
+            })
+            .unwrap();
+        // Frozen under one seed, merged into a table with a fresh seed.
+        let frozen = build(None, &keys_b).freeze().unwrap();
+        let mut got = build(None, &keys_a);
+        frozen
+            .merge_into(&mut got, |x, y| {
+                *x += *y;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(dump(&got), dump(&want));
+        for g in 0..got.len() {
+            let kb = got.group(g).0.to_vec();
+            assert_eq!(got.find(got.hash(&kb), &kb), Some(g));
+        }
+        assert_eq!(frozen.len(), 4, "8, 5, 31, 2, 16, 23 mod 7");
+        let mut other = GroupTable::<u64>::new(2);
+        assert!(frozen.merge_into(&mut other, |_, _| Ok(())).is_err());
     }
 
     fn arb_value() -> impl proptest::strategy::Strategy<Value = Value> {

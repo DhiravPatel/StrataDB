@@ -804,3 +804,13 @@ note = "always a permutation; no width-based choice to carry narrow payloads alo
 status = "IMPLEMENTED"
 evidence = "apps/stratadb-server/src/json_out.rs: rows encoded per column in 1,024-row blocks into scratch buffers, then interleaved with pre-encoded keys; itoa + zmij (shortest round-trip) numbers, non-allocating RFC 3339 timestamps; byte-identical to serde_json (proptests incl. escaping, key order, missing cells, nested values); 587 MB/s per core vs 186 MB/s for the old value tree (3.17x) on events-table rows (json_throughput, report 2026-11-28-json-serializer, ADR-0044)"
 note = "rows are encoded off the async reactor (blocking pool); the response is still built whole, not streamed (06-002)"
+
+# ------------------------------------------------------- ARCH-09 cache --
+[req."STRATA-ARCH-09-002"]
+status = "IMPLEMENTED"
+evidence = "stratadb_query::partial_cache: per-segment aggregate partials keyed by (query shape without event_time bounds, time part empty when the segment is covered, segment identity), verified on hit, rehashed and merged in segment order; tests/partial_cache.rs (on/off identical hit or miss, moving window hits covered segments, new data/compaction rescan only what changed, tenants never share, memory region accounting; 3 mutations caught), server tests/snapshots.rs; ADR-0045"
+note = "opt-in ([limits] partial_cache_bytes, default 0); aggregates only"
+
+[req."STRATA-ARCH-09-003"]
+status = "IMPLEMENTED"
+evidence = "entries keyed by ScanSource::identity (process-unique per opened segment; rewrites get new identities), never by time; tests/partial_cache.rs compaction_yields_new_identities_and_tenants_never_share"

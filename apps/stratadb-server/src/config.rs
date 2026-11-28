@@ -222,6 +222,9 @@ pub struct LimitsSection {
     /// Plan cache bounds (0 disables; defaults 10000 entries, 64 MiB).
     pub plan_cache_entries: Option<usize>,
     pub plan_cache_bytes: Option<usize>,
+    /// Per-segment partial aggregate cache (0 disables; default 0; capped
+    /// at the cache memory region; ADR-0045).
+    pub partial_cache_bytes: Option<usize>,
     pub max_query_timeout_ms: Option<u64>,
     pub max_query_rows: Option<usize>,
     /// Threads of the shared scan worker pool (1..=256; default: logical CPUs).
@@ -452,6 +455,14 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
             ));
         }
         server.plan_cache_bytes = v;
+    }
+    if let Some(v) = l.partial_cache_bytes {
+        if v > 64 << 30 {
+            return Err(Error::invalid_input(
+                "limits.partial_cache_bytes must be at most 64 GiB",
+            ));
+        }
+        server.partial_cache_bytes = v;
     }
     if let Some(v) = positive("limits.max_query_timeout_ms", l.max_query_timeout_ms)? {
         server.max_query_timeout = Duration::from_millis(v);
@@ -759,6 +770,7 @@ impl Resolved {
                 "max_concurrent_queries": self.server.max_concurrent_queries,
                 "plan_cache_entries": self.server.plan_cache_entries,
                 "plan_cache_bytes": self.server.plan_cache_bytes,
+                "partial_cache_bytes": self.server.partial_cache_bytes,
                 "max_query_timeout_ms": self.server.max_query_timeout.as_millis() as u64,
                 "max_query_rows": self.server.max_query_rows,
                 "scan_threads": self.threads.scan,

@@ -227,6 +227,8 @@ The plan cache:
 
 Query responses report `stats.plan_cache` (`hit`/`miss`), `est_rows`,
 `q_error`, `sources_skipped_by_order`, `column_cache_hits`,
+`partials_from_cache` / `rows_from_cache` (segments whose aggregate
+partial came from the partial cache, and the rows not rescanned; ADR-0045),
 `sort_runs_merged` (sorted segment runs merged) and `topk_rows_skipped`
 (rows of an `ORDER BY ... LIMIT` beaten by the shared top-k bound before
 being built). The

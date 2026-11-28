@@ -27,6 +27,7 @@
 | `[storage] group_commit_adaptive` | — | true | wait only when more writers are expected: no wait at low arrival rate; otherwise up to min(fsync latency, max delay), stopping when the group is complete (spec STRATA-SYS-07-004). `false` always waits the full delay |
 | `[storage] wal_format_version` | — | 3 | WAL format written: 3 (columnar, LZ4-compressed batch payloads; spec STRATA-SYS-07-002) or 2 (row payloads, readable by the previous release; use it for a rollback window, runbooks/upgrade.md) |
 | `[storage] io_max_inflight_per_device` | — | 128 | I/O calls (reads, writes, fsyncs) in flight per device (1–4096; spec STRATA-SYS-04-008). Callers wait for a permit beyond it |
+| `[limits] partial_cache_bytes` | — | 0 (off) | per-segment partial aggregate cache (ADR-0045): repeated aggregate queries reuse each unchanged segment's partial; charged to and capped at the cache memory region |
 | `[storage] column_cache_bytes` | — | 0 (off) | decoded segment column cache (SLRU, scan resistant), charged to the cache memory region and capped at it; useful when the same queries repeat over the same segments |
 | `[storage] old_segments_lifetime_s` | — | 480 | seconds a replaced segment file is kept after its last reader (0–86400; spec `old_parts_lifetime`); disk is freed that much later after compaction or retention |
 | `[storage] max_open_files` | — | 50% of the soft `RLIMIT_NOFILE` | segment files kept open (LRU; at least 16); cold files are closed and reopened on demand. The server first raises the soft limit to the hard limit |

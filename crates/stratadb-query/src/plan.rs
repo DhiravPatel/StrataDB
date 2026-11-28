@@ -175,6 +175,77 @@ fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
+/// A filter split into its top-level `event_time` bounds and the other
+/// conjuncts (per-source partial caching, spec STRATA-ARCH-09-002): for a
+/// source whose time range lies inside the bounds, every time conjunct is
+/// true for every row, so the filter there equals the residual alone
+/// (`TRUE AND x = x`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TimeSplit {
+    /// Inclusive bounds implied by the time conjuncts (`None`: unbounded).
+    pub lo: Option<i64>,
+    pub hi: Option<i64>,
+    /// Every top-level conjunct that is not an `event_time` comparison with
+    /// a timestamp literal, in filter order.
+    pub residual: Vec<Expr>,
+}
+
+impl TimeSplit {
+    pub fn of(filter: Option<&Expr>) -> TimeSplit {
+        let mut out = TimeSplit::default();
+        let Some(f) = filter else {
+            return out;
+        };
+        let mut cs = Vec::new();
+        conjuncts(f, &mut cs);
+        for c in cs {
+            let bound = match c {
+                Expr::Cmp(a, op, b) => match (a.as_ref(), b.as_ref()) {
+                    (Expr::Column(ColumnRef::EventTime), Expr::Literal(Value::Timestamp(t))) => {
+                        time_bound(*op, *t)
+                    }
+                    (Expr::Literal(Value::Timestamp(t)), Expr::Column(ColumnRef::EventTime)) => {
+                        time_bound(op.flip(), *t)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            match bound {
+                Some((lo, hi)) => {
+                    if let Some(lo) = lo {
+                        out.lo = Some(out.lo.map_or(lo, |x| x.max(lo)));
+                    }
+                    if let Some(hi) = hi {
+                        out.hi = Some(out.hi.map_or(hi, |x| x.min(hi)));
+                    }
+                }
+                None => out.residual.push(c.clone()),
+            }
+        }
+        out
+    }
+
+    /// Whether every row of a source with this inclusive time range passes
+    /// every time conjunct.
+    pub fn covers(&self, (min, max): (i64, i64)) -> bool {
+        self.lo.is_none_or(|lo| min >= lo) && self.hi.is_none_or(|hi| max <= hi)
+    }
+}
+
+/// Inclusive bounds of `event_time OP t`; `None` for forms that are not a
+/// single interval (`!=`) or overflow.
+fn time_bound(op: CmpOp, t: i64) -> Option<(Option<i64>, Option<i64>)> {
+    Some(match op {
+        CmpOp::Eq => (Some(t), Some(t)),
+        CmpOp::Ge => (Some(t), None),
+        CmpOp::Gt => (Some(t.checked_add(1)?), None),
+        CmpOp::Le => (None, Some(t)),
+        CmpOp::Lt => (None, Some(t.checked_sub(1)?)),
+        CmpOp::Ne => return None,
+    })
+}
+
 fn require_key(c: &ColumnRef, p: &mut Pruning) {
     match c {
         ColumnRef::Attr(k) => {

@@ -272,7 +272,14 @@ pub struct SegmentHandle {
     cache: Option<Arc<stratadb_common::memory::MemoryTracker>>,
     /// Decoded column cache shared by the engine's segments (opt-in).
     column_cache: Option<Arc<crate::colcache::ColumnCache>>,
+    /// Process-unique identity of this immutable segment
+    /// ([`crate::scan::ScanSource::identity`]).
+    uid: u64,
 }
+
+/// Source of [`SegmentHandle::uid`]: every opened segment gets a new value,
+/// so a rewritten or reopened segment never shares an identity.
+static NEXT_SEGMENT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// A decoded structure and its tracked memory (released with it).
 #[derive(Debug)]
@@ -897,6 +904,7 @@ fn open_segment(
         ngram: std::sync::OnceLock::new(),
         cache: None,
         column_cache: None,
+        uid: NEXT_SEGMENT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     })
 }
 
@@ -914,6 +922,10 @@ impl SegmentHandle {
 
     pub(crate) fn column_cache(&self) -> Option<&crate::colcache::ColumnCache> {
         self.column_cache.as_deref()
+    }
+
+    pub(crate) fn uid(&self) -> u64 {
+        self.uid
     }
 }
 

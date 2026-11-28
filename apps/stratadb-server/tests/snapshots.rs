@@ -174,3 +174,68 @@ async fn repeated_queries_are_served_from_the_plan_cache() {
     assert_eq!(first["stats"]["q_error"], 1.0);
     assert!(text.contains("strata_query_estimate_q_error_count 3"));
 }
+
+/// `[limits] partial_cache_bytes` (ADR-0045): a repeated aggregate is
+/// answered from cached per-segment partials, with identical results, and
+/// the cache is visible in `/admin/caches` and the metrics.
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_aggregates_reuse_cached_segment_partials() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = TokenStore::load(dir.path()).unwrap();
+    let mut mk = |t: &str, p: &[Permission]| {
+        store
+            .create(
+                TenantId::new(t).unwrap(),
+                p.iter().copied().collect::<BTreeSet<_>>(),
+                None,
+                None,
+            )
+            .unwrap()
+            .1
+    };
+    let rw = mk("t", &[Permission::Ingest, Permission::Query]);
+    let ops = mk("ops", &[Permission::ClusterRead]);
+    let mut o = EngineOptions::new(dir.path().join("data"));
+    o.wal.durability = Durability::Async;
+    o.background = false;
+    let engine = Arc::new(Engine::open(o).unwrap());
+    let cfg = ServerConfig {
+        partial_cache_bytes: 16 << 20,
+        ..ServerConfig::default()
+    };
+    let state = AppState::new(
+        Arc::clone(&engine),
+        TokenStore::load(dir.path()).unwrap(),
+        cfg,
+    );
+    let app = router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for k in 0..3 {
+        let lines: Vec<String> = (0..200)
+            .map(|i| format!(r#"{{"body":"b{i}","service":"s{}"}}"#, (i + k) % 4))
+            .collect();
+        let body = format!("[{}]", lines.join(","));
+        let (st, _, b) = req(addr, "POST", "/api/v1/ingest", &rw, &body).await;
+        assert_eq!(st, 200, "{b}");
+        engine.flush().unwrap();
+    }
+    let q = r#"{"query":"SELECT service, count(*) FROM logs GROUP BY service ORDER BY service"}"#;
+    let (_, _, first) = req(addr, "POST", "/api/v1/query", &rw, q).await;
+    let (_, _, second) = req(addr, "POST", "/api/v1/query", &rw, q).await;
+    let (a, b): (Value, Value) = (
+        serde_json::from_str(&first).unwrap(),
+        serde_json::from_str(&second).unwrap(),
+    );
+    assert_eq!(a["rows"], b["rows"]);
+    assert_eq!(a["stats"]["partials_from_cache"], 0, "{a}");
+    assert_eq!(b["stats"]["partials_from_cache"], 3, "{b}");
+    assert_eq!(b["stats"]["rows_from_cache"], 600);
+    let (_, _, caches) = req(addr, "GET", "/api/v1/admin/caches", &ops, "").await;
+    let c: Value = serde_json::from_str(&caches).unwrap();
+    assert_eq!(c["partial_cache"]["entries"], 3, "{c}");
+    assert!(c["partial_cache"]["hits"].as_u64().unwrap() >= 3);
+    let (_, _, text) = req(addr, "GET", "/api/v1/metrics", &ops, "").await;
+    assert!(text.contains("strata_partial_cache_entries 3"), "metrics");
+}

@@ -108,6 +108,9 @@ pub struct EngineCfg {
     /// Decoded column cache bytes (0 = off, the engine default).
     #[serde(default)]
     pub column_cache_bytes: usize,
+    /// Per-segment partial aggregate cache bytes (0 = off; ADR-0045).
+    #[serde(default)]
+    pub partial_cache_bytes: usize,
 }
 
 fn wal_v3() -> u16 {
@@ -379,6 +382,7 @@ const STAT_KEYS: &[&str] = &[
     "column_cache_hits",
     "sort_runs_merged",
     "topk_rows_skipped",
+    "partials_from_cache",
 ];
 
 fn stat(s: &QueryStats, result_rows: usize, key: &str) -> f64 {
@@ -411,6 +415,7 @@ fn stat(s: &QueryStats, result_rows: usize, key: &str) -> f64 {
         "column_cache_hits" => s.column_cache_hits,
         "sort_runs_merged" => s.sort_runs_merged,
         "topk_rows_skipped" => s.topk_rows_skipped,
+        "partials_from_cache" => s.partials_from_cache,
         _ => 0,
     }) as f64
 }
@@ -666,6 +671,12 @@ pub fn run(text: &str, out_dir: &Path, hw_profile: &str, data_dir: Option<PathBu
         memory: memory
             .as_ref()
             .map(|(_, tenant)| std::sync::Arc::clone(tenant)),
+        partial_cache: (sc.engine.partial_cache_bytes > 0).then(|| {
+            std::sync::Arc::new(stratadb_query::PartialCache::new(
+                sc.engine.partial_cache_bytes,
+                None,
+            ))
+        }),
         ..QueryOptions::default()
     };
     let mut queries = Vec::new();

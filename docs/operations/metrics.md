@@ -152,6 +152,7 @@ number of concurrent writers (ADR-0032).
 | `strata_plan_cache_hit_seconds` | histogram of hit lookup latency |
 | `strata_plan_cache_fingerprint_hit_ratio{fingerprint}` | hit ratio of the 100 most looked-up query shapes |
 | `strata_column_cache_{hits,misses,insertions,evictions}_total`, `strata_column_cache_bytes`, `strata_column_cache_protected_entries`, `strata_column_cache_hit_seconds` | decoded column cache (only when `[storage] column_cache_bytes` > 0): bytes are charged to the cache memory region; protected = used at least twice (SLRU) |
+| `strata_partial_cache_{hits,misses,insertions,evictions}_total`, `strata_partial_cache_{bytes,entries}`, `strata_partial_cache_hit_seconds` | per-segment partial aggregate cache (only when `[limits] partial_cache_bytes` > 0) |
 | `strata_query_estimate_q_error` | histogram of max(estimated/actual, actual/estimated) rows per query; high values also come from early stops and metadata answers (work avoided) |
 
 ## Snapshots and retained segments (spec VIII.17, ADR-0039)

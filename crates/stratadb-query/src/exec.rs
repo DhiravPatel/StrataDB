@@ -67,6 +67,12 @@ pub struct QueryOptions {
     /// shared by all scan workers (STRATA-SYS-14-003). Disabling it must
     /// never change results.
     pub enable_topk_bound: bool,
+    /// Per-segment partial aggregate cache shared across queries (spec
+    /// STRATA-ARCH-09-002/003; `None`: off). With a cache, aggregates are
+    /// always computed as per-segment partials merged in segment order (as
+    /// parallel scans are), and cached partials merge exactly like fresh
+    /// ones: results do not depend on hits or misses.
+    pub partial_cache: Option<Arc<crate::partial_cache::PartialCache>>,
     /// `ORDER BY event_time [ASC|DESC] LIMIT k`: read sources best-first by
     /// their time ranges and stop when the k-th row beats every remaining
     /// source (STRATA-SYS-14-004). Disabling it must never change results.
@@ -106,6 +112,7 @@ impl Default for QueryOptions {
             enable_dense_groups: true,
             enable_normalized_sort: true,
             enable_topk_bound: true,
+            partial_cache: None,
             enable_ordered_scan: true,
             parse_limits: Default::default(),
             parallelism: std::thread::available_parallelism()
@@ -199,6 +206,11 @@ pub struct QueryStats {
     /// were built, because they sort after the query-wide k-th row
     /// (STRATA-SYS-14-003; all workers).
     pub topk_rows_skipped: u64,
+    /// Segments whose aggregate partial came from the partial cache instead
+    /// of a scan, and the rows those scans would have read
+    /// (STRATA-ARCH-09-002; not included in `rows_scanned`).
+    pub partials_from_cache: u64,
+    pub rows_from_cache: u64,
     /// Times a conjunction of the vectorized filter changed its evaluation
     /// order from observed cost and selectivity (STRATA-SYS-08-019; all
     /// workers).
@@ -1034,7 +1046,7 @@ pub(crate) fn eval_truth(e: &Expr, b: &Batch<'_>, i: usize) -> Result<Truth> {
 // Aggregation
 
 #[derive(Debug, Clone)]
-enum AggState {
+pub(crate) enum AggState {
     Count(u64),
     Sum {
         int: i128,
@@ -2094,6 +2106,8 @@ impl Iterator for Selected<'_> {
 /// Result of scanning one segment in a parallel work item.
 struct Partial {
     stats: QueryStats,
+    /// A cached partial used instead of `groups` (partial cache hit).
+    cached: Option<Arc<crate::partial_cache::CachedPartial>>,
     rows: Vec<Row>,
     /// Groups in first-seen order: (key bytes, key values, states).
     groups: crate::groups::GroupTable<AggState>,
@@ -2101,6 +2115,38 @@ struct Partial {
     /// The worker's reservation for `rows` and `groups`, handed over with
     /// them.
     acct: Accountant,
+}
+
+/// What a cached per-segment partial depends on, besides the segment
+/// (spec STRATA-ARCH-09-002; see `partial_cache`).
+struct PartialKey {
+    /// Tenant, table, `GROUP BY`, aggregates and the non-time conjuncts.
+    canon: Arc<str>,
+    split: crate::plan::TimeSplit,
+}
+
+impl PartialKey {
+    /// `Some` for aggregate queries with a partial cache (not EXPLAIN, not
+    /// paginated).
+    fn of(plan: &Plan, opts: &QueryOptions, paged: bool, tenant: &TenantId) -> Option<Self> {
+        opts.partial_cache.as_ref()?;
+        if !plan.aggregate || paged || plan.explain != crate::ast::ExplainMode::None {
+            return None;
+        }
+        let split = crate::plan::TimeSplit::of(plan.filter.as_ref());
+        let canon = format!(
+            "v1|{}|{:?}|{:?}|{:?}|{:?}",
+            tenant.as_str(),
+            plan.table,
+            plan.group_by,
+            plan.aggregates,
+            split.residual
+        );
+        Some(PartialKey {
+            canon: Arc::from(canon),
+            split,
+        })
+    }
 }
 
 /// Everything a scan task needs, owned so tasks can run on the shared pool
@@ -2120,6 +2166,8 @@ struct ScanShared {
     tenant: TenantId,
     /// Default-order positions of `segs` (ordered scans), see `Ctx::pos_base`.
     positions: Option<Vec<u64>>,
+    /// The query's partial cache key, when its partials can be cached.
+    partial_key: Option<PartialKey>,
     /// Next segment index to claim.
     next: std::sync::atomic::AtomicUsize,
     /// Workers that claimed at least one segment.
@@ -2182,6 +2230,40 @@ impl ScanShared {
     }
 
     fn scan_one(&self, i: usize) -> Result<Partial> {
+        let seg = &self.segs[i];
+        let cacheable = match (&self.opts.partial_cache, &self.partial_key, seg.identity()) {
+            (Some(cache), Some(key), Some(uid)) => {
+                let time = if key.split.covers(seg.event_time_range()) {
+                    None
+                } else {
+                    Some((key.split.lo, key.split.hi))
+                };
+                Some((cache, key, time, uid))
+            }
+            _ => None,
+        };
+        if let Some((cache, key, time, uid)) = &cacheable {
+            // Storage re-checks ownership on every read; a cache hit reads
+            // nothing, so check it here.
+            if !seg.owned_by(&self.tenant) {
+                return Err(Error::internal("segment of another tenant in a scan"));
+            }
+            if let Some(hit) = cache.get(&key.canon, *time, *uid) {
+                let stats = QueryStats {
+                    partials_from_cache: 1,
+                    rows_from_cache: hit.rows_scanned,
+                    ..QueryStats::default()
+                };
+                return Ok(Partial {
+                    stats,
+                    mem: hit.bytes,
+                    cached: Some(hit),
+                    rows: Vec::new(),
+                    groups: crate::groups::GroupTable::new(0),
+                    acct: Accountant::new(None, DEFAULT_BATCH_BYTES, Duration::ZERO),
+                });
+            }
+        }
         let mut p = Ctx::new(
             &self.plan,
             &self.opts,
@@ -2212,8 +2294,17 @@ impl ScanShared {
             p.mem = p.rows.iter().map(row_size).sum();
         }
         let empty = crate::groups::GroupTable::new(0);
+        if let Some((cache, key, time, uid)) = cacheable {
+            // Partials answered from metadata are cheaper than a cache hit.
+            if p.stats.sources_from_metadata == 0 {
+                if let Some(frozen) = p.groups.freeze() {
+                    cache.put(&key.canon, time, uid, frozen, p.stats.rows_scanned);
+                }
+            }
+        }
         Ok(Partial {
             stats: std::mem::take(&mut p.stats),
+            cached: None,
             rows: std::mem::take(&mut p.rows),
             groups: std::mem::replace(&mut p.groups, empty),
             mem: p.mem,
@@ -2487,6 +2578,7 @@ fn scan_parallel(
 ) -> Result<()> {
     let n = segs.len();
     let shared = Arc::new(ScanShared {
+        partial_key: PartialKey::of(ctx.plan, ctx.opts, ctx.page.is_some(), tenant),
         positions: positions.map(<[u64]>::to_vec),
         plan: ctx.plan.clone(),
         opts: ctx.opts.clone(),
@@ -2600,6 +2692,8 @@ fn scan_parallel(
         s.filter_reorders += p.stats.filter_reorders;
         s.column_cache_hits += p.stats.column_cache_hits;
         s.topk_rows_skipped += p.stats.topk_rows_skipped;
+        s.partials_from_cache += p.stats.partials_from_cache;
+        s.rows_from_cache += p.stats.rows_from_cache;
         s.rows_scanned += p.stats.rows_scanned;
         s.rows_matched += p.stats.rows_matched;
         s.bytes_read += p.stats.bytes_read;
@@ -2617,7 +2711,10 @@ fn scan_parallel(
             ctx.maybe_compact();
         }
         // Partial groups in their first-seen order → global first-seen order.
-        p.groups.merge_into(&mut ctx.groups, |a, b| a.merge(&b))?;
+        match &p.cached {
+            Some(c) => c.groups.merge_into(&mut ctx.groups, |a, b| a.merge(b))?,
+            None => p.groups.merge_into(&mut ctx.groups, |a, b| a.merge(&b))?,
+        }
     }
     if merge && !runs.is_empty() {
         // Row queries only (aggregates hold groups, not rows).
@@ -2751,7 +2848,9 @@ fn run(
         && first_key_is_event_time(plan);
     if ordered {
         scan_ordered(&mut ctx, snapshot, &to_scan, &needed, tenant, workers, pool)?;
-    } else if workers > 1 && (plan.aggregate || ctx.sorted()) {
+    } else if (workers > 1 && (plan.aggregate || ctx.sorted()))
+        || (plan.aggregate && opts.partial_cache.is_some() && !to_scan.is_empty())
+    {
         scan_parallel(&mut ctx, &to_scan, &needed, tenant, workers, pool, None)?;
     } else {
         if !to_scan.is_empty() {

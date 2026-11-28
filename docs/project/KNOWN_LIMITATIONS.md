@@ -87,6 +87,11 @@
   - **Q-error:** it is per query, not per operator.
   - **Wire protocol:** there is no native or columnar protocol.
 
+- Partial aggregate cache (ADR-0045):
+  - **Opt-in:** it is off by default.
+  - **Scope:** aggregates only; memtable windows are always rescanned.
+  - **Q-error:** for cached queries it reads high, because the estimate
+    counts the rows a hit did not scan.
 - Query responses (ADR-0044):
   - **Not streamed:** they are built whole. Peak memory holds the result
     rows and their JSON (06-002 is open), bounded by `max_result_rows`.
