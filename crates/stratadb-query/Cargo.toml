@@ -12,6 +12,7 @@ stratadb-schema.workspace = true
 stratadb-storage.workspace = true
 hashbrown.workspace = true
 ahash.workspace = true
+memchr.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

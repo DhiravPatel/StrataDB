@@ -1,0 +1,19 @@
+interactive_alone        req  600 p50   9.81 p99  36.64 max   60.8 lag 2.29 cpu 0.0 flags ['CLIENT_BOUND']
+vs_batch_unclassed_1     req  600 p50  14.91 p99  45.07 max   66.5 lag 16.28 cpu 0.0 flags ['CLIENT_BOUND'] | batch 98.7/s p50 64.0
+vs_batch_classed_1       req  600 p50  13.86 p99  18.21 max   21.8 lag 0.03 cpu 0.0 flags [] | batch 139.7/s p50 56.3
+vs_batch_classed_2       req  600 p50  14.53 p99  38.35 max   64.8 lag 7.2 cpu 0.0 flags ['CLIENT_BOUND'] | batch 128.9/s p50 60.5
+vs_batch_unclassed_2     req  600 p50  14.37 p99  33.34 max  140.1 lag 4.23 cpu 0.0 flags ['CLIENT_BOUND'] | batch 121.8/s p50 63.7
+vs_batch3_unclassed_1    req  600 p50  11.82 p99  18.32 max   29.8 lag 0.31 cpu 0.0 flags [] | batch 71.4/s p50 41.4
+vs_batch3_classed_1      req  600 p50  11.08 p99  21.59 max   52.7 lag 0.02 cpu 0.0 flags [] | batch 75.4/s p50 38.3
+vs_batch3_classed_2      req  600 p50  10.48 p99  16.77 max   46.7 lag 0.01 cpu 0.0 flags [] | batch 80.3/s p50 36.3
+vs_batch3_unclassed_2    req  600 p50  10.46 p99  19.64 max   42.4 lag 0.43 cpu 0.0 flags [] | batch 79.9/s p50 36.5
+
+interactive_alone        req  600 p50   5.52 p99   6.57 max   14.7 lag 0.01 cpu 0.0003640118990349355 flags []
+vs_batch_unclassed_1     req  600 p50  12.90 p99  17.04 max   25.4 lag 0.01 cpu 0.0 flags [] | batch 166.3/s p50 47.7
+vs_batch_classed_1       req  600 p50  14.24 p99  29.55 max   49.1 lag 3.75 cpu 0.0 flags ['CLIENT_BOUND'] | batch 139.5/s p50 55.9
+vs_batch_classed_2       req  600 p50  13.36 p99  30.13 max   61.7 lag 1.71 cpu 0.0 flags [] | batch 147.7/s p50 53.3
+vs_batch_unclassed_2     req  600 p50  14.09 p99  34.66 max   44.2 lag 5.17 cpu 0.0 flags ['CLIENT_BOUND'] | batch 132.4/s p50 57.2
+vs_batch3_unclassed_1    req  600 p50   9.03 p99  10.42 max   15.9 lag 0.01 cpu 0.0 flags [] | batch 91.8/s p50 32.2
+vs_batch3_classed_1      req  600 p50   8.48 p99  10.11 max   13.8 lag 0.0 cpu 0.0001690464312152746 flags [] | batch 95.3/s p50 31.7
+vs_batch3_classed_2      req  600 p50   8.98 p99   9.64 max    9.8 lag 0.0 cpu 0.00012938892923771025 flags [] | batch 92.5/s p50 32.5
+vs_batch3_unclassed_2    req  600 p50   9.08 p99   9.69 max   10.4 lag 0.0 cpu 0.00013591149387689796 flags [] | batch 92.4/s p50 32.6

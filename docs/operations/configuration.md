@@ -14,12 +14,21 @@
 | `[tls] cert`, `key` | `STRATADB_TLS_CERT`, `STRATADB_TLS_KEY` | none | PEM; both or neither |
 | `[limits] max_body_bytes` | flag only | 8 MiB | |
 | `[limits] max_decompressed_bytes` | — | 32 MiB | gzip bomb protection |
-| `[limits] max_concurrent_ingest` / `max_concurrent_queries` | — | 32 / 16 | excess → 429 |
+| `[limits] max_concurrent_ingest` / `max_concurrent_queries` | — | 32 / 16 | ingest: excess → 429. Queries: the global limit over all classes; beyond it queries wait in the `[workload]` queue |
+| `[workload] interactive_slots` / `normal_slots` / `batch_slots` | — | all / 3/4 / 1/4 of `max_concurrent_queries` | concurrent queries per class (spec VIII.11, ADR-0036); batch is adapted by the AIMD controller between `batch_slots_min` (1) and this value |
+| `[workload] queue_max` / `queue_timeout_ms` | — | 64 / 5000 | queries waiting for a slot (all classes); longest wait (also bounded by the query timeout). Beyond either → 429 `TOO_MANY_QUERIES` with `retry_after_ms` |
+| `[workload] interactive_ms` / `batch_ms` | — | 100 / 10000 | plan-time classification by estimated CPU ms; also the class time budgets (a query running past 2× its budget is demoted one class) |
+| `[workload] latency_target_ms` / `controller_interval_ms` | — | 250 / 1000 | AIMD: batch slots −1 per interval while interactive p95 > target and CPU > 90%, +1 when below target and CPU < 70% |
+| `[workload] aging_ms` / `memory_floor_bytes` | — | 500 / 1 MiB | fair-queue aging (+1 priority step per interval waited); free query-pool memory required to admit a query |
+| `[workload] tenant_classes` | — | none | `{ tenant = "batch" }`: operator-assigned class per tenant (a request can only lower its class, never raise it) |
+| `[limits] plan_cache_entries` / `plan_cache_bytes` | — | 10000 / 64 MiB | plan cache bounds (0 disables): repeated query texts skip parse and plan |
 | `[limits] scan_threads` | — | logical CPUs | threads of the shared scan worker pool (1–256), fixed at startup; queries scan on their own thread plus pool tasks, never on threads of their own |
 | `[storage] group_commit_max_delay_ms` | — | 2 | upper bound (0–100 ms) of the group-commit wait (durability `group_commit`) |
 | `[storage] group_commit_adaptive` | — | true | wait only when more writers are expected: no wait at low arrival rate; otherwise up to min(fsync latency, max delay), stopping when the group is complete (spec STRATA-SYS-07-004). `false` always waits the full delay |
 | `[storage] wal_format_version` | — | 3 | WAL format written: 3 (columnar, LZ4-compressed batch payloads; spec STRATA-SYS-07-002) or 2 (row payloads, readable by the previous release; use it for a rollback window, runbooks/upgrade.md) |
 | `[storage] io_max_inflight_per_device` | — | 128 | I/O calls (reads, writes, fsyncs) in flight per device (1–4096; spec STRATA-SYS-04-008). Callers wait for a permit beyond it |
+| `[storage] column_cache_bytes` | — | 0 (off) | decoded segment column cache (SLRU, scan resistant), charged to the cache memory region and capped at it; useful when the same queries repeat over the same segments |
+| `[storage] old_segments_lifetime_s` | — | 480 | seconds a replaced segment file is kept after its last reader (0–86400; spec `old_parts_lifetime`); disk is freed that much later after compaction or retention |
 | `[storage] max_open_files` | — | 50% of the soft `RLIMIT_NOFILE` | segment files kept open (LRU; at least 16); cold files are closed and reopened on demand. The server first raises the soft limit to the hard limit |
 | `[limits] net_threads` | — | logical CPUs | async network runtime threads (`sx-net-NN`) |
 | `[limits] blocking_threads` | — | rest of the budget, at most ingest + query permits | maximum `sx-blk-NN` threads running commits, queries and admin operations (started on demand); at least 2 |

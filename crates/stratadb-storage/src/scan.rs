@@ -10,6 +10,7 @@
 //! and shredded-column layout stay behind this interface.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use stratadb_common::{Error, Result, TenantId};
 use stratadb_schema::column::{ColumnData, ColumnId, RawValues, Scope, StrBuilder, StrColumn};
@@ -177,6 +178,8 @@ pub struct ColumnBatch {
     pub bytes_read: u64,
     /// Attribute scopes whose keys were all served from dedicated columns.
     pub dedicated_key_reads: u64,
+    /// Columns served from the decoded column cache (no read, no decode).
+    pub cached_columns: u64,
 }
 
 /// A source of rows for the executor. Trait objects are used at this
@@ -201,6 +204,12 @@ pub trait ScanSource: Send + Sync + std::fmt::Debug {
     /// reserve it before reading (STRATA-SYS-05-005). Computed from
     /// metadata only; no data is read.
     fn estimated_read_bytes(&self, req: &ColumnRequest<'_>) -> u64;
+    /// Exact row count per severity code, from metadata, when the source
+    /// records it (aggregates answered without reading, STRATA-SYS-09-006).
+    /// `None` when unknown.
+    fn severity_counts(&self) -> Option<Vec<(u8, u64)>> {
+        None
+    }
 }
 
 /// Per-row size of a decoded column slot (the vector element itself).
@@ -246,6 +255,14 @@ impl ScanSource for SegmentHandle {
 
     fn rows(&self) -> u64 {
         self.reader.footer().row_count
+    }
+
+    fn severity_counts(&self) -> Option<Vec<(u8, u64)>> {
+        let f = self.reader.footer();
+        let counts: Vec<(u8, u64)> = f.severity_counts.iter().map(|(k, v)| (*k, *v)).collect();
+        // Trust the map only when it accounts for every row (a writer that
+        // did not record it leaves it empty).
+        (counts.iter().map(|(_, n)| n).sum::<u64>() == f.row_count).then_some(counts)
     }
 
     fn event_time_range(&self) -> (i64, i64) {
@@ -330,7 +347,19 @@ impl ScanSource for SegmentHandle {
             {
                 continue;
             }
-            out.columns.insert(*id, self.reader.read_column(*id)?);
+            if let Some(c) = self
+                .column_cache()
+                .and_then(|cc| cc.get(self.entry.id, *id))
+            {
+                out.columns.insert(*id, c);
+                out.cached_columns += 1;
+                continue;
+            }
+            let col = self.reader.read_column(*id)?;
+            if let Some(cc) = self.column_cache() {
+                cc.put(self.entry.id, *id, &col);
+            }
+            out.columns.insert(*id, col);
             out.bytes_read += footer.column(*id).map_or(0, |c| c.len);
             // Full maps also read their shredded chunks.
             let scope = match id {
@@ -485,34 +514,37 @@ impl<'a> MemChunk<'a> {
     /// Column `id` of this window.
     fn column(&self, id: ColumnId) -> Result<ColumnData> {
         let c = self.chunk;
-        let ints = |f: &dyn Fn(usize) -> i64| ColumnData::Ints(self.ids().map(f).collect());
+        let ints =
+            |f: &dyn Fn(usize) -> i64| ColumnData::Ints(Arc::new(self.ids().map(f).collect()));
         Ok(match id {
             ColumnId::EventTime => ints(&|i| c.event_time(i)),
             ColumnId::IngestTime => ints(&|i| c.ingest_time(i)),
             ColumnId::SchemaVersion => ints(&|i| i64::from(c.schema_version(i))),
             ColumnId::Seq => ints(&|i| c.seq(i) as i64),
             ColumnId::Idx => ints(&|i| i64::from(c.idx(i))),
-            ColumnId::Severity => ColumnData::U8s(self.ids().map(|i| c.severity(i)).collect()),
+            ColumnId::Severity => {
+                ColumnData::U8s(Arc::new(self.ids().map(|i| c.severity(i)).collect()))
+            }
             ColumnId::Service => ColumnData::Strs(self.strs(Chunk::service)?),
             ColumnId::SeverityText => ColumnData::Strs(self.strs(Chunk::severity_text)?),
             ColumnId::TraceId => ColumnData::Strs(self.strs(Chunk::trace_id)?),
             ColumnId::SpanId => ColumnData::Strs(self.strs(Chunk::span_id)?),
             ColumnId::EventId => ColumnData::Strs(self.strs(Chunk::event_id)?),
-            ColumnId::Body => ColumnData::Values(
+            ColumnId::Body => ColumnData::Values(Arc::new(
                 self.ids()
                     .map(|i| c.body(i).cloned())
                     .collect::<Result<_>>()?,
-            ),
-            ColumnId::Attributes => ColumnData::Maps(
+            )),
+            ColumnId::Attributes => ColumnData::Maps(Arc::new(
                 self.ids()
                     .map(|i| c.attributes(i).cloned())
                     .collect::<Result<_>>()?,
-            ),
-            ColumnId::ResourceAttributes => ColumnData::Maps(
+            )),
+            ColumnId::ResourceAttributes => ColumnData::Maps(Arc::new(
                 self.ids()
                     .map(|i| c.resource_attributes(i).cloned())
                     .collect::<Result<_>>()?,
-            ),
+            )),
         })
     }
 

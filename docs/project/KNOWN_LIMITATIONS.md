@@ -32,6 +32,80 @@
   the engine into the failed state (restart required).
 - Format upgrades (`strata upgrade`) cannot be rolled back except by restoring a backup.
 
+- State machines (ADR-0035): the `connection` machine is exported but not
+  driven, since HTTP authenticates per request. Insert `FLUSHED`, merge
+  `PAUSED`/`CANCELLED`, WAL `RECYCLED` and table DDL states are never
+  entered. The spec tables have no `DEGRADED → DRAINING`, `UNKNOWN →
+  FAILED` (device) or `RECEIVED → REJECTED` (insert) edges. A degraded server
+  therefore stops from `DEGRADED`, and undecodable or quota-rejected inserts
+  are not tracked. Device health is for one device (the data directory),
+  judged from WAL fsync latency only.
+
+- Workload classes (ADR-0036):
+  - **What is scheduled:** fair scheduling covers scan-pool morsels, and
+    query threads that lend to or yield to higher classes. Sequential scans
+    and work outside the pool (merge, ingest) are not scheduled. There is no
+    background minimum share (SYS-11-002).
+  - **Admission inputs:** PSI-based overload refusal works only on Linux,
+    and admission does not budget estimated CPU.
+  - **Workload stats:** they are an HTTP endpoint and metrics, not a
+    `system.workload_stats` table.
+  - **Measured effect:** in the embedded mixed benchmark on a 10-core
+    laptop, classes give no measurable interactive-latency gain.
+
+- Aggregation (ADR-0037):
+  - **Metadata answers:** only global `count`/`min`/`max(event_time)` with
+    time or canonical-severity filters are answered from metadata.
+    `GROUP BY severity` is not, because of the first-seen output order.
+    Memtable windows have no severity counts.
+  - **Dense aggregation:** it needs dictionary or byte keys, so it covers
+    segments, not the memtable's plain strings.
+  - **Hash tables:** there are no two-level tables, no streaming
+    aggregation, and no probe-length statistics.
+
+- String kernels (ADR-0038):
+  - **Fast paths:** only literal patterns (`x`, `x%`, `%x`, `%x%`) have
+    them; patterns with `_` or inner `%` use the general matcher. ILIKE is
+    fast only for ASCII literals on ASCII text.
+  - **Filters:** they compile to a node tree, not bytecode.
+  - **Unverified:** the query-level gains, pending an A/B on AC power.
+
+- Snapshots (ADR-0039):
+  - **Deletion delay:** replaced segment files stay on disk for
+    `old_segments_lifetime` (8 min by default) after their last reader, so
+    disk is freed later than before.
+  - **Large tenants:** segment lists are per-tenant vectors, so very large
+    single tenants copy their list on publish while a snapshot holds it.
+  - **`system.snapshots`:** it is an HTTP endpoint and metrics, not a SQL
+    table.
+
+- P3 (ADR-0040):
+  - **Ordered scans:** they need `event_time` as the first ORDER BY key and
+    a LIMIT without pagination.
+  - **Plan cache:** it keys on exact text, so queries differing only in a
+    literal plan separately.
+  - **Q-error:** it is per query, not per operator.
+  - **Wire protocol:** there is no native or columnar protocol.
+
+- Query responses (ADR-0044):
+  - **Not streamed:** they are built whole. Peak memory holds the result
+    rows and their JSON (06-002 is open), bounded by `max_result_rows`.
+- Sorting (ADR-0043):
+  - **No external sort:** results are bounded by `max_result_rows`.
+  - **Granule skipping:** the top-k bound skips rows, not granules, for
+    keys other than `event_time`.
+  - **Group top-k:** it still uses comparison selection.
+  - **Small sorts:** normalized sorts of fewer than 4,096 rows that keep
+    half of them measured 0.87× on integer keys.
+- Column cache and StrataStudio (ADR-0041, ADR-0042):
+  - **Column cache:** it is off by default and needs `[storage]
+    column_cache_bytes`. Shredded keys and projected map reads are not
+    cached.
+  - **StrataStudio limitations:** see `docs/studio/STATUS.md`. Each
+    connection uses one token (one tenant), and sessions are held in
+    memory.
+  - **`/api/v1/schema`:** it lists keys from flushed segments only.
+
 ## Durability / testing gaps
 - Power loss is tested by **simulation** (simfs recorder: lost/torn/reordered
   un-synced sectors, lost un-synced directory operations), sampling 2–6 states

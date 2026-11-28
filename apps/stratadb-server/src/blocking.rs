@@ -192,7 +192,9 @@ mod tests {
             .into_iter()
             .filter(|t| t.role == Role::Blk && t.name.starts_with("sx-blk-"))
             .collect();
-        assert!(threads.len() >= 2);
+        // Threads start on demand, so this pool may have only one; other
+        // tests' pools come and go in the same process inventory.
+        assert!(!threads.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

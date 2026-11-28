@@ -1,0 +1,21 @@
+query (process CPU ms median, best of 3 runs) / wall ms
+q04_service_severity         cpu   3.880 ->   3.894 (1.00x)  wall  0.999 ->  1.001 (1.00x)
+q06_message_token_search     cpu  10.583 ->  10.585 (1.00x)  wall  2.700 ->  2.714 (0.99x)
+q07_attribute_equality       cpu   6.196 ->   6.043 (1.03x)  wall  1.583 ->  1.572 (1.01x)
+q08_high_cardinality_agg     cpu   3.906 ->   3.914 (1.00x)  wall  2.055 ->  2.071 (0.99x)
+q12_historical_wide_range    cpu   0.865 ->   0.883 (0.98x)  wall  0.232 ->  0.233 (0.99x)
+q01_trace_id_lookup          cpu   2.779 ->   2.780 (1.00x)  wall  2.779 ->  2.779 (1.00x)
+geomean cpu speedup 1.0
+loads: p50/p99 latency ms (median over 3 runs) and achieved rate
+  like_closed_8        p50     23.37 ->    23.10
+  like_closed_8        p99     42.50 ->    42.94
+  like_closed_8        rate   362.34 ->   369.21
+  groupby_closed_8     p50      1.65 ->     1.63
+  groupby_closed_8     p99      3.02 ->     3.08
+  groupby_closed_8     rate  4704.72 ->  4630.30
+  filter_open_300      p50      3.97 ->     4.00
+  filter_open_300      p99      8.03 ->     7.13
+  filter_open_300      rate   299.97 ->   299.97
+  trace_open_200       p50      6.12 ->     6.13
+  trace_open_200       p99     10.16 ->     7.18
+  trace_open_200       rate   199.94 ->   199.97

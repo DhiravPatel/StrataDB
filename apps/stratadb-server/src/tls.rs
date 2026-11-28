@@ -93,6 +93,7 @@ impl TlsListener {
                         continue;
                     }
                 };
+                crate::net::tune(&stream);
                 let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
                     drop(stream); // shed load: too many handshakes in progress
                     continue;

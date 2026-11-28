@@ -22,6 +22,7 @@ use stratadb_segment::StoredRow;
 
 use super::*;
 use crate::manifest::{ObsoleteSegment, RetentionPolicy};
+use stratadb_common::state::{MergeState, Tracker};
 
 /// Compaction policy.
 #[derive(Debug, Clone)]
@@ -155,6 +156,7 @@ impl Shared {
         keep: &dyn Fn(&Event) -> bool,
     ) -> Result<Rewritten> {
         self.check_healthy()?;
+        let mut life = Tracker::new(MergeState::Planned);
         let input_ids: BTreeSet<u64> = inputs.iter().map(|h| h.entry.id).collect();
         if inputs.iter().any(|h| &h.entry.tenant != tenant)
             || input_ids
@@ -168,127 +170,153 @@ impl Shared {
         // Every input row is held in memory during the rewrite: reserve it on
         // the background region first (spec VIII.5.2 merge_memory_limit).
         let _mem = match &self.opts.background_memory {
-            Some(t) => Some(stratadb_common::memory::Reservation::new(
+            Some(t) => match stratadb_common::memory::Reservation::new(
                 t,
                 rewrite_memory_estimate(inputs),
                 Duration::ZERO,
-            )?),
-            None => None,
-        };
-        let mut rows: Vec<StoredRow> = Vec::new();
-        let mut metas = Vec::new();
-        for h in inputs {
-            rows.extend(h.reader.read_rows()?);
-            if let Some(x) = h.reader.footer().extension(idempotency::EXT_IDEMPOTENCY) {
-                metas.extend(idempotency::decode_extension(&x.data)?);
-            }
-        }
-        let total = rows.len() as u64;
-        rows.retain(|r| keep(&r.event));
-        let rows_kept = rows.len() as u64;
-        let now_ms = time::now_unix_millis();
-        let window = i64::try_from(self.opts.idempotency_window.as_millis()).unwrap_or(i64::MAX);
-        metas.retain(|m| m.committed_ms >= now_ms.saturating_sub(window));
-        metas.sort_by_key(|m| m.commit_seq);
-
-        let mut next = man.clone();
-        next.version += 1;
-        let mut output = None;
-        if !rows.is_empty() {
-            let id = man.next_segment_id;
-            let path = segment_path(&self.dir, tenant, id);
-            let mut refs: Vec<RowRef<'_>> = rows
-                .iter()
-                .map(|r| RowRef {
-                    seq: r.seq,
-                    idx: r.idx,
-                    event: &r.event,
-                })
-                .collect();
-            let extensions = self.segment_extensions(&refs, &metas);
-            let created_ms = now_ms;
-            let ws = stratadb_segment::write_segment_io(
-                &*self.opts.io_engine(),
-                &path,
-                id,
-                tenant,
-                &mut refs,
-                created_ms,
-                extensions,
-                &self.segment_write_options(),
-                self.keys.as_deref(),
-            )?;
-            failpoint::hit("compaction::after_output_write")?;
-            let f = &ws.footer;
-            let entry = SegmentEntry {
-                id,
-                tenant: tenant.clone(),
-                segment_format_version: stratadb_segment::FORMAT_VERSION,
-                min_schema_version: f.min_schema_version,
-                max_schema_version: f.max_schema_version,
-                min_event_time: f.min_event_time,
-                max_event_time: f.max_event_time,
-                min_seq: f.min_seq,
-                max_seq: f.max_seq,
-                row_count: f.row_count,
-                file_bytes: ws.file_bytes,
-                footer_crc: ws.footer_crc,
-                created_ms,
-                state: SegmentState::Committed,
-                lineage: input_ids.iter().copied().collect(),
-            };
-            let handle = match open_segment(
-                &self.dir,
-                &entry,
-                true,
-                self.keys.as_deref(),
-                &self.opts.io_engine(),
             ) {
-                Ok(h) => h.tracked(self.opts.cache_memory.as_ref()),
+                Ok(r) => Some(r),
                 Err(e) => {
-                    let _ = fsutil::remove_if_exists(&path);
+                    life.to(MergeState::Skipped, "background memory is full");
                     return Err(e);
                 }
-            };
-            next.next_segment_id = id + 1;
-            next.segments.push(entry);
-            output = Some(Arc::new(handle));
+            },
+            None => None,
+        };
+        life.to(MergeState::Reserved, "memory reserved");
+        life.to(MergeState::Running, "rewriting");
+        let life = &mut life;
+        let out = (|| -> Result<Rewritten> {
+            let mut rows: Vec<StoredRow> = Vec::new();
+            let mut metas = Vec::new();
+            for h in inputs {
+                rows.extend(h.reader.read_rows()?);
+                if let Some(x) = h.reader.footer().extension(idempotency::EXT_IDEMPOTENCY) {
+                    metas.extend(idempotency::decode_extension(&x.data)?);
+                }
+            }
+            let total = rows.len() as u64;
+            rows.retain(|r| keep(&r.event));
+            let rows_kept = rows.len() as u64;
+            let now_ms = time::now_unix_millis();
+            let window =
+                i64::try_from(self.opts.idempotency_window.as_millis()).unwrap_or(i64::MAX);
+            metas.retain(|m| m.committed_ms >= now_ms.saturating_sub(window));
+            metas.sort_by_key(|m| m.commit_seq);
+
+            let mut next = man.clone();
+            next.version += 1;
+            let mut output = None;
+            if !rows.is_empty() {
+                let id = man.next_segment_id;
+                let path = segment_path(&self.dir, tenant, id);
+                let mut refs: Vec<RowRef<'_>> = rows
+                    .iter()
+                    .map(|r| RowRef {
+                        seq: r.seq,
+                        idx: r.idx,
+                        event: &r.event,
+                    })
+                    .collect();
+                let extensions = self.segment_extensions(&refs, &metas);
+                let created_ms = now_ms;
+                let ws = stratadb_segment::write_segment_io(
+                    &*self.opts.io_engine(),
+                    &path,
+                    id,
+                    tenant,
+                    &mut refs,
+                    created_ms,
+                    extensions,
+                    &self.segment_write_options(),
+                    self.keys.as_deref(),
+                )?;
+                failpoint::hit("compaction::after_output_write")?;
+                let f = &ws.footer;
+                let entry = SegmentEntry {
+                    id,
+                    tenant: tenant.clone(),
+                    segment_format_version: stratadb_segment::FORMAT_VERSION,
+                    min_schema_version: f.min_schema_version,
+                    max_schema_version: f.max_schema_version,
+                    min_event_time: f.min_event_time,
+                    max_event_time: f.max_event_time,
+                    min_seq: f.min_seq,
+                    max_seq: f.max_seq,
+                    row_count: f.row_count,
+                    file_bytes: ws.file_bytes,
+                    footer_crc: ws.footer_crc,
+                    created_ms,
+                    state: SegmentState::Committed,
+                    lineage: input_ids.iter().copied().collect(),
+                };
+                let handle = match open_segment(
+                    &self.dir,
+                    &entry,
+                    true,
+                    self.keys.as_deref(),
+                    &self.opts.io_engine(),
+                ) {
+                    Ok(h) => h.tracked(self.opts.cache_memory.as_ref(), self.column_cache.as_ref()),
+                    Err(e) => {
+                        let _ = fsutil::remove_if_exists(&path);
+                        return Err(e);
+                    }
+                };
+                next.next_segment_id = id + 1;
+                next.segments.push(entry);
+                output = Some(Arc::new(handle));
+            }
+            next.segments.retain(|s| !input_ids.contains(&s.id));
+            next.obsolete_segments
+                .extend(inputs.iter().map(|h| ObsoleteSegment {
+                    id: h.entry.id,
+                    tenant: tenant.clone(),
+                }));
+            life.to(MergeState::Written, "output durable");
+            if let Err(e) =
+                next.commit_with(&self.dir, self.keys.as_deref(), &*self.opts.io_engine())
+            {
+                let e = Error::indeterminate(format!("manifest commit failed during rewrite: {e}"));
+                self.fail(&e);
+                return Err(e);
+            }
+            *man = next;
+            life.to(MergeState::Committed, "manifest committed");
+            if let Err(e) = failpoint::hit("compaction::after_manifest_commit") {
+                let e = Error::indeterminate(e.to_string());
+                self.fail(&e);
+                return Err(e);
+            }
+            {
+                let mut st = self.state.lock();
+                let list = st.by_tenant.entry(tenant.clone()).or_default();
+                let l = Arc::make_mut(list);
+                l.retain(|s| !input_ids.contains(&s.entry.id));
+                l.extend(output.iter().cloned());
+                l.sort_by_key(|s| s.entry.id);
+                if l.is_empty() {
+                    st.by_tenant.remove(tenant);
+                }
+                let now = Instant::now();
+                st.obsolete
+                    .extend(inputs.iter().map(|h| (Arc::clone(h), now)));
+                self.publish(&st);
+            }
+            Ok(Rewritten {
+                output,
+                rows_kept,
+                rows_dropped: total - rows_kept,
+            })
+        })();
+        if let Err(e) = &out {
+            // After WRITTEN the outcome is the manifest's (the engine is
+            // failed on an indeterminate commit); only a running task fails.
+            if life.state() == MergeState::Running {
+                life.to(MergeState::Failed, &e.to_string());
+            }
         }
-        next.segments.retain(|s| !input_ids.contains(&s.id));
-        next.obsolete_segments
-            .extend(inputs.iter().map(|h| ObsoleteSegment {
-                id: h.entry.id,
-                tenant: tenant.clone(),
-            }));
-        if let Err(e) = next.commit_with(&self.dir, self.keys.as_deref(), &*self.opts.io_engine()) {
-            let e = Error::indeterminate(format!("manifest commit failed during rewrite: {e}"));
-            self.fail(&e);
-            return Err(e);
-        }
-        *man = next;
-        if let Err(e) = failpoint::hit("compaction::after_manifest_commit") {
-            let e = Error::indeterminate(e.to_string());
-            self.fail(&e);
-            return Err(e);
-        }
-        {
-            let mut st = self.state.lock();
-            let mut segs: Vec<Arc<SegmentHandle>> = st
-                .segments
-                .iter()
-                .filter(|s| !input_ids.contains(&s.entry.id))
-                .cloned()
-                .collect();
-            segs.extend(output.iter().cloned());
-            segs.sort_by_key(|s| s.entry.id);
-            st.segments = Arc::new(segs);
-            st.obsolete.extend(inputs.iter().cloned());
-        }
-        Ok(Rewritten {
-            output,
-            rows_kept,
-            rows_dropped: total - rows_kept,
-        })
+        out
     }
 
     /// Delete obsolete segment files that no snapshot references any more,
@@ -296,11 +324,14 @@ impl Shared {
     fn reclaim_obsolete(&self, man: &mut Manifest) -> Result<usize> {
         let deletable: Vec<Arc<SegmentHandle>> = {
             let mut st = self.state.lock();
+            // Unreferenced (only this list holds it) and old enough
+            // (STRATA-SYS-17-004).
+            let lifetime = self.opts.old_segments_lifetime;
             let (del, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut st.obsolete)
                 .into_iter()
-                .partition(|h| Arc::strong_count(h) == 1);
+                .partition(|(h, at)| Arc::strong_count(h) == 1 && at.elapsed() >= lifetime);
             st.obsolete = keep;
-            del
+            del.into_iter().map(|(h, _)| h).collect::<Vec<_>>()
         };
         if deletable.is_empty() {
             return Ok(0);
@@ -309,7 +340,14 @@ impl Shared {
         for h in &deletable {
             let path = segment_path(&self.dir, &h.entry.tenant, h.entry.id);
             if let Err(e) = fsutil::remove_if_exists(&path) {
-                self.state.lock().obsolete.extend(deletable.iter().cloned());
+                // Back on the list, eligible again at the next reclamation.
+                let due = Instant::now()
+                    .checked_sub(self.opts.old_segments_lifetime)
+                    .unwrap_or_else(Instant::now);
+                self.state
+                    .lock()
+                    .obsolete
+                    .extend(deletable.iter().map(|h| (Arc::clone(h), due)));
                 return Err(e);
             }
             failpoint::hit("compaction::after_delete_obsolete")?;
@@ -342,7 +380,7 @@ impl Shared {
         // Plan in a scope that ends before rewriting: any handle clone kept
         // alive here would look like a reader pin to `reclaim_obsolete`.
         let plan: Vec<(TenantId, Vec<Arc<SegmentHandle>>, u64)> = {
-            let segs = Arc::clone(&self.state.lock().segments);
+            let segs = self.state.lock().all_segments();
             let mut by_tenant: BTreeMap<TenantId, Vec<Arc<SegmentHandle>>> = BTreeMap::new();
             for s in segs
                 .iter()
@@ -380,6 +418,7 @@ impl Shared {
         for (tenant, group, bytes) in plan {
             // The output can be as large as the inputs until they are deleted.
             if let Err(e) = self.check_disk(bytes) {
+                Tracker::new(MergeState::Planned).to(MergeState::Skipped, "not enough disk space");
                 tracing::warn!(error = %e, "skipping compaction: not enough disk space");
                 continue;
             }
@@ -423,7 +462,7 @@ impl Shared {
             Vec<Arc<SegmentHandle>>,
         );
         let plan: Vec<Plan> = {
-            let segs = Arc::clone(&self.state.lock().segments);
+            let segs = self.state.lock().all_segments();
             let tenants: BTreeSet<TenantId> = segs.iter().map(|s| s.entry.tenant.clone()).collect();
             let mut plan = Vec::new();
             for tenant in tenants {
@@ -481,7 +520,7 @@ impl Shared {
             ..Default::default()
         };
         let old: Vec<Arc<SegmentHandle>> = {
-            let segs = Arc::clone(&self.state.lock().segments);
+            let segs = self.state.lock().all_segments();
             for s in segs.iter() {
                 *report
                     .versions_before
@@ -548,7 +587,7 @@ impl Shared {
     /// Opportunistic deletion of obsolete files (background loop).
     pub(super) fn indexes(&self, verify: bool) -> Result<Vec<SegmentIndexes>> {
         self.check_healthy()?;
-        let segs = Arc::clone(&self.state.lock().segments);
+        let segs = self.state.lock().all_segments();
         let mut out = Vec::with_capacity(segs.len());
         for h in segs.iter() {
             let bloom = h.bloom();
@@ -632,7 +671,7 @@ impl Shared {
         for id in targets {
             // The segment may have been compacted away since the check.
             let seg = {
-                let segs = Arc::clone(&self.state.lock().segments);
+                let segs = self.state.lock().all_segments();
                 segs.iter().find(|h| h.entry.id == id).cloned()
             };
             let Some(seg) = seg else { continue };

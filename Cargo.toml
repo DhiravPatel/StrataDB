@@ -13,6 +13,7 @@ members = [
     "apps/stratadb-cli",
     "apps/stratadb-bench",
     "apps/stratadb-server",
+    "apps/stratadb-studio",
     "sdk/rust",
 ]
 
@@ -55,6 +56,12 @@ hashbrown = { version = "0.17", default-features = false }
 # Randomly seeded fast hasher for aggregation groups (already in the lockfile via parquet).
 ahash = { version = "0.8", default-features = false, features = ["std", "runtime-rng"] }
 zeroize = "1"
+# Lock-free publication of the engine's read view (snapshot catalog,
+# STRATA-SYS-17-001; no dependencies; ADR-0039).
+arc-swap = { version = "1.7", default-features = false }
+# SIMD substring search for LIKE (already in the lockfile via aho-corasick/regex;
+# no dependencies; ADR-0038).
+memchr = { version = "2.8", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

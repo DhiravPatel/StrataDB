@@ -58,11 +58,14 @@ fn ops(
     sample: Arc<Vec<stratadb_schema::Event>>,
 ) -> Vec<Op> {
     let columnar = Arc::new(stratadb_schema::columnar::encode_batch(&sample).unwrap_or_default());
+    // Operator kernels are measured on rows they actually read: metadata
+    // answers (count_from_metadata below) are measured separately.
     let q = |sql: &'static str| {
         let (engine, tenant) = (Arc::clone(&engine), tenant.clone());
         Box::new(move || {
             let opts = QueryOptions {
                 parallelism: 1,
+                enable_metadata_aggregates: false,
                 ..QueryOptions::default()
             };
             let snap = engine.snapshot(&tenant);
@@ -163,10 +166,38 @@ fn ops(
             run: q("SELECT count(*) FROM logs WHERE severity = 'ERROR'"),
         },
         Op {
+            name: "count_from_metadata",
+            unit: "cpu_ns_per_row_answered",
+            description: "SELECT count(*) WHERE severity = 'ERROR' answered from segment metadata (1 thread)",
+            run: {
+                let (engine, tenant) = (Arc::clone(&engine), tenant.clone());
+                Box::new(move || {
+                    let opts = QueryOptions {
+                        parallelism: 1,
+                        ..QueryOptions::default()
+                    };
+                    let snap = engine.snapshot(&tenant);
+                    let t = CpuTimer::start();
+                    let out = execute(&snap, "SELECT count(*) FROM logs WHERE severity = 'ERROR'", &opts)?;
+                    let s = t.stop();
+                    // Per row of the segments answered (all rows when flushed).
+                    let rows: u64 = snap.segments().iter().map(|h| h.entry.row_count).sum();
+                    let _ = out;
+                    Ok((s.process_cpu.as_secs_f64() * 1e9, rows.max(1) as f64))
+                })
+            },
+        },
+        Op {
             name: "like_substring_count",
             unit: "cpu_ns_per_row_scanned",
             description: "SELECT count(*) WHERE body LIKE '%TIMEOUT%' (1 thread)",
             run: q("SELECT count(*) FROM logs WHERE body LIKE '%TIMEOUT%'"),
+        },
+        Op {
+            name: "ilike_substring_count",
+            unit: "cpu_ns_per_row_scanned",
+            description: "SELECT count(*) WHERE body ILIKE '%timeout%' (1 thread)",
+            run: q("SELECT count(*) FROM logs WHERE body ILIKE '%timeout%'"),
         },
         Op {
             name: "group_by_high_cardinality",
@@ -185,6 +216,12 @@ fn ops(
             unit: "cpu_ns_per_row_scanned",
             description: "ORDER BY event_time DESC LIMIT 10 (1 thread)",
             run: q("SELECT event_time, service FROM logs ORDER BY event_time DESC LIMIT 10"),
+        },
+        Op {
+            name: "top_k_order_by_string",
+            unit: "cpu_ns_per_row_scanned",
+            description: "ORDER BY service, body LIMIT 10: normalized keys + shared top-k bound (1 thread)",
+            run: q("SELECT event_time, service FROM logs ORDER BY service, body LIMIT 10"),
         },
     ]
 }
@@ -430,8 +467,9 @@ mod tests {
     fn measures_every_operator() {
         let got = measure(5).unwrap();
         let names: Vec<&str> = got.iter().map(|x| x.name).collect();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 13);
         for op in [
+            "count_from_metadata",
             "group_by_high_cardinality",
             "event_batch_encode",
             "columnar_batch_encode",

@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 60c1bff53e9fba3eeff113fa60359ce1015b759134c225dbcdd727a0ce11ac98 # shrinks to rows = [[Some(Float(-0.0)), Some(Null)], [Some(Float(0.0)), None]], desc = [false, true], keep = None
+cc 32bc7e618050b22b731d436c12c368e4f8cf6e6f0907dc85798ccf2e49aaa2a5 # shrinks to rows = [[Some(UInt(18446744073709551615)), Some(Timestamp(0))], [Some(UInt(18446744073709551614)), Some(Bool(false))]], desc = [false, true], keep = None
+cc 134eb0d5b40236ce45ae2711f3765e3ebd0a615f052858a739e51363a2bc29c7 # shrinks to a = Some(Float(-2.5679412559322313e-285)), b = Some(Int(9007199254740992)), desc = false
+cc 69edd8b26b741d652eeae70a548785bb85809dda2fe2369e528dc8139405fa54 # shrinks to a = Some(UInt(18446744073709551613)), b = Some(UInt(18446744073709551615)), desc = false
+cc 618a55ef70c9e25342dab63b6bf222988fb13efd89a7248d73e1f1b38c84d466 # shrinks to a = Some(Float(NaN)), b = Some(Int(0)), desc = false
+cc 4ff96dec4d9d00dfde878a0d22dc8df0de03ad94994ebc00a644654152f253a2 # shrinks to rows = [[Some(Float(NaN)), None], [Some(Int(0)), None]], desc = [false, false], keep = None

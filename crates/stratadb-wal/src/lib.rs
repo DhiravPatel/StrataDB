@@ -32,6 +32,7 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
 use stratadb_common::checksum::crc32c;
 use stratadb_common::io::{read_file, write_all_at, IoEngine, WriteFile};
+use stratadb_common::state::{Tracker, WalSegmentState};
 use stratadb_common::{failpoint, fsutil, time, Error, IoResultExt, Result};
 
 pub use format::RecordType;
@@ -191,6 +192,10 @@ struct Inner {
     frame_key: Option<stratadb_crypto::FrameKey>,
     /// Closed (non-active) segments, oldest first: (base_seq, path).
     closed: Vec<(u64, PathBuf)>,
+    /// Lifecycle of the active segment and of each closed one (parallel to
+    /// `closed`; spec IX.22.3).
+    active_life: Tracker<WalSegmentState>,
+    closed_life: Vec<Tracker<WalSegmentState>>,
     next_seq: u64,
     written_seq: u64,
     durable_seq: u64,
@@ -234,6 +239,17 @@ pub struct Wal {
     /// From a group's durability being published to a covered writer
     /// returning (the wake-up cost, STRATA-SYS-07-006).
     commit_wake_seconds: stratadb_common::metrics::Histogram,
+}
+
+/// One appended record and where its time went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Appended {
+    pub seq: u64,
+    /// Frame encode, checksum (and seal) and write, including the wait for
+    /// the WAL lock.
+    pub write: Duration,
+    /// From written to durable (zero under `async`).
+    pub durable_wait: Duration,
 }
 
 /// WAL latency/size distributions.
@@ -530,6 +546,7 @@ impl Wal {
 
         let next_seq = last_seq + 1;
         let mut frame_key_new = None;
+        let mut active_life = Tracker::new(WalSegmentState::Active);
         let (file, path, base_seq, len, closed, header_len) = match segs.last() {
             // Reuse the last segment only if appending `next_seq` keeps it
             // contiguous and it has the current format (frames of one segment
@@ -553,6 +570,7 @@ impl Wal {
                 // No WAL yet, the WAL ends before the manifest (e.g. Async
                 // tail lost on power failure after a flush), or encryption:
                 // start a new segment so sequence numbers never repeat in it.
+                let mut life = Tracker::new(WalSegmentState::Preallocated);
                 let n = create_segment(
                     &*io,
                     dir,
@@ -560,6 +578,8 @@ impl Wal {
                     opts.keys.as_deref(),
                     opts.format_version,
                 )?;
+                life.to(WalSegmentState::Active, "segment created");
+                active_life = life;
                 frame_key_new = n.frame_key;
                 (
                     n.file,
@@ -583,7 +603,12 @@ impl Wal {
                 len,
                 header_len,
                 frame_key: frame_key_new,
+                closed_life: closed
+                    .iter()
+                    .map(|_| Tracker::new(WalSegmentState::Sealed))
+                    .collect(),
                 closed,
+                active_life,
                 next_seq,
                 written_seq: last_seq,
                 durable_seq: last_seq,
@@ -639,6 +664,9 @@ impl Wal {
     fn poison(g: &mut Inner, why: String) {
         tracing::error!(reason = %why, "WAL poisoned");
         if g.poisoned.is_none() {
+            if g.active_life.state() == WalSegmentState::Active {
+                g.active_life.to(WalSegmentState::Failed, &why);
+            }
             g.poisoned = Some(why);
         }
     }
@@ -652,6 +680,11 @@ impl Wal {
     /// * `Indeterminate` — a write or sync failed after the frame may have
     ///   reached the file; the record may or may not survive recovery.
     pub fn append(&self, record_type: RecordType, payload: &[u8]) -> Result<u64> {
+        self.append_timed(record_type, payload).map(|a| a.seq)
+    }
+
+    /// [`Wal::append`], also returning where the time went.
+    pub fn append_timed(&self, record_type: RecordType, payload: &[u8]) -> Result<Appended> {
         let started = Instant::now();
         if record_type.min_version() > self.opts.format_version {
             return Err(Error::invalid_input(format!(
@@ -751,14 +784,24 @@ impl Wal {
             Self::poison(&mut g, e.to_string());
             return Err(Error::indeterminate(e.to_string()));
         }
-        self.append_seconds.observe_duration(started.elapsed());
+        let write = started.elapsed();
+        self.append_seconds.observe_duration(write);
         match self.opts.durability {
-            Durability::Async => Ok(seq),
+            Durability::Async => Ok(Appended {
+                seq,
+                write,
+                durable_wait: Duration::ZERO,
+            }),
             Durability::Sync | Durability::GroupCommit { .. } => {
                 let waiting = Instant::now();
-                let r = self.wait_durable(g, seq).map(|()| seq);
-                self.commit_wait_seconds.observe_duration(waiting.elapsed());
-                r
+                let r = self.wait_durable(g, seq);
+                let durable_wait = waiting.elapsed();
+                self.commit_wait_seconds.observe_duration(durable_wait);
+                r.map(|()| Appended {
+                    seq,
+                    write,
+                    durable_wait,
+                })
             }
         }
     }
@@ -889,6 +932,7 @@ impl Wal {
         g.durable_seq = g.durable_seq.max(g.written_seq);
         self.publish();
         let base = g.next_seq;
+        let mut life = Tracker::new(WalSegmentState::Preallocated);
         let n = create_segment(
             &*self.io,
             &self.dir,
@@ -899,6 +943,10 @@ impl Wal {
         .inspect_err(|e| {
             Self::poison(g, format!("segment rotation failed: {e}"));
         })?;
+        life.to(WalSegmentState::Active, "rotation");
+        let mut old_life = std::mem::replace(&mut g.active_life, life);
+        old_life.to(WalSegmentState::Sealed, "segment full");
+        g.closed_life.push(old_life);
         let old_base = g.base_seq;
         let old_path = std::mem::replace(&mut g.path, n.path);
         g.closed.push((old_base, old_path));
@@ -929,7 +977,7 @@ impl Wal {
     /// first so a crash mid-way never leaves a gap. The active segment is
     /// never removed.
     pub fn reclaim_through(&self, flushed_through: u64) -> Result<usize> {
-        let victims: Vec<PathBuf> = {
+        let (victims, mut lives): (Vec<PathBuf>, Vec<Tracker<WalSegmentState>>) = {
             let mut g = self.inner.lock();
             Self::check_poisoned(&g)?;
             let mut count = 0;
@@ -941,10 +989,21 @@ impl Wal {
                     break;
                 }
             }
-            g.closed.drain(..count).map(|(_, p)| p).collect()
+            let count_lives = count.min(g.closed_life.len());
+            let mut lives: Vec<_> = g.closed_life.drain(..count_lives).collect();
+            for l in &mut lives {
+                l.to(
+                    WalSegmentState::Checkpointed,
+                    "records in committed segments",
+                );
+            }
+            (g.closed.drain(..count).map(|(_, p)| p).collect(), lives)
         };
-        for p in &victims {
+        for (i, p) in victims.iter().enumerate() {
             fsutil::remove_if_exists(p)?;
+            if let Some(l) = lives.get_mut(i) {
+                l.to(WalSegmentState::Deleted, "recycling disabled");
+            }
             failpoint::hit("wal::reclaim::after_delete")?;
         }
         if !victims.is_empty() {

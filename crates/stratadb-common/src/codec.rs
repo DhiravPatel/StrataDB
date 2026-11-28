@@ -244,6 +244,33 @@ impl<'a> Decoder<'a> {
 
 #[cfg(test)]
 mod tests {
+
+    /// UTF-8 validation throughput (spec STRATA-SYS-08-016: >= 10 GB/s/core
+    /// on ASCII-heavy input). Run with `cargo test --release -p
+    /// stratadb-common codec::tests::utf8_validation_throughput -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore = "timing measurement"]
+    fn utf8_validation_throughput() {
+        let line = r#"{"service":"checkout","severity":"INFO","body":"request 12345 served in 17 ms","attributes":{"region":"eu-west-1"}}"#;
+        let ascii: Vec<u8> = line.repeat((1 << 20) / line.len()).into_bytes();
+        // ~2% multi-byte characters (names, symbols in log text).
+        let mixed: Vec<u8> = line
+            .replace("served", "servéd → ok")
+            .repeat((1 << 20) / line.len())
+            .into_bytes();
+        for (name, buf) in [("ASCII JSON", &ascii), ("mixed (~2% multi-byte)", &mixed)] {
+            let reps = 2000;
+            let t = std::time::Instant::now();
+            let mut ok = 0usize;
+            for _ in 0..reps {
+                ok += usize::from(std::str::from_utf8(std::hint::black_box(buf)).is_ok());
+            }
+            let gbs = (buf.len() * reps) as f64 / t.elapsed().as_secs_f64() / 1e9;
+            assert_eq!(ok, reps);
+            println!("std::str::from_utf8 {name:24} {gbs:6.2} GB/s");
+        }
+    }
     use super::*;
     use proptest::prelude::*;
 

@@ -87,6 +87,8 @@ pub struct Entry<'a> {
     /// during execution).
     pub stats: Option<&'a QueryStats>,
     pub result_rows: u64,
+    /// Plan-time estimate: (rows to scan, single-core CPU ms), when made.
+    pub estimate: Option<(u64, f64)>,
 }
 
 fn us(d: Duration) -> Value {
@@ -134,6 +136,17 @@ impl Entry<'_> {
             a.insert("memory_peak".into(), int(s.peak_memory_bytes as u64));
             a.insert("memory_reserved_peak".into(), int(s.memory_reserved_peak));
             a.insert("scan_workers".into(), int(s.scan_workers as u64));
+            if let Some((rows, _)) = self.estimate {
+                // Estimated vs actual rows (STRATA-SYS-12-004).
+                a.insert(
+                    "q_error".into(),
+                    Value::Float(crate::telemetry::q_error(rows, s.rows_scanned)),
+                );
+            }
+        }
+        if let Some((rows, ms)) = self.estimate {
+            a.insert("est_rows".into(), int(rows));
+            a.insert("est_cpu_ms".into(), Value::Float(ms));
         }
         e.attributes = a;
         e
@@ -339,6 +352,7 @@ mod tests {
             serialize: Duration::from_micros(5),
             stats: None,
             result_rows: 2,
+            estimate: Some((10, 0.5)),
         }
     }
 
@@ -445,6 +459,7 @@ mod cost {
                 serialize: Duration::ZERO,
                 stats: Some(&stats),
                 result_rows: 1,
+                estimate: None,
             });
         }
         let rec_ns = t0.elapsed().as_nanos() / u128::from(n);

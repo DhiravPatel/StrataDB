@@ -58,7 +58,11 @@ the Unix epoch.
 ## Ordering and limits
 `ORDER BY` uses a total order: by type (bool < number < timestamp < string <
 bytes < list < map < null), then value; **null and missing sort last in ASC
-and first in DESC**. Sorting is stable. Without `ORDER BY`, row order is
+and first in DESC**.
+- **Numbers:** they compare exactly, so an integer and a float compare as
+  the numbers they denote, without rounding the integer to a float.
+  `-0.0` equals `0`, and NaN sorts after every other number.
+- **Stability:** sorting is stable. Without `ORDER BY`, row order is
 unspecified (currently source order) and `LIMIT` may stop scanning early.
 
 ## Pagination

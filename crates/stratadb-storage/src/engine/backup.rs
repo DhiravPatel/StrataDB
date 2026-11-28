@@ -225,6 +225,16 @@ impl BackupManifest {
     }
 }
 
+/// A backup's manifest (envelope checksum only; no file verification). For
+/// listings; use [`verify_backup`] before trusting the data.
+pub fn read_backup_manifest(dir: &Path) -> Result<BackupManifest> {
+    let raw = stratadb_common::io::read_file(
+        &*stratadb_common::io::default_io(),
+        &dir.join(BACKUP_FILE),
+    )?;
+    BackupManifest::decode(&raw)
+}
+
 /// Verify a backup without modifying it: envelope checksum, every file's
 /// size and SHA-256, the data manifest, and full verification of every segment.
 /// An encrypted backup needs the KEK that wrapped its KEYRING.
@@ -355,7 +365,7 @@ impl Shared {
         // Capture the manifest and pin its segments atomically w.r.t. maintenance.
         let (man, pinned): (Manifest, Vec<Arc<SegmentHandle>>) = {
             let man = self.manifest.lock();
-            let segs = Arc::clone(&self.state.lock().segments);
+            let segs = self.state.lock().all_segments();
             (man.clone(), segs.iter().cloned().collect())
         };
         let tmp = fsutil::tmp_path(dest);

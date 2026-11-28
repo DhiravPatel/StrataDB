@@ -73,6 +73,11 @@ impl Histogram {
         Self::with_scale(bounds, 1e6)
     }
 
+    /// A histogram of plain values (not durations) with these bounds.
+    pub fn with_bounds(bounds: &'static [f64]) -> Self {
+        Self::with_scale(bounds, 1e3)
+    }
+
     fn with_scale(bounds: &'static [f64], scale: f64) -> Self {
         Self {
             bounds,

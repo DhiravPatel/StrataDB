@@ -6,11 +6,16 @@
 //! than unbounded queueing. All engine threads follow a budgeted plan
 //! ([`ThreadPlan`]) and are listed at `GET /api/v1/admin/threads`.
 
+pub mod admission;
 pub mod audit;
 pub mod auth;
 pub mod blocking;
 pub mod config;
+pub mod json_out;
+pub mod lifecycle;
 pub mod memory;
+pub mod net;
+pub mod plan_cache;
 pub mod query_log;
 pub mod telemetry;
 pub mod tls;
@@ -27,12 +32,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
-use serde_json::{json, Map, Value as J};
+use serde_json::{json, Value as J};
 use stratadb_common::TenantId;
 use stratadb_common::{time, Error, ErrorKind};
-use stratadb_query::{execute, execute_page, Catalog, Datum, PageRequest, QueryOptions, Table};
+use stratadb_query::{
+    execute_page_prepared, execute_prepared, Catalog, PageRequest, QueryOptions, Table,
+};
 use stratadb_schema::json::event_from_json;
-use stratadb_schema::{Limits, Value};
+use stratadb_schema::Limits;
 use stratadb_storage::RetentionPolicy;
 use stratadb_storage::{Engine, IdempotencyKey};
 use tokio::sync::Semaphore;
@@ -63,6 +70,11 @@ pub struct ServerConfig {
     /// Threads of the `sx-blk` pool that runs blocking request work
     /// (commits, queries, admin operations); counted in the thread budget.
     pub blocking_threads: usize,
+    /// Query classes, slots, queueing and the AIMD controller (spec VIII.11).
+    pub workload: admission::WorkloadSettings,
+    /// Plan cache bounds (0 disables it; spec VIII.16).
+    pub plan_cache_entries: usize,
+    pub plan_cache_bytes: usize,
 }
 
 /// Limits for one tenant; `None` = unlimited.
@@ -115,6 +127,9 @@ impl Default for ServerConfig {
             token_reload_interval: Duration::from_secs(2),
             quotas: Quotas::default(),
             blocking_threads: ThreadPlan::default_for(32, 16).blocking,
+            workload: admission::WorkloadSettings::default(),
+            plan_cache_entries: 10_000,
+            plan_cache_bytes: 64 << 20,
         }
     }
 }
@@ -133,7 +148,10 @@ pub struct AppState {
     quota_rejections: Arc<std::sync::atomic::AtomicU64>,
     cfg: Arc<ServerConfig>,
     ingest_sem: Arc<Semaphore>,
-    query_sem: Arc<Semaphore>,
+    /// Query admission: classes, slots and the fair queue (spec VIII.11).
+    admission: Arc<admission::Admission>,
+    /// Parsed and planned queries by text (spec VIII.16).
+    plan_cache: Arc<plan_cache::PlanCache>,
     running: Arc<std::sync::Mutex<std::collections::HashMap<String, Running>>>,
     auth_limiter: Arc<std::sync::Mutex<AuthLimiter>>,
     audit: Option<Arc<audit::AuditLog>>,
@@ -143,6 +161,8 @@ pub struct AppState {
     query_log: Option<Arc<query_log::QueryLog>>,
     /// Memory accounting tree (None: queries are accounted on their own).
     memory: Option<Arc<memory::ServerMemory>>,
+    /// Server/table/device lifecycles (None: not tracked, e.g. in tests).
+    lifecycle: Option<Arc<lifecycle::Lifecycle>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -260,7 +280,15 @@ impl AppState {
             buckets: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             quota_rejections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ingest_sem: Arc::new(Semaphore::new(cfg.max_concurrent_ingest)),
-            query_sem: Arc::new(Semaphore::new(cfg.max_concurrent_queries)),
+            admission: admission::Admission::new(
+                cfg.max_concurrent_queries,
+                cfg.workload.clone(),
+                None,
+            ),
+            plan_cache: Arc::new(plan_cache::PlanCache::new(
+                cfg.plan_cache_entries,
+                cfg.plan_cache_bytes,
+            )),
             running: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             auth_limiter: Arc::new(std::sync::Mutex::new(AuthLimiter {
                 window: Instant::now(),
@@ -276,13 +304,32 @@ impl AppState {
             metrics: Arc::default(),
             query_log: None,
             memory: None,
+            lifecycle: None,
         }
     }
 
-    /// Account queries in the server's memory tree (tenant and pool limits).
+    /// Report the server lifecycle in `/api/v1/ready`.
+    pub fn with_lifecycle(mut self, l: Arc<lifecycle::Lifecycle>) -> Self {
+        self.lifecycle = Some(l);
+        self
+    }
+
+    /// Account queries in the server's memory tree (tenant and pool limits);
+    /// admission then also requires headroom in the query pool.
     pub fn with_memory(mut self, m: Arc<memory::ServerMemory>) -> Self {
+        self.admission = admission::Admission::new(
+            self.cfg.max_concurrent_queries,
+            self.cfg.workload.clone(),
+            Some(Arc::clone(&m.query)),
+        );
         self.memory = Some(m);
         self
+    }
+
+    /// The query admission controller (its `tick` drives the AIMD
+    /// controller; the server calls it every `controller_interval`).
+    pub fn admission(&self) -> Arc<admission::Admission> {
+        Arc::clone(&self.admission)
     }
 
     /// Record every query in `system.query_log`.
@@ -297,6 +344,9 @@ struct TenantCatalog {
     tenant: TenantId,
     engine: Arc<Engine>,
     query_log: Option<Arc<query_log::QueryLog>>,
+    /// Shown as the holder of the snapshots this query takes
+    /// (`GET /api/v1/admin/snapshots`, STRATA-SYS-17-005).
+    holder: Option<String>,
 }
 
 impl Catalog for TenantCatalog {
@@ -309,10 +359,16 @@ impl Catalog for TenantCatalog {
         table: Table,
     ) -> stratadb_common::Result<std::borrow::Cow<'_, stratadb_storage::Snapshot>> {
         use std::borrow::Cow;
+        let held = |s: stratadb_storage::Snapshot| {
+            if let Some(h) = &self.holder {
+                s.set_holder(h.clone());
+            }
+            Cow::Owned(s)
+        };
         match table {
-            Table::Logs => Ok(Cow::Owned(self.engine.snapshot(&self.tenant))),
+            Table::Logs => Ok(held(self.engine.snapshot(&self.tenant))),
             Table::QueryLog => match &self.query_log {
-                Some(q) => Ok(Cow::Owned(q.engine().snapshot(&self.tenant))),
+                Some(q) => Ok(held(q.engine().snapshot(&self.tenant))),
                 None => Err(Error::unsupported(
                     "system.query_log is disabled ([observability] query_log = false)",
                 )),
@@ -403,9 +459,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/query/{id}", get(get_query).delete(cancel_query))
         .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/admin/compaction", post(admin_compaction))
-        .route("/api/v1/admin/backup", post(admin_backup))
+        .route("/api/v1/admin/backup", post(admin_backup).get(list_backups))
         .route("/api/v1/admin/threads", get(admin_threads))
         .route("/api/v1/admin/memory", get(admin_memory))
+        .route("/api/v1/admin/workload", get(admin_workload))
+        .route("/api/v1/admin/snapshots", get(admin_snapshots))
+        .route("/api/v1/admin/caches", get(admin_caches))
+        .route("/api/v1/whoami", get(whoami))
+        .route("/api/v1/schema", get(schema))
+        .route("/api/v1/queries", get(list_queries))
         .route(
             "/api/v1/retention",
             get(get_retention)
@@ -461,12 +523,65 @@ fn error_response(e: &Error) -> Response {
     }
 }
 
+/// Response for a refused admission (spec STRATA-SYS-11-004):
+/// `TOO_MANY_QUERIES` → 429, `SERVER_OVERLOADED` → 503, both with
+/// `retry_after_ms` and `Retry-After`; a query cancelled while queued
+/// fails as `cancelled`.
+fn refusal_response(r: &admission::Refusal) -> Response {
+    let (status, kind, retry, detail) = match r {
+        admission::Refusal::TooManyQueries {
+            retry_after,
+            detail,
+        } => (
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorKind::ResourceExhausted,
+            *retry_after,
+            detail.as_str(),
+        ),
+        admission::Refusal::Overloaded {
+            retry_after,
+            detail,
+        } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorKind::Unavailable,
+            *retry_after,
+            detail.as_str(),
+        ),
+        admission::Refusal::Cancelled => {
+            return error_response(&Error::new(
+                ErrorKind::Cancelled,
+                "query cancelled while queued",
+            ));
+        }
+    };
+    let ms = retry.as_millis() as u64;
+    let body = Json(json!({
+        "error": kind.as_str(),
+        "code": r.code(),
+        "message": detail,
+        "retryable": true,
+        "retry_after_ms": ms,
+    }));
+    let secs = ms.div_ceil(1000).max(1).to_string();
+    (status, [(header::RETRY_AFTER, secs)], body).into_response()
+}
+
 // Returning the ready-made error response keeps handlers simple; built at most once per request.
 #[allow(clippy::result_large_err)]
 fn authenticate(
     st: &AppState,
     headers: &HeaderMap,
     perm: Permission,
+) -> Result<Principal, Response> {
+    authenticate_with(st, headers, Some(perm))
+}
+
+/// Authenticate, requiring `perm` when given (`None`: any valid token).
+#[allow(clippy::result_large_err)]
+fn authenticate_with(
+    st: &AppState,
+    headers: &HeaderMap,
+    perm: Option<Permission>,
 ) -> Result<Principal, Response> {
     let presented = headers
         .get(header::AUTHORIZATION)
@@ -486,21 +601,25 @@ fn authenticate(
             "missing bearer token",
         )),
     };
+    let perm_name = perm.map_or("any", |p| p.as_str());
     match result {
-        Ok(p) => p.require(perm).map(|()| p.clone()).map_err(|e| {
-            st.audit(
-                "permission_denied",
-                Some(&p),
-                json!({"permission": perm.as_str()}),
-            );
-            error_response(&e)
-        }),
+        Ok(p) => match perm {
+            None => Ok(p.clone()),
+            Some(perm) => p.require(perm).map(|()| p.clone()).map_err(|e| {
+                st.audit(
+                    "permission_denied",
+                    Some(&p),
+                    json!({"permission": perm.as_str()}),
+                );
+                error_response(&e)
+            }),
+        },
         Err(e) => {
             // Never record the presented credential.
             st.audit(
                 "auth_failure",
                 None,
-                json!({"permission": perm.as_str(), "reason": e.kind().as_str()}),
+                json!({"permission": perm_name, "reason": e.kind().as_str()}),
             );
             let limited = {
                 let mut l = st.auth_limiter.lock().unwrap_or_else(|p| p.into_inner());
@@ -627,13 +746,29 @@ async fn health() -> Json<J> {
 }
 
 async fn ready(State(st): State<AppState>) -> Response {
-    match st.engine.failure() {
-        None => Json(json!({"status": "ready"})).into_response(),
-        Some(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"status": "failed"})),
-        )
-            .into_response(),
+    use stratadb_common::state::{ServerState as S, State as _};
+    let server = st.lifecycle.as_ref().map(|l| l.server());
+    let mut body = match st.engine.failure() {
+        None => json!({"status": "ready"}),
+        Some(_) => json!({"status": "failed"}),
+    };
+    if let Some(s) = server {
+        body["state"] = json!(s.name());
+    }
+    // A draining server takes no new work (spec IX.22.7); a degraded one
+    // still serves reads, so it stays ready unless the engine has failed.
+    let up = st.engine.failure().is_none()
+        && !matches!(
+            server,
+            Some(S::Starting | S::Recovering | S::Warming | S::Draining | S::Stopped)
+        );
+    if up {
+        Json(body).into_response()
+    } else {
+        if st.engine.failure().is_none() {
+            body["status"] = json!("unavailable");
+        }
+        (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
     }
 }
 
@@ -705,32 +840,72 @@ fn idempotency_key(headers: &HeaderMap, body: &[u8]) -> Result<Option<Idempotenc
 struct Committed {
     receipt: stratadb_storage::WriteReceipt,
     accepted: usize,
+    /// In `VISIBLE`; the caller acknowledges.
+    life: stratadb_common::state::Tracker<stratadb_common::state::InsertState>,
 }
 
+/// Commit a validated request (`life` in `VALIDATED`), replaying the
+/// engine's measured phases into the insert lifecycle (spec IX.22.2).
 async fn commit(
     st: &AppState,
     principal: &Principal,
     permit: tokio::sync::OwnedSemaphorePermit,
     events: Vec<stratadb_schema::Event>,
     idem: Option<IdempotencyKey>,
+    mut life: stratadb_common::state::Tracker<stratadb_common::state::InsertState>,
 ) -> stratadb_common::Result<Committed> {
+    use stratadb_common::state::InsertState as I;
     let n = events.len();
+    // A quota refusal has no spec transition: the entity ends in VALIDATED.
     st.check_quota(&principal.tenant, n)?;
     let engine = Arc::clone(&st.engine);
     let tenant = principal.tenant.clone();
-    let receipt = st
+    let handed = Instant::now();
+    let res = st
         .blk
         .run(move || {
+            let waited = handed.elapsed();
             let _permit = permit;
-            engine.write_batch_idempotent(&tenant, events, idem)
+            engine
+                .write_batch_idempotent(&tenant, events, idem)
+                .map(|r| (r, waited))
         })
-        .await?;
+        .await;
+    let (receipt, waited) = match res {
+        Ok(v) => v,
+        Err(e) => {
+            if !matches!(
+                e.kind(),
+                ErrorKind::ResourceExhausted | ErrorKind::InvalidInput
+            ) {
+                // The write reached the WAL path and failed there.
+                life.to(I::Logged, "WAL append");
+                life.to(I::Failed, "WAL failed");
+            }
+            return Err(e);
+        }
+    };
+    let t = receipt.timings;
+    let before_wal = waited + t.encode;
+    if t.throttled > Duration::ZERO {
+        life.to_after(I::Throttled, before_wal, "write stall");
+        life.to_after(I::Validated, t.throttled, "stall over");
+        life.to_after(I::Logged, t.wal_write, "WAL append");
+    } else {
+        life.to_after(I::Logged, before_wal + t.wal_write, "WAL append");
+    }
+    life.to_after(I::Durable, t.durable_wait, "group fsync");
+    life.to_after(I::Visible, t.publish, "memtable published");
     let accepted = if receipt.duplicate {
         receipt.accepted
     } else {
         n
     };
-    Ok(Committed { receipt, accepted })
+    Ok(Committed {
+        receipt,
+        accepted,
+        life,
+    })
 }
 
 /// Ingest with acknowledgement-latency measurement (committed requests only).
@@ -758,10 +933,14 @@ async fn ingest_inner(State(st): State<AppState>, headers: HeaderMap, body: Byte
             "too many concurrent ingest requests",
         ));
     };
+    use stratadb_common::state::{InsertState as I, Tracker};
+    // Insert lifecycle (spec IX.22.2) from admission on.
+    let mut life = Tracker::new(I::Received);
     let text = match decode_body(&headers, &body, st.cfg.max_decompressed_bytes).and_then(utf8) {
         Ok(t) => t,
         Err(e) => return error_response(&e),
     };
+    life.to(I::Decoded, "body decoded");
     let idem = match idempotency_key(&headers, text.as_bytes()) {
         Ok(k) => k,
         Err(e) => return error_response(&e),
@@ -775,9 +954,13 @@ async fn ingest_inner(State(st): State<AppState>, headers: HeaderMap, body: Byte
             Ok(J::Array(items)) => items.into_iter().map(Ok).collect(),
             Ok(obj @ J::Object(_)) => vec![Ok(obj)],
             Ok(_) => {
-                return error_response(&Error::invalid_input("expected a JSON object or array"))
+                life.to(I::Rejected, "not a JSON object or array");
+                return error_response(&Error::invalid_input("expected a JSON object or array"));
             }
-            Err(e) => return error_response(&Error::invalid_input(format!("invalid JSON: {e}"))),
+            Err(e) => {
+                life.to(I::Rejected, "invalid JSON");
+                return error_response(&Error::invalid_input(format!("invalid JSON: {e}")));
+            }
         }
     } else {
         text.lines()
@@ -806,6 +989,7 @@ async fn ingest_inner(State(st): State<AppState>, headers: HeaderMap, body: Byte
     let rejected = errors.len();
     errors.truncate(100);
     if events.is_empty() {
+        life.to(I::Rejected, "no valid events");
         let status = if rejected == 0 {
             StatusCode::BAD_REQUEST
         } else {
@@ -817,8 +1001,9 @@ async fn ingest_inner(State(st): State<AppState>, headers: HeaderMap, body: Byte
         )
             .into_response();
     }
-    match commit(&st, &principal, permit, events, idem).await {
-        Ok(c) => {
+    life.to(I::Validated, "schema checks ok");
+    match commit(&st, &principal, permit, events, idem, life).await {
+        Ok(mut c) => {
             let stage = Instant::now();
             let r = Json(json!({
                 // For a duplicate, `accepted` and `commit_seq` describe the original commit.
@@ -832,6 +1017,7 @@ async fn ingest_inner(State(st): State<AppState>, headers: HeaderMap, body: Byte
             }))
             .into_response();
             st.metrics.insert_stage(InsertStage::Ack, stage.elapsed());
+            c.life.to(I::Acked, "response sent");
             r
         }
         Err(e) => error_response(&e),
@@ -906,10 +1092,13 @@ async fn otlp_logs_inner(State(st): State<AppState>, headers: HeaderMap, body: B
             proto,
         );
     };
+    use stratadb_common::state::{InsertState as I, Tracker};
+    let mut life = Tracker::new(I::Received);
     let raw = match decode_body(&headers, &body, st.cfg.max_decompressed_bytes) {
         Ok(t) => t,
         Err(e) => return otlp_error(&e, proto),
     };
+    life.to(I::Decoded, "body decoded");
     let idem = match idempotency_key(&headers, &raw) {
         Ok(k) => k,
         Err(e) => return otlp_error(&e, proto),
@@ -917,13 +1106,17 @@ async fn otlp_logs_inner(State(st): State<AppState>, headers: HeaderMap, body: B
     let req: J = if proto {
         match stratadb_schema::otlp_proto::decode_export_request(&raw) {
             Ok(v) => v,
-            Err(e) => return otlp_error(&e, true),
+            Err(e) => {
+                life.to(I::Rejected, "invalid protobuf");
+                return otlp_error(&e, true);
+            }
         }
     } else {
         match serde_json::from_slice(&raw) {
             Ok(v) => v,
             Err(e) => {
-                return otlp_error(&Error::invalid_input(format!("invalid JSON: {e}")), false)
+                life.to(I::Rejected, "invalid JSON");
+                return otlp_error(&Error::invalid_input(format!("invalid JSON: {e}")), false);
             }
         }
     };
@@ -934,7 +1127,10 @@ async fn otlp_logs_inner(State(st): State<AppState>, headers: HeaderMap, body: B
         &st.cfg.limits,
     ) {
         Ok(b) => b,
-        Err(e) => return otlp_error(&e, proto),
+        Err(e) => {
+            life.to(I::Rejected, "invalid export request");
+            return otlp_error(&e, proto);
+        }
     };
     let mut events = Vec::new();
     let mut rejected = 0usize;
@@ -974,19 +1170,25 @@ async fn otlp_logs_inner(State(st): State<AppState>, headers: HeaderMap, body: B
     if events.is_empty() {
         // Nothing valid (or an empty request): OTLP treats this as success with
         // every record rejected; the records are not retryable.
+        life.to(I::Rejected, "no valid records");
         return respond(Vec::new(), rejected, first_error);
     }
-    match commit(&st, &principal, permit, events, idem).await {
-        Ok(c) => respond(
-            vec![
-                ("x-stratadb-commit-seq", c.receipt.commit_seq.to_string()),
-                ("x-stratadb-durability", c.receipt.level.as_str().to_owned()),
-                ("x-stratadb-duplicate", c.receipt.duplicate.to_string()),
-                ("x-stratadb-accepted", c.accepted.to_string()),
-            ],
-            rejected,
-            first_error,
-        ),
+    life.to(I::Validated, "schema checks ok");
+    match commit(&st, &principal, permit, events, idem, life).await {
+        Ok(mut c) => {
+            let r = respond(
+                vec![
+                    ("x-stratadb-commit-seq", c.receipt.commit_seq.to_string()),
+                    ("x-stratadb-durability", c.receipt.level.as_str().to_owned()),
+                    ("x-stratadb-duplicate", c.receipt.duplicate.to_string()),
+                    ("x-stratadb-accepted", c.accepted.to_string()),
+                ],
+                rejected,
+                first_error,
+            );
+            c.life.to(I::Acked, "response sent");
+            r
+        }
         Err(e) => otlp_error(&e, proto),
     }
 }
@@ -1006,6 +1208,9 @@ struct QueryRequest {
     page_size: Option<usize>,
     /// `next_cursor` from the previous page (requires the same query text).
     cursor: Option<String>,
+    /// Lower the query's work class (`normal` or `batch`); a request can
+    /// never raise it (spec VIII.11.1).
+    workload_class: Option<String>,
 }
 
 /// A running query in the registry.
@@ -1015,6 +1220,10 @@ struct Running {
     cancel: Arc<std::sync::atomic::AtomicBool>,
     started: Instant,
     sql: String,
+    class: stratadb_common::workload::WorkClass,
+    /// Set once admitted; until then the query is queued.
+    admitted: Arc<std::sync::atomic::AtomicBool>,
+    fingerprint: String,
 }
 
 /// Removes a query from the registry when it finishes (also on panic/cancel).
@@ -1029,21 +1238,6 @@ impl Drop for RunningGuard {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.id);
-    }
-}
-
-fn to_json(v: &Value) -> J {
-    match v {
-        Value::Null => J::Null,
-        Value::Bool(b) => json!(b),
-        Value::Int(i) => json!(i),
-        Value::UInt(u) => json!(u),
-        Value::Float(f) => json!(f),
-        Value::String(s) => json!(s),
-        Value::Bytes(b) => json!(b.iter().map(|x| format!("{x:02x}")).collect::<String>()),
-        Value::Timestamp(t) => json!(time::format_rfc3339(*t)),
-        Value::List(l) => J::Array(l.iter().map(to_json).collect()),
-        Value::Map(m) => J::Object(m.iter().map(|(k, v)| (k.clone(), to_json(v))).collect()),
     }
 }
 
@@ -1063,15 +1257,12 @@ fn unique_names(cols: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn row_object(names: &[String], row: &[Datum]) -> J {
-    let mut m = Map::new();
-    for (k, d) in names.iter().zip(row) {
-        // Missing values are omitted; null is rendered as JSON null.
-        if let Some(v) = d {
-            m.insert(k.clone(), to_json(v));
-        }
-    }
-    J::Object(m)
+/// Result rows encoded as JSON on the blocking pool, with their unique
+/// column names and the time it took.
+struct EncodedRows {
+    names: Vec<String>,
+    rows_json: Vec<u8>,
+    took: Duration,
 }
 
 /// Query with latency and outcome measurement. Unauthenticated/unauthorized
@@ -1102,10 +1293,17 @@ async fn query(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> R
 }
 
 async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    use stratadb_common::state::{QueryState as Q, Tracker};
     let arrived = Instant::now();
     let principal = match authenticate(&st, &headers, Permission::Query) {
         Ok(p) => p,
         Err(r) => return r,
+    };
+    // Query lifecycle (spec IX.22.1). Unauthenticated requests are not
+    // queries. Shared with the worker that runs it.
+    let life = Arc::new(std::sync::Mutex::new(Tracker::new(Q::Received)));
+    let step = |to: Q, why: &str| {
+        life.lock().unwrap_or_else(|e| e.into_inner()).to(to, why);
     };
     let req: QueryRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -1139,6 +1337,8 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
     // (STRATA-SYS-13-009) and its response carries the timing headers.
     let fp = stratadb_query::fingerprint(&req.query);
     let arrived_ns = time::now_unix_nanos();
+    // The plan-time estimate (rows, CPU ms), once made.
+    let estimate: std::sync::OnceLock<(u64, f64)> = std::sync::OnceLock::new();
     let record = |status: &str,
                   queue: Duration,
                   serialize: Duration,
@@ -1156,6 +1356,7 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
                 serialize,
                 stats,
                 result_rows: rows,
+                estimate: estimate.get().copied(),
             });
         }
     };
@@ -1173,19 +1374,85 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
             .collect();
         with_query_headers(error_response(e), &query_id, &fp, &t)
     };
-    let Ok(permit) = Arc::clone(&st.query_sem).try_acquire_owned() else {
-        return fail(
-            &Error::resource_exhausted("too many concurrent queries"),
-            None,
-        );
+    let requested = match req.workload_class.as_deref() {
+        None => None,
+        Some(c) => match stratadb_common::workload::WorkClass::parse(c)
+            .filter(|c| stratadb_common::workload::WorkClass::QUERY.contains(c))
+        {
+            Some(c) => Some(c),
+            None => {
+                step(Q::Failed, "bad workload_class");
+                return fail(
+                    &Error::invalid_input("workload_class must be interactive, normal or batch"),
+                    None,
+                );
+            }
+        },
     };
+    // Parse and plan before admission: malformed queries fail without
+    // taking a slot.
+    let cached = st.plan_cache.get(&req.query, &fp);
+    let plan_cache_hit = cached.is_some();
+    let prepared = match cached {
+        Some(p) => {
+            step(Q::Parsed, "plan cache hit");
+            step(Q::Planned, "plan cache hit");
+            p
+        }
+        None => {
+            let parse_opts = QueryOptions::default();
+            let parsed = match stratadb_query::parse(&req.query, &parse_opts) {
+                Ok(p) => p,
+                Err(e) => {
+                    step(Q::Failed, "syntax error");
+                    return fail(&e, None);
+                }
+            };
+            step(Q::Parsed, "parse ok");
+            let prepared = match parsed.plan() {
+                Ok(p) => p,
+                Err(e) => {
+                    step(Q::Failed, "semantic error");
+                    return fail(&e, None);
+                }
+            };
+            step(Q::Planned, "plan ok");
+            st.plan_cache.insert(&req.query, &prepared);
+            prepared
+        }
+    };
+    // Classify from the plan-time estimate (metadata only, STRATA-SYS-11-003).
+    let catalog = TenantCatalog {
+        tenant: principal.tenant.clone(),
+        engine: Arc::clone(&st.engine),
+        query_log: st.query_log.clone(),
+        holder: Some(format!("query:{query_id}")),
+    };
+    // Waiting for a slot is QUEUED; anything refused from here on is
+    // QUEUED -> REJECTED.
+    step(Q::Queued, "admission");
+    let est = match prepared.estimate(&catalog) {
+        Ok(e) => {
+            let _ = estimate.set((e.rows + e.memory_rows, e.est_cpu_ms));
+            e.est_cpu_ms
+        }
+        Err(e) => {
+            step(Q::Rejected, "estimate failed");
+            return fail(&e, None);
+        }
+    };
+    let class = st
+        .admission
+        .classify(principal.tenant.as_str(), est, requested);
     // Registry keys are global; scope them by tenant so ids cannot collide or leak.
     let key = format!("{}/{}", principal.tenant, query_id);
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let mut reg = st.running.lock().unwrap_or_else(|e| e.into_inner());
         if reg.contains_key(&key) {
             drop(reg);
+            step(Q::Rejected, "duplicate query_id");
             return fail(
                 &Error::new(
                     ErrorKind::AlreadyExists,
@@ -1201,20 +1468,53 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
                 cancel: Arc::clone(&cancel),
                 started: Instant::now(),
                 sql: req.query.chars().take(200).collect(),
+                class,
+                admitted: Arc::clone(&admitted),
+                fingerprint: fp.hex(),
             },
         );
     }
     let guard = RunningGuard {
         reg: Arc::clone(&st.running),
-        id: key,
+        id: key.clone(),
     };
-    let catalog = TenantCatalog {
-        tenant: principal.tenant.clone(),
-        engine: Arc::clone(&st.engine),
-        query_log: st.query_log.clone(),
+    // Admission (spec VIII.11.2): run now, wait in the fair queue, or be
+    // refused.
+    let admitting = Instant::now();
+    let mut permit = match st
+        .admission
+        .admit(admission::Ask {
+            class,
+            tenant: stratadb_query::tenant_key(&principal.tenant),
+            est_cpu_ms: est,
+            max_wait: timeout,
+            cancel: Some(Arc::clone(&cancel)),
+            key,
+        })
+        .await
+    {
+        Ok(p) => p,
+        Err(r) => {
+            step(Q::Rejected, r.code());
+            let waited = admitting.elapsed();
+            let status = match r {
+                admission::Refusal::Cancelled => "cancelled",
+                admission::Refusal::Overloaded { .. } => "unavailable",
+                admission::Refusal::TooManyQueries { .. } => "resource_exhausted",
+            };
+            record(status, waited, Duration::ZERO, None, 0);
+            return with_query_headers(
+                refusal_response(&r),
+                &query_id,
+                &fp,
+                &[("x-stratadb-queue-us", waited)],
+            );
+        }
     };
+    admitted.store(true, std::sync::atomic::Ordering::Relaxed);
+    let admission_wait = permit.waited;
     let started = Instant::now();
-    let sql = req.query.clone();
+    let worker_life = Arc::clone(&life);
     let memory = st.memory.as_ref().map(|m| {
         (
             m.query_parent(&principal.tenant, &query_id),
@@ -1225,13 +1525,26 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
     let res = st
         .blk
         .run(move || {
-            let queued = started.elapsed();
-            let _permit = permit;
+            let queued = admission_wait + started.elapsed();
+            worker_life
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .to(Q::Running, "worker started");
             let _guard = guard;
             let mut opts = QueryOptions {
                 timeout,
                 max_result_rows: max_rows,
                 cancel: Some(cancel),
+                class: Some(Arc::clone(&permit.cell)),
+                // Degree of parallelism per class (STRATA-SYS-11-008):
+                // 5 ms of estimated CPU per worker, 50 ms for batch.
+                target_ms_per_worker: if permit.class()
+                    == stratadb_common::workload::WorkClass::Batch
+                {
+                    50.0
+                } else {
+                    stratadb_query::TARGET_MS_PER_WORKER
+                },
                 ..QueryOptions::default()
             };
             if let Some((parent, limit, wait)) = memory {
@@ -1239,58 +1552,136 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
                 opts.max_memory_bytes = usize::try_from(limit).unwrap_or(usize::MAX);
                 opts.memory_wait = wait;
             }
-            let out = if req.page_size.is_some() || req.cursor.is_some() {
+            // Aggregates and EXPLAIN have bounded results: a page size is
+            // ignored ("paginated": false), a cursor is still an error.
+            let paginate =
+                req.cursor.is_some() || (req.page_size.is_some() && prepared.paginable());
+            let out = if paginate {
                 let page = PageRequest {
                     page_size: req.page_size.unwrap_or(max_rows).min(max_rows),
                     cursor: req.cursor,
                 };
-                execute_page(&catalog, &sql, &opts, &page).map(|p| (p.output, p.next_cursor))
+                execute_page_prepared(&catalog, &prepared, &opts, &page)
+                    .map(|p| (p.output, p.next_cursor))
             } else {
-                execute(&catalog, &sql, &opts).map(|o| (o, None))
+                execute_prepared(&catalog, &prepared, &opts).map(|o| (o, None))
             };
-            Ok((queued, out))
+            if let Ok((o, _)) = &out {
+                permit.finish(o.stats.cpu);
+            }
+            let class = permit.class();
+            drop(permit); // frees the slot before the response is built
+                          // Encode the rows here, on the blocking pool, so a large result
+                          // never occupies an async reactor thread (spec
+                          // STRATA-SYS-06-003, ADR-0044).
+            let out = out.map(|(o, c)| {
+                let started = Instant::now();
+                let names = unique_names(&o.columns);
+                let mut rows_json = Vec::new();
+                json_out::write_rows(&names, &o.rows, &mut rows_json);
+                let enc = EncodedRows {
+                    names,
+                    rows_json,
+                    took: started.elapsed(),
+                };
+                (o, c, paginate, enc)
+            });
+            Ok((queued, class, out))
         })
         .await;
-    let (queued, res) = match res {
-        Ok((queued, r)) => (Some(queued), r),
-        Err(e) => (None, Err(e)),
+    let (queued, ran_class, res) = match res {
+        Ok((queued, c, r)) => (Some(queued), Some(c), r),
+        Err(e) => (None, None, Err(e)),
     };
+    let res = res.map(|(o, c, paginated, enc)| ((o, c), paginated, enc));
+    let ran_class = ran_class.unwrap_or(class);
     match res {
-        Ok((out, next_cursor)) => {
+        Ok(((out, next_cursor), paginated, enc)) => {
             let queued = queued.unwrap_or_default();
             use telemetry::QueryStage;
+            step(Q::Streaming, "result ready");
             let serializing = Instant::now();
             st.metrics.query_work(&out.stats);
-            let names = unique_names(&out.columns);
-            let rows: Vec<J> = out.rows.iter().map(|r| row_object(&names, r)).collect();
+            let q_error = estimate
+                .get()
+                .map(|(rows, _)| telemetry::q_error(*rows, out.stats.rows_scanned));
+            if let Some(q) = q_error {
+                st.metrics.estimate(q);
+            }
+            let EncodedRows {
+                names,
+                rows_json,
+                took: encode_took,
+            } = enc;
             let s = &out.stats;
             let us = |d: Duration| d.as_secs_f64() * 1e6;
-            let r = Json(json!({
+            let envelope = json!({
                 "query_id": query_id,
                 "columns": names,
-                "rows": rows,
                 "explain": out.explain,
                 "partial": false,
                 "next_cursor": next_cursor,
+                "paginated": paginated,
                 "stats": {
-                    "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                    // From arrival: parse, plan and admission happen before
+                    // the worker starts, so queue + parse + plan + exec <=
+                    // elapsed holds.
+                    "elapsed_ms": arrived.elapsed().as_secs_f64() * 1000.0,
                     "rows_scanned": s.rows_scanned, "rows_matched": s.rows_matched,
                     "segment_bytes_read": s.bytes_read, "segments_total": s.segments_total,
                     "segments_scanned": s.segments_scanned,
                     "segments_pruned": s.segments_pruned_time + s.segments_pruned_keys + s.segments_pruned_severity + s.segments_pruned_bloom + s.segments_pruned_ngram + s.segments_pruned_cursor,
                     "indexes_used": s.indexes_used,
+                    // Segments/windows answered from metadata (STRATA-SYS-09-006).
+                    "sources_from_metadata": s.sources_from_metadata,
+                    "plan_cache": if plan_cache_hit { "hit" } else { "miss" },
+                    "column_cache_hits": s.column_cache_hits,
+                    // Plan-time estimate vs actual (STRATA-SYS-12-004).
+                    "est_rows": estimate.get().map(|e| e.0),
+                    "q_error": q_error,
+                    // Sources skipped by an ordered ORDER BY event_time LIMIT scan.
+                    "sources_skipped_by_order": s.sources_skipped_by_order,
+                    // Sorting (STRATA-SYS-14-001/003): segment runs merged,
+                    // rows skipped against the shared top-k bound.
+                    "sort_runs_merged": s.sort_runs_merged,
+                    "topk_rows_skipped": s.topk_rows_skipped,
                     // Phase decomposition (spec VIII.1.4, STRATA-SYS-01-007):
                     // queue + parse + plan + exec (+ serialize) ≈ elapsed.
                     "queue_us": us(queued), "parse_us": us(s.parse),
                     "plan_us": us(s.plan), "exec_us": us(s.elapsed),
                     // Degree of parallelism (STRATA-SYS-11-008).
                     "scan_workers": s.scan_workers, "est_cpu_ms": s.est_cpu_ms,
+                    // Work class at admission and when it finished (a
+                    // demotion lowers it; spec VIII.11.1).
+                    "class": class.name(), "final_class": ran_class.name(),
                     "cpu_us": us(s.cpu),
                 },
                 "fingerprint": fp.hex(),
-            }))
-            .into_response();
-            let serialize = serializing.elapsed();
+            });
+            // The envelope is small; the rows are already JSON. The body is
+            // sent as prefix + rows + suffix with an exact length, so the
+            // encoded rows are never copied; "rows" goes where serde_json
+            // would put it, so the bytes are unchanged.
+            let parts = match &envelope {
+                J::Object(env) => json_out::envelope_parts(env, "rows"),
+                _ => Err(serde::ser::Error::custom("envelope is not an object")),
+            };
+            let (prefix, suffix) = match parts {
+                Ok(p) => p,
+                Err(e) => {
+                    return fail(
+                        &Error::internal(format!("response encoding: {e}")),
+                        Some(queued),
+                    )
+                }
+            };
+            let body = json_out::ChunkedBody::new(vec![prefix, rows_json, suffix]);
+            let r = (
+                [(header::CONTENT_TYPE, "application/json")],
+                axum::body::Body::new(body),
+            )
+                .into_response();
+            let serialize = serializing.elapsed() + encode_took;
             for (stage, d) in [
                 (QueryStage::Queue, queued),
                 (QueryStage::Parse, s.parse),
@@ -1309,9 +1700,10 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
                 plan_us = us(s.plan) as u64, exec_us = us(s.elapsed) as u64,
                 cpu_us = us(s.cpu) as u64,
                 serialize_us = us(serialize) as u64, rows_scanned = s.rows_scanned,
-                rows_returned = rows.len(), segment_bytes_read = s.bytes_read, "query"
+                rows_returned = out.rows.len(), segment_bytes_read = s.bytes_read, "query"
             );
-            record("ok", queued, serialize, Some(s), rows.len() as u64);
+            record("ok", queued, serialize, Some(s), out.rows.len() as u64);
+            step(Q::Finished, "response built");
             with_query_headers(
                 r,
                 &query_id,
@@ -1325,7 +1717,24 @@ async fn query_inner(State(st): State<AppState>, headers: HeaderMap, body: Bytes
                 ],
             )
         }
-        Err(e) => fail(&e, queued),
+        Err(e) => {
+            let mut t = life.lock().unwrap_or_else(|e| e.into_inner());
+            match (t.state(), e.kind()) {
+                // A blocking-pool rejection: the query never started.
+                (Q::Queued, _) => {
+                    t.to(Q::Rejected, "worker pool full");
+                }
+                (_, ErrorKind::Cancelled | ErrorKind::Timeout) => {
+                    t.to(Q::Cancelling, "cancel requested or time limit");
+                    t.to(Q::Cancelled, "operators released");
+                }
+                _ => {
+                    t.to(Q::Failed, "runtime error");
+                }
+            }
+            drop(t);
+            fail(&e, queued)
+        }
     }
 }
 
@@ -1716,12 +2125,304 @@ async fn metrics(State(st): State<AppState>, headers: HeaderMap) -> Response {
          strata_scan_pool_tasks_total{{result=\"rejected\"}} {}\n",
         p.workers, p.active_tasks, p.submitted, p.rejected
     ));
+    // Time in state per lifecycle (spec IX.22, STRATA-ARCH-22-001..008).
+    stratadb_common::state::render(&mut out);
+    // Workload classes and admission (spec VIII.11).
+    st.admission.render(&mut out);
+    // Plan cache and decoded column cache (spec VIII.16).
+    st.plan_cache.render(&mut out);
+    if let Some(c) = &s.column_cache {
+        for (name, kind, help, v) in [
+            (
+                "hits_total",
+                "counter",
+                "Segment columns served decoded from the cache.",
+                c.hits as f64,
+            ),
+            (
+                "misses_total",
+                "counter",
+                "Segment columns read and decoded.",
+                c.misses as f64,
+            ),
+            (
+                "insertions_total",
+                "counter",
+                "Decoded columns added.",
+                c.insertions as f64,
+            ),
+            (
+                "evictions_total",
+                "counter",
+                "Decoded columns evicted (SLRU).",
+                c.evictions as f64,
+            ),
+            (
+                "bytes",
+                "gauge",
+                "Bytes of decoded columns held (charged to the cache region).",
+                c.bytes as f64,
+            ),
+            (
+                "protected_entries",
+                "gauge",
+                "Columns in the protected segment (used at least twice).",
+                c.protected_entries as f64,
+            ),
+        ] {
+            out.push_str(&format!(
+                "# HELP strata_column_cache_{name} {help}\n# TYPE strata_column_cache_{name} {kind}\nstrata_column_cache_{name} {v}\n"
+            ));
+        }
+        c.hit_seconds.render(
+            &mut out,
+            "strata_column_cache_hit_seconds",
+            "Lookup latency of column cache hits.",
+            "",
+            true,
+        );
+    }
+    // Snapshots and retained obsolete segments (spec STRATA-SYS-17-005).
+    let snaps = st.engine.snapshots();
+    let oldest = snaps.open.iter().map(|s| s.age_ms).max().unwrap_or(0) as f64 / 1000.0;
+    for (name, kind, help, v) in [
+        (
+            "snapshots_open",
+            "gauge",
+            "Open engine snapshots (queries holding a consistent view).",
+            snaps.open.len() as f64,
+        ),
+        (
+            "snapshot_oldest_age_seconds",
+            "gauge",
+            "Age of the oldest open snapshot.",
+            oldest,
+        ),
+        (
+            "obsolete_segments",
+            "gauge",
+            "Replaced segments whose files still exist (pinned or within old_segments_lifetime).",
+            snaps.obsolete_segments as f64,
+        ),
+        (
+            "obsolete_retained_bytes",
+            "gauge",
+            "Bytes of replaced segments still on disk.",
+            snaps.obsolete_bytes as f64,
+        ),
+        (
+            "obsolete_retained_ratio",
+            "gauge",
+            "Retained obsolete bytes / disk size (warned above 0.10).",
+            snaps.obsolete_ratio,
+        ),
+    ] {
+        out.push_str(&format!(
+            "# HELP strata_{name} {help}\n# TYPE strata_{name} {kind}\nstrata_{name} {v}\n"
+        ));
+    }
+    out.push_str("# HELP strata_scan_pool_class_cpu_seconds_total Scan-pool CPU time by work class (fair scheduling, STRATA-SYS-11-001).\n# TYPE strata_scan_pool_class_cpu_seconds_total counter\n");
+    for (c, u) in stratadb_query::scan_pool().class_usage() {
+        if stratadb_common::workload::WorkClass::QUERY.contains(&c) {
+            out.push_str(&format!(
+                "strata_scan_pool_class_cpu_seconds_total{{class=\"{}\"}} {}\n",
+                c.name(),
+                u.cpu.as_secs_f64()
+            ));
+        }
+    }
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         out,
     )
         .into_response()
+}
+
+/// `GET /api/v1/admin/workload` — per-class slots, queue, arrival rate,
+/// service time, utilization and queue-wait p99 (spec VIII.11.4,
+/// STRATA-SYS-11-010).
+async fn admin_workload(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authenticate(&st, &headers, Permission::ClusterRead) {
+        return r;
+    }
+    Json(st.admission.stats()).into_response()
+}
+
+/// `GET /api/v1/admin/snapshots` — open snapshots with their holders and
+/// the obsolete segment bytes they keep on disk (spec STRATA-SYS-17-005,
+/// the equivalent of `system.snapshots`). Tenants appear by name, so it
+/// needs an operator token.
+async fn admin_snapshots(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authenticate(&st, &headers, Permission::ClusterRead) {
+        return r;
+    }
+    let logs = st.engine.snapshots();
+    let qlog = st.query_log.as_ref().map(|q| q.engine().snapshots());
+    Json(json!({"logs": logs, "query_log": qlog})).into_response()
+}
+
+/// `GET /api/v1/admin/caches` — the plan cache: hits, misses, insertions,
+/// evictions, entries, bytes, hit latency, and the 100 most looked-up
+/// fingerprints with their hit ratios (spec STRATA-SYS-16-004).
+async fn admin_caches(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authenticate(&st, &headers, Permission::ClusterRead) {
+        return r;
+    }
+    let s = st.plan_cache.stats();
+    Json(json!({
+        "plan_cache": {
+            "enabled": st.plan_cache.enabled(),
+            "hits": s.hits, "misses": s.misses, "insertions": s.insertions,
+            "evictions": s.evictions, "entries": s.entries, "bytes": s.bytes,
+            "capacity_entries": s.capacity_entries, "capacity_bytes": s.capacity_bytes,
+            "hit_p99_us": s.hit_seconds.quantile_upper_bound(0.99).map(|x| x * 1e6),
+            "top_fingerprints": st.plan_cache.top(100),
+        },
+        "column_cache": st.engine.stats().column_cache.map(|c| json!({
+            "hits": c.hits, "misses": c.misses, "insertions": c.insertions,
+            "evictions": c.evictions, "entries": c.entries, "bytes": c.bytes,
+            "protected_entries": c.protected_entries,
+            "capacity_bytes": c.capacity_bytes,
+            "hit_p99_us": c.hit_seconds.quantile_upper_bound(0.99).map(|x| x * 1e6),
+        })),
+    }))
+    .into_response()
+}
+
+/// `GET /api/v1/whoami` (any valid token) — the caller's tenant, token id,
+/// permissions and expiry. Never the secret.
+async fn whoami(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let p = match authenticate_with(&st, &headers, None) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let expires_ms = st
+        .tokens
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .list()
+        .into_iter()
+        .find(|t| t.id == p.token_id)
+        .and_then(|t| t.expires_ms);
+    let perms: Vec<&str> = p.permissions.iter().map(|x| x.as_str()).collect();
+    Json(json!({
+        "tenant": p.tenant.as_str(),
+        "token_id": p.token_id,
+        "permissions": perms,
+        "expires_ms": expires_ms,
+    }))
+    .into_response()
+}
+
+/// Attribute keys listed per scope by `GET /api/v1/schema`.
+const SCHEMA_MAX_KEYS: usize = 500;
+
+/// `GET /api/v1/schema` (query, caller's tenant) — tables, their columns, and
+/// the attribute / resource keys present in the tenant's segments with the
+/// rows of the segments holding them (from segment metadata, never a scan;
+/// memtable rows are not counted). At most 500 keys per scope, most common
+/// first.
+async fn schema(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let p = match authenticate(&st, &headers, Permission::Query) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let columns = json!([
+        {"name": "event_time", "type": "timestamp"},
+        {"name": "ingest_time", "type": "timestamp"},
+        {"name": "service", "type": "string"},
+        {"name": "severity", "type": "string"},
+        {"name": "severity_number", "type": "int"},
+        {"name": "severity_text", "type": "string"},
+        {"name": "body", "type": "value"},
+        {"name": "trace_id", "type": "string"},
+        {"name": "span_id", "type": "string"},
+        {"name": "event_id", "type": "string"},
+        {"name": "schema_version", "type": "int"},
+        {"name": "tenant_id", "type": "string"},
+        {"name": "attributes", "type": "map"},
+        {"name": "resource_attributes", "type": "map"},
+    ]);
+    let keys_of = |engine: &Engine| {
+        let (counts, mut truncated) = engine.snapshot(&p.tenant).attribute_key_rows();
+        let mut keys: Vec<((&'static str, String), u64)> = counts.into_iter().collect();
+        keys.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut per_scope: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let list: Vec<J> = keys
+            .into_iter()
+            .filter(|((scope, _), _)| {
+                let n = per_scope.entry(scope).or_default();
+                *n += 1;
+                if *n > SCHEMA_MAX_KEYS {
+                    truncated = true;
+                    false
+                } else {
+                    true
+                }
+            })
+            .map(|((scope, key), rows)| json!({"key": key, "scope": scope, "rows": rows}))
+            .collect();
+        (list, truncated)
+    };
+    let (keys, truncated) = keys_of(&st.engine);
+    let mut tables = vec![json!({
+        "name": "logs", "enabled": true, "columns": columns,
+        "attribute_keys": keys, "attribute_keys_truncated": truncated,
+    })];
+    match &st.query_log {
+        Some(q) => {
+            let (keys, truncated) = keys_of(q.engine());
+            tables.push(json!({
+                "name": "system.query_log", "enabled": true, "columns": columns,
+                "attribute_keys": keys, "attribute_keys_truncated": truncated,
+            }));
+        }
+        None => {
+            tables.push(json!({"name": "system.query_log", "enabled": false, "columns": columns}))
+        }
+    }
+    Json(json!({"tables": tables})).into_response()
+}
+
+/// `GET /api/v1/queries` (query, caller's tenant) — the tenant's queued and
+/// running queries.
+async fn list_queries(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let p = match authenticate(&st, &headers, Permission::Query) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let prefix = format!("{}/", p.tenant);
+    let entries: Vec<(String, J)> = {
+        let reg = st.running.lock().unwrap_or_else(|e| e.into_inner());
+        reg.iter()
+            .filter(|(k, r)| r.tenant == p.tenant && k.starts_with(&prefix))
+            .map(|(k, r)| {
+                let running = r.admitted.load(std::sync::atomic::Ordering::Relaxed);
+                (
+                    k.clone(),
+                    json!({
+                        "query_id": &k[prefix.len()..],
+                        "state": if running { "running" } else { "queued" },
+                        "class": r.class.name(),
+                        "elapsed_ms": r.started.elapsed().as_millis() as u64,
+                        "fingerprint": r.fingerprint,
+                        "cancel_requested": r.cancel.load(std::sync::atomic::Ordering::Relaxed),
+                    }),
+                )
+            })
+            .collect()
+    };
+    let queries: Vec<J> = entries
+        .into_iter()
+        .map(|(key, mut v)| {
+            if v["state"] == "queued" {
+                v["queue_position"] = json!(st.admission.position(&key));
+            }
+            v
+        })
+        .collect();
+    Json(json!({"queries": queries})).into_response()
 }
 
 /// Parse a comma-separated permission list.
@@ -1835,6 +2536,61 @@ async fn admin_compaction(State(st): State<AppState>, headers: HeaderMap) -> Res
 struct BackupRequest {
     /// Backup name: same alphabet as tenant ids; created under the server's backup root.
     name: String,
+}
+
+/// Backups listed by `GET /api/v1/admin/backup`.
+const MAX_LISTED_BACKUPS: usize = 200;
+
+/// `GET /api/v1/admin/backup` (backup.create) — backups under `--backup-dir`,
+/// newest first (at most 200): name, creation time, bytes and rows from each
+/// backup's manifest. Directories without a readable manifest are skipped.
+async fn list_backups(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authenticate(&st, &headers, Permission::BackupCreate) {
+        return r;
+    }
+    let Some(root) = st.cfg.backup_root.clone() else {
+        return Json(json!({"enabled": false, "backups": [], "truncated": false})).into_response();
+    };
+    let res = st
+        .blk
+        .run(move || -> stratadb_common::Result<(Vec<J>, bool)> {
+            let mut all: Vec<(i64, J)> = Vec::new();
+            let entries = match std::fs::read_dir(&root) {
+                Ok(d) => d,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok((Vec::new(), false))
+                }
+                Err(e) => return Err(Error::io(format!("listing {}", root.display()), e)),
+            };
+            for entry in entries.flatten().take(10_000) {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let Ok(bm) = stratadb_storage::read_backup_manifest(&path) else {
+                    continue;
+                };
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let bytes: u64 = bm.files.iter().map(|f| f.bytes).sum();
+                all.push((
+                    bm.created_ms,
+                    json!({"name": name, "created_unix_ms": bm.created_ms, "bytes": bytes,
+                           "rows": bm.rows, "segments": bm.segments}),
+                ));
+            }
+            all.sort_by_key(|x| std::cmp::Reverse(x.0));
+            let truncated = all.len() > MAX_LISTED_BACKUPS;
+            all.truncate(MAX_LISTED_BACKUPS);
+            Ok((all.into_iter().map(|(_, v)| v).collect(), truncated))
+        })
+        .await;
+    match res {
+        Ok((backups, truncated)) => {
+            Json(json!({"enabled": true, "backups": backups, "truncated": truncated}))
+                .into_response()
+        }
+        Err(e) => error_response(&e),
+    }
 }
 
 async fn admin_backup(State(st): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -1986,10 +2742,19 @@ async fn get_query(
         .get(&format!("{}/{}", p.tenant, id))
         .filter(|r| r.tenant == p.tenant)
     {
-        Some(r) => Json(json!({"query_id": id, "state": "running",
-            "elapsed_ms": r.started.elapsed().as_millis() as u64, "query": r.sql,
-            "cancel_requested": r.cancel.load(std::sync::atomic::Ordering::Relaxed)}))
-        .into_response(),
+        Some(r) => {
+            let running = r.admitted.load(std::sync::atomic::Ordering::Relaxed);
+            let key = format!("{}/{}", p.tenant, id);
+            // Queued queries report their approximate position (0 = next).
+            let position = (!running).then(|| st.admission.position(&key)).flatten();
+            Json(
+                json!({"query_id": id, "state": if running { "running" } else { "queued" },
+                "queue_position": position, "class": r.class.name(),
+                "elapsed_ms": r.started.elapsed().as_millis() as u64, "query": r.sql,
+                "cancel_requested": r.cancel.load(std::sync::atomic::Ordering::Relaxed)}),
+            )
+            .into_response()
+        }
         // Finished, never existed, or another tenant's: indistinguishable by design.
         None => error_response(&Error::not_found("no running query with this id")),
     }

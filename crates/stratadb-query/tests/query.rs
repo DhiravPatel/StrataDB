@@ -124,10 +124,13 @@ fn recent_error_search_like_spec_example() {
     let out = q(&e, "a", &sql);
     assert_eq!(ids(&out), vec!["e90", "e80", "e70"]);
     assert_eq!(out.columns[0], "event_id");
-    // 4 segments: [0,19] pruned by time; [20,39],[40,59],[60,79] scanned.
+    // 4 segments: [0,19] pruned by time. Read newest first (ordered scan,
+    // STRATA-SYS-14-004): the memtable [80,99] holds e90 and e80, segment
+    // [60,79] e70; [20,39] and [40,59] cannot beat e70 and are skipped.
     assert_eq!(out.stats.segments_total, 4);
     assert_eq!(out.stats.segments_pruned_time, 1);
-    assert_eq!(out.stats.segments_scanned, 3);
+    assert_eq!(out.stats.segments_scanned, 1);
+    assert_eq!(out.stats.sources_skipped_by_order, 2);
 }
 
 #[test]
@@ -339,9 +342,17 @@ fn explain_and_explain_analyze() {
     assert!(text.contains("severity in: [\"ERROR\"]"), "{text}");
     assert!(out.rows.is_empty());
     assert_eq!(out.stats.rows_scanned, 0, "EXPLAIN must not execute");
-    let out = q(&e, "a", "EXPLAIN ANALYZE SELECT count(*) FROM logs");
+    let out = q(&e, "a", "EXPLAIN ANALYZE SELECT count(body) FROM logs");
     let text = out.explain.unwrap();
     assert!(text.contains("Actual: rows scanned 100"), "{text}");
+    // A plain count(*) is answered from segment and memtable metadata.
+    let out = q(&e, "a", "EXPLAIN ANALYZE SELECT count(*) FROM logs");
+    let text = out.explain.unwrap();
+    assert!(
+        text.contains("Actual: rows scanned 0, matched 100"),
+        "{text}"
+    );
+    assert!(text.contains("answered from metadata"), "{text}");
 }
 
 #[test]
@@ -393,8 +404,9 @@ fn budgets_and_cancellation_are_enforced() {
         max_rows_scanned: 10,
         ..Default::default()
     };
+    // (count(body) must read rows; a plain count(*) reads none.)
     assert_eq!(
-        run(o, "SELECT count(*) FROM logs"),
+        run(o, "SELECT count(body) FROM logs"),
         ErrorKind::ResourceExhausted
     );
     let o = QueryOptions {

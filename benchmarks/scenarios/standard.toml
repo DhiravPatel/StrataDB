@@ -85,6 +85,29 @@ sql = "SELECT attributes['error.code'] AS code, count(*) AS n FROM logs WHERE se
 [[query]]
 id = "q12_historical_wide_range"
 sql = "SELECT severity, count(*) FROM logs GROUP BY severity"
+[query.expect]
+dense_group_batches = ">= 1"
+
+[[query]]
+id = "q14_total_count_and_time_range"
+sql = "SELECT count(*), min(event_time), max(event_time) FROM logs"
+[query.expect]
+sources_from_metadata = ">= 1"
+rows_scanned = "== 0"
+
+[[query]]
+id = "q15_like_written_before_rare_severity"
+sql = "SELECT count(*) FROM logs WHERE body LIKE '%TIMEOUT%' AND severity = 'FATAL'"
+
+[[query]]
+id = "q16_case_insensitive_substring"
+sql = "SELECT count(*) FROM logs WHERE body ILIKE '%timeout%'"
+
+[[query]]
+id = "q17_top_k_by_string_keys"
+sql = "SELECT event_time, service, body FROM logs ORDER BY service, body DESC LIMIT 100"
+[query.expect]
+topk_rows_skipped = ">= 1"
 
 [[query]]
 id = "q13_absent_substring_search"

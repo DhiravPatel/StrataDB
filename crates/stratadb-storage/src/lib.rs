@@ -2,6 +2,7 @@
 //!
 //! See [`engine`] for the write path, flush protocol, and failure policy.
 
+pub mod colcache;
 pub mod engine;
 pub mod idempotency;
 pub mod manifest;
@@ -9,10 +10,10 @@ pub mod memtable;
 pub mod scan;
 
 pub use engine::{
-    restore_backup, verify_backup, BackupManifest, BackupReport, CommitLevel, CompactionOptions,
-    CompactionReport, Engine, EngineOptions, EngineStats, FlushReport, IndexCheck,
-    IndexRebuildReport, OpenReport, RestoreReport, RetentionReport, SegmentHandle, SegmentIndexes,
-    Snapshot, TenantUsage, UpgradeReport, WriteReceipt,
+    read_backup_manifest, restore_backup, verify_backup, BackupManifest, BackupReport, CommitLevel,
+    CompactionOptions, CompactionReport, Engine, EngineOptions, EngineStats, FlushReport,
+    IndexCheck, IndexRebuildReport, OpenReport, RestoreReport, RetentionReport, SegmentHandle,
+    SegmentIndexes, Snapshot, TenantUsage, UpgradeReport, WriteReceipt, WriteTimings,
 };
 pub use idempotency::IdempotencyKey;
 pub use manifest::{Manifest, RetentionPolicy, SegmentEntry};

@@ -1130,7 +1130,7 @@ impl SegmentReader {
                 }
             }
         }
-        Ok(ColumnData::Maps(maps))
+        Ok(ColumnData::Maps(std::sync::Arc::new(maps)))
     }
 
     /// Materialize every row (all columns). Used by recovery tooling, verify,

@@ -142,6 +142,98 @@ Requirement-level status: PERF_INVENTORY.md (generated; `scripts/spec_inventory.
    ☐ Typed numeric and value columns with null bitmaps, and a vector pool;
    dictionary-encoded memtable strings; caching dictionary truth tables per
    batch.
-3. ▶ **A1-3** State-machine metrics `strata_state_seconds` (ARCH-22-*).
-4. ☐ **P2** Scheduler classes and admission, the hash-table family, the
-   scalar kernel library.
+3. ✅ **A1-3** State-machine metrics (ADR-0035):
+   - `stratadb_common::state`: the eight IX.22 machines as spec tables,
+     checked against the spec text by a test; `Tracker` with illegal-edge
+     detection; `strata_state_seconds`, `strata_state_entities`,
+     `strata_state_illegal_transitions_total` in `/metrics`;
+   - query and insert lifecycles in the server; WAL segment and merge-task
+     lifecycles in storage; server, table and device lifecycles (device
+     health from WAL fsync p99 windows); `/api/v1/ready` reports the state;
+   - ARCH-22-001/007/008 IMPLEMENTED, 002/003/004/006 PARTIAL, 005
+     DEFERRED.
+   ☐ Connection lifecycle (needs connection-level sessions); insert
+   `FLUSHED`; merge pause/cancel.
+4. **P2** (in order):
+   1. ✅ **P2-1** Workload classes, fair scan scheduling and admission
+      (ADR-0036):
+      - `FairQueue`: stride scheduling over CPU per class, then tenant, then
+        FIFO, with aging;
+      - the scan pool runs morsel-sized steps through it, with per-class
+        pool caps; lower-class callers lend to or yield to higher classes;
+      - server admission: per-class slots, a bounded queue with timeout and
+        position, memory and PSI gates, `TOO_MANY_QUERIES` /
+        `SERVER_OVERLOADED` refusals with `retry_after_ms`, demotion at 2×
+        the budget, AIMD on batch slots, `/admin/workload` and
+        `strata_workload_*`;
+      - SYS-11-003/004/005 IMPLEMENTED; 11-001/010 PARTIAL;
+      - report 2026-11-27-workload-classes: no overhead, and no measurable
+        latency gain in the embedded mixed benchmark.
+      ☐ Background minimum share (SYS-11-002); an HTTP mixed-load
+      benchmark; yielding in sequential scans.
+   2. ✅ **P2-2** Hash-table family, first part (ADR-0037):
+      - global `count`/`min`/`max(event_time)` answered from segment and
+        window metadata, including covering time filters and exact
+        per-segment severity counts (09-006/007 IMPLEMENTED);
+      - dense aggregation on dictionary/byte codes (09-008 IMPLEMENTED);
+      - growth reserved before allocation, and memory charged by
+        capacity (09-002 PARTIAL);
+      - EXPLAIN ANALYZE hash-table line (09-011 PARTIAL);
+      - report 2026-11-27-hash-aggregation: q14 3.43 → 0.003 ms, GROUP BY
+        severity 3.4–3.8×, high-cardinality GROUP BY 0.97–0.98×.
+      ☐ TwoLevel tables (09-003), streaming aggregation (09-009),
+      abandoning pre-aggregation (09-010), probe statistics, and
+      dictionary-encoded memtable strings.
+   3. ✅ **P2-3** String kernels and adaptive filters (ADR-0038):
+      - `memmem` LIKE (08-014) and ASCII-folding ILIKE (08-015): about 20×
+        on short rows;
+      - adaptive conjunction order (08-019): about 6× less filter cost when
+        an expensive predicate is written first;
+      - constant folding and duplicate removal (08-018 PARTIAL);
+      - lazy validity bitmaps and a no-null loop (08-011 PARTIAL);
+      - std UTF-8 validation measured at 10–46 GB/s (08-016 PARTIAL).
+      ☐ **End-to-end A/B on AC power** (the session ran on battery; the
+      kernel numbers are in-process only); expression bytecode (08-017);
+      selection bitmaps (08-005/006).
+   4. ✅ **P2-4** Snapshot catalog (ADR-0039):
+      - a lock-free published read view (`arc-swap`; 17-001);
+      - per-tenant copy-on-write segment lists (17-002 PARTIAL);
+      - `old_segments_lifetime`, default 8 min (17-004);
+      - a snapshot registry with holders, `/api/v1/admin/snapshots`,
+        retained-bytes metrics and a warning (17-005 PARTIAL);
+      - snapshot cost flat at about 0.25 µs, against linear before (17-003
+        PARTIAL).
+      ☐ Persistent maps for huge single-tenant lists; a publish-rate
+      benchmark; a `system.snapshots` SQL table.
+
+### Phase 12: P3 (in order)
+1. ✅ **P3-1** Ordered `ORDER BY event_time LIMIT` scans with early stop
+   (14-004 IMPLEMENTED, ADR-0040).
+2. ✅ **P3-2** Sharded LRU cache and plan cache (16-001 IMPLEMENTED, 16-004
+   PARTIAL), with `/api/v1/admin/caches`.
+3. ✅ **P3-3** `TCP_NODELAY` and keepalive on client connections (06-012
+   IMPLEMENTED, 06-009 PARTIAL).
+4. ✅ **P3-4** Estimated vs actual rows and a Q-error metric (12-004
+   PARTIAL).
+5. ▶ **Pending:** the end-to-end A/B on AC power with the machine otherwise
+   idle (P2-3 + P2-4 + P3).
+6. ✅ **P3-5** Decoded column cache (opt-in) with SLRU scan resistance,
+   and shared column buffers (16-002 IMPLEMENTED, ADR-0042).
+7. ✅ **StrataStudio** (ADR-0041): `apps/stratadb-studio`, a pgAdmin-style
+   UI served by `strata-studio`. Its five requested server changes are
+   done: `whoami`, `schema`, `queries`, the backup listing, and `page_size`
+   ignored for aggregates.
+8. ✅ **P3-6** Normalized-key sorts (14-001/002 IMPLEMENTED), sorted
+   segment runs with a loser-tree merge, and a shared top-k bound (14-003,
+   2.2–2.6× on top-k); exact numeric ORDER BY (ADR-0043).
+9. ◐ **P3-7** Network and estimates.
+   - ✅ The columnar JSON serializer (06-003 IMPLEMENTED, 587 MB/s per
+     core, ADR-0044).
+   - ☐ Streamed results with backpressure (06-002).
+   - ☐ A columnar native protocol (06-001, 06-004, 06-005).
+   - ☐ A cost model (12-003: NDV sketches, histograms).
+   - ☐ Granule skipping against the top-k bound for keys other than
+     `event_time`.
+10. ☐ **StrataStudio follow-up:** use `whoami` for permissions and
+    `schema` for the object browser, instead of probing and the fixed
+    column list.

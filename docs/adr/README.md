@@ -46,3 +46,13 @@ its decision; it is superseded by a new ADR. Status meanings:
 | [0032](0032-commit-wakeups-and-inflight-io.md) | One fsync per WAL; group-commit wake-up measured (parking_lot kept); per-device in-flight I/O bound | Accepted |
 | [0033](0033-columnar-memtable.md) | Columnar memtable: column chunks, published row counts, zone maps, O(1) freeze, replay into columns | Accepted |
 | [0034](0034-typed-string-columns-and-selections.md) | Typed string columns (plain/dictionary), dictionary filter and group-key kernels, selection vectors, count fast path | Accepted |
+| [0035](0035-state-machine-metrics.md) | Spec IX.22 state machines: generic tracker, `strata_state_*` metrics, spec-conformance test, device health monitor | Accepted |
+| [0044](0044-columnar-json-serializer.md) | Columnar JSON result serializer (per-column blocks, itoa/zmij, byte-identical to serde_json), encoded on the blocking pool, exact-length chunked body | Accepted |
+| [0043](0043-normalized-key-sort-and-topk-bound.md) | Normalized-key sort (radix/pdqsort over a permutation), per-segment sorted runs merged by a loser tree, shared top-k bound; exact numeric ORDER BY | Accepted |
+| [0042](0042-column-cache-and-studio-endpoints.md) | Decoded column cache with SLRU scan resistance and shared column buffers; whoami/schema/queries/backup-list endpoints for StrataStudio | Accepted |
+| [0041](0041-strata-studio.md) | StrataStudio: pgAdmin-style web UI as a separate proxying binary with an embedded no-build-step UI | Accepted |
+| [0040](0040-ordered-scans-plan-cache-network.md) | Ordered `ORDER BY event_time LIMIT` scans with early stop, sharded plan cache, TCP_NODELAY/keepalive, estimate Q-error | Accepted |
+| [0039](0039-snapshot-catalog.md) | Snapshot catalog: arc-swap published read view, per-tenant copy-on-write segment lists, old segment lifetime, snapshot registry and `/admin/snapshots` | Accepted |
+| [0038](0038-string-kernels-and-adaptive-filters.md) | SIMD substring search (memmem) and ASCII-folding ILIKE, adaptive conjunction order, constant folding, no-null string columns, std UTF-8 validation measured | Accepted |
+| [0037](0037-metadata-aggregates-and-code-aggregation.md) | Aggregates answered from source metadata, dense aggregation on dictionary/byte codes, group-table growth reserved before allocation and reported in EXPLAIN ANALYZE | Accepted |
+| [0036](0036-workload-classes-and-admission.md) | Workload classes, `FairQueue` (class/tenant/FIFO stride scheduling), morsel-stepped scan pool, admission with queue/refusals/demotion/AIMD | Accepted |

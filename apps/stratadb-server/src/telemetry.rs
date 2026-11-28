@@ -67,6 +67,20 @@ pub struct ServerMetrics {
     segments_pruned: AtomicU64,
     insert_stages: [Histogram; 4],
     query_stages: [Histogram; 5],
+    /// Q-error of the scan's row estimate (STRATA-SYS-12-004).
+    q_error: Histogram,
+}
+
+/// Buckets of the estimate Q-error (1 = exact).
+pub const Q_ERROR_BUCKETS: &[f64] = &[
+    1.0, 1.25, 1.5, 2.0, 3.0, 5.0, 10.0, 30.0, 100.0, 1000.0, 10000.0,
+];
+
+/// `max(est / actual, actual / est)`, each at least 1 (so empty scans and
+/// zero estimates stay finite).
+pub fn q_error(estimated: u64, actual: u64) -> f64 {
+    let (e, a) = (estimated.max(1) as f64, actual.max(1) as f64);
+    (e / a).max(a / e)
 }
 
 impl Default for ServerMetrics {
@@ -82,6 +96,7 @@ impl Default for ServerMetrics {
             bytes_read: AtomicU64::new(0),
             segments_scanned: AtomicU64::new(0),
             segments_pruned: AtomicU64::new(0),
+            q_error: Histogram::with_bounds(Q_ERROR_BUCKETS),
         }
     }
 }
@@ -93,6 +108,11 @@ impl ServerMetrics {
 
     pub fn query_stage(&self, s: QueryStage, d: std::time::Duration) {
         self.query_stages[s as usize].observe_duration(d);
+    }
+
+    /// Record a finished query's estimate Q-error.
+    pub fn estimate(&self, q: f64) {
+        self.q_error.observe(q);
     }
 
     /// Append `strata_insert_stage_seconds` (server stages around the
@@ -190,6 +210,13 @@ impl ServerMetrics {
                 i == 0,
             );
         }
+        self.q_error.snapshot().render(
+            out,
+            "strata_query_estimate_q_error",
+            "Q-error (max(est/actual, actual/est)) of the plan-time row estimate of query scans (STRATA-SYS-12-004).",
+            "",
+            true,
+        );
         self.query_seconds.snapshot().render(
             out,
             "stratadb_query_seconds",
@@ -236,5 +263,19 @@ impl ServerMetrics {
                 v.load(Ordering::Relaxed)
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn q_error_is_symmetric_and_finite() {
+        assert_eq!(q_error(100, 100), 1.0);
+        assert_eq!(q_error(100, 25), 4.0);
+        assert_eq!(q_error(25, 100), 4.0);
+        assert_eq!(q_error(0, 0), 1.0);
+        assert_eq!(q_error(0, 10), 10.0);
     }
 }

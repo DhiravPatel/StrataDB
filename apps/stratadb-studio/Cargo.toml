@@ -1,0 +1,40 @@
+[package]
+name = "stratadb-studio"
+description = "StrataStudio: web administration and query tool for StrataDB (proxies the HTTP API v1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "strata-studio"
+path = "src/main.rs"
+
+# No StrataDB crate is a normal dependency: the studio talks to servers only
+# over the documented HTTP API v1 (ADR-0041). Tests stand up a real server
+# in-process, hence the dev-dependencies.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync", "macros", "time"] }
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+getrandom = "0.3"
+subtle = "2.6"
+sha2 = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "display", "serde", "std"] }
+
+[dev-dependencies]
+stratadb-server = { path = "../stratadb-server" }
+stratadb-storage.workspace = true
+stratadb-common.workspace = true
+tempfile.workspace = true
+tokio = { version = "1", features = ["io-util"] }
+
+[lints]
+workspace = true

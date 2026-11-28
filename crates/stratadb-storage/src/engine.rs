@@ -28,12 +28,12 @@
 //! *failed* state: writes and flushes are refused until restart, because the
 //! durable state is no longer known. Queries remain available.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -49,7 +49,8 @@ mod backup;
 mod maintenance;
 
 pub use backup::{
-    restore_backup, verify_backup, BackupFile, BackupManifest, BackupReport, RestoreReport,
+    read_backup_manifest, restore_backup, verify_backup, BackupFile, BackupManifest, BackupReport,
+    RestoreReport,
 };
 pub use maintenance::{
     CompactionOptions, CompactionReport, IndexCheck, IndexRebuildReport, RetentionReport,
@@ -94,6 +95,16 @@ pub struct EngineOptions {
     /// Maximum remembered keys; the oldest are evicted early beyond this.
     pub idempotency_max_keys: usize,
     pub compaction: CompactionOptions,
+    /// How long an obsolete segment (replaced by compaction, retention or
+    /// an upgrade) is kept after no snapshot references it, before its file
+    /// is deleted (spec STRATA-SYS-17-004 `old_parts_lifetime`, default
+    /// 8 min): protects against filesystem caching anomalies and leaves a
+    /// window to roll back. Recovery at open deletes the manifest's obsolete
+    /// list at once.
+    pub old_segments_lifetime: Duration,
+    /// Decoded column cache size in bytes (0 = off, the spec default for
+    /// this cache; ADR-0042). Charged to `cache_memory`.
+    pub column_cache_bytes: usize,
     /// How often the background thread applies retention policies.
     pub retention_interval: Duration,
     /// Retention for tenants without an explicit policy (`None` = keep forever).
@@ -161,6 +172,8 @@ impl EngineOptions {
             idempotency_window: Duration::from_secs(24 * 3600),
             idempotency_max_keys: 100_000,
             compaction: CompactionOptions::default(),
+            old_segments_lifetime: Duration::from_secs(8 * 60),
+            column_cache_bytes: 0,
             retention_interval: Duration::from_secs(60),
             default_retention: None,
             disk_reserve_bytes: 512 * 1024 * 1024,
@@ -211,6 +224,25 @@ pub struct WriteReceipt {
     /// True when an idempotency key matched an earlier commit: nothing new
     /// was written and `commit_seq`/`accepted` describe the original commit.
     pub duplicate: bool,
+    /// Where this write's time went (insert lifecycle, spec IX.22.2).
+    pub timings: WriteTimings,
+}
+
+/// Phases of one write, in order (zero for phases that did not happen).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteTimings {
+    /// Waiting for flush backlog or ingest memory (`THROTTLED`); zero when
+    /// the write did not wait.
+    pub throttled: Duration,
+    /// Encoding the WAL record and reserving memory (`VALIDATED` until the
+    /// append starts).
+    pub encode: Duration,
+    /// Writing the WAL record (`VALIDATED` → `LOGGED`).
+    pub wal_write: Duration,
+    /// From written to durable (`LOGGED` → `DURABLE`).
+    pub durable_wait: Duration,
+    /// Publishing the rows in the memtable (`DURABLE` → `VISIBLE`).
+    pub publish: Duration,
 }
 
 /// What recovery did when the engine opened.
@@ -238,6 +270,8 @@ pub struct SegmentHandle {
     ngram: std::sync::OnceLock<Option<Charged<stratadb_segment::ngram::NgramSet>>>,
     /// Where decoded filters are accounted.
     cache: Option<Arc<stratadb_common::memory::MemoryTracker>>,
+    /// Decoded column cache shared by the engine's segments (opt-in).
+    column_cache: Option<Arc<crate::colcache::ColumnCache>>,
 }
 
 /// A decoded structure and its tracked memory (released with it).
@@ -364,6 +398,8 @@ pub struct EngineStats {
     /// in pipeline order: `admission` (backpressure wait), `wal_encode`
     /// (batch encoding), `wal_append`, `group_commit_wait`, `memtable_insert`.
     pub insert_stages: Vec<(&'static str, stratadb_common::metrics::HistogramSnapshot)>,
+    /// Decoded column cache (`None` when off).
+    pub column_cache: Option<stratadb_common::cache::CacheStats>,
 }
 
 /// A consistent, tenant-scoped read view (spec §9.4): committed segments plus
@@ -371,7 +407,11 @@ pub struct EngineStats {
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     tenant: TenantId,
-    segments: Vec<Arc<SegmentHandle>>,
+    /// The tenant's committed segments at the snapshot instant: the
+    /// published list itself (shared, O(1) to take; spec STRATA-SYS-17-001).
+    segments: Arc<Vec<Arc<SegmentHandle>>>,
+    /// Registration in the engine's snapshot registry (`system.snapshots`).
+    pin: Arc<Pin>,
     /// Memtable rows visible at the snapshot instant: chunk pointers and
     /// counts (frozen memtables first, then the active one).
     memory: Vec<MemView>,
@@ -380,6 +420,44 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn tenant(&self) -> &TenantId {
         &self.tenant
+    }
+
+    /// Attribute (`"attributes"`) and resource (`"resource"`) keys present
+    /// in this snapshot's segments, with the rows of the segments holding
+    /// each, from segment metadata only. `true` when a segment had too many
+    /// distinct keys to list (its keys are missing). Memtable rows are not
+    /// included.
+    pub fn attribute_key_rows(&self) -> (BTreeMap<(&'static str, String), u64>, bool) {
+        let mut counts = BTreeMap::new();
+        let mut truncated = false;
+        for seg in self.segments.iter() {
+            let f = seg.reader.footer();
+            for (scope, ks) in [
+                ("attributes", &f.attribute_keys),
+                ("resource", &f.resource_keys),
+            ] {
+                match ks {
+                    stratadb_segment::KeySet::Exact(set) => {
+                        for k in set {
+                            *counts.entry((scope, k.clone())).or_default() += f.row_count;
+                        }
+                    }
+                    stratadb_segment::KeySet::Overflow => truncated = true,
+                }
+            }
+        }
+        (counts, truncated)
+    }
+
+    /// Name what holds this snapshot (a query id), shown by
+    /// [`Engine::snapshots`]. The first label set wins.
+    pub fn set_holder(&self, holder: impl Into<String>) {
+        let _ = self.pin.holder.set(holder.into());
+    }
+
+    /// This snapshot's id in [`Engine::snapshots`].
+    pub fn id(&self) -> u64 {
+        self.pin.id
     }
 
     pub fn segments(&self) -> &[Arc<SegmentHandle>] {
@@ -431,7 +509,7 @@ impl Snapshot {
     /// Materialize every row, ordered by `(event_time, seq, idx)`.
     pub fn scan_all(&self) -> Result<Vec<(u64, u32, Event)>> {
         let mut out: Vec<(u64, u32, Event)> = Vec::new();
-        for s in &self.segments {
+        for s in self.segments.iter() {
             for r in s.reader.read_rows()? {
                 if r.event.tenant_id != self.tenant {
                     return Err(Error::corruption(
@@ -454,10 +532,172 @@ impl Snapshot {
 struct State {
     active: Arc<Memtable>,
     frozen: VecDeque<Arc<FrozenMemtable>>,
-    segments: Arc<Vec<Arc<SegmentHandle>>>,
-    /// Removed from the visible set; deleted once no snapshot holds them.
-    obsolete: Vec<Arc<SegmentHandle>>,
+    /// Committed segments per tenant, each list sorted by segment id. Lists
+    /// are replaced copy-on-write (`Arc::make_mut`): a publish copies only
+    /// the tenants it changes, and only while a snapshot holds the old list
+    /// (spec STRATA-SYS-17-002).
+    by_tenant: HashMap<TenantId, Arc<Vec<Arc<SegmentHandle>>>>,
+    /// Removed from the visible set at the recorded instant; deleted once no
+    /// snapshot holds them and `old_segments_lifetime` has passed.
+    obsolete: Vec<(Arc<SegmentHandle>, Instant)>,
 }
+
+impl State {
+    fn new(active: Arc<Memtable>, handles: Vec<Arc<SegmentHandle>>) -> Self {
+        let mut st = Self {
+            active,
+            frozen: VecDeque::new(),
+            by_tenant: HashMap::new(),
+            obsolete: Vec::new(),
+        };
+        st.add_segments(handles);
+        st
+    }
+
+    /// Every committed segment, sorted by id (admin and maintenance paths;
+    /// O(segments)).
+    fn all_segments(&self) -> Arc<Vec<Arc<SegmentHandle>>> {
+        let mut v: Vec<Arc<SegmentHandle>> = self
+            .by_tenant
+            .values()
+            .flat_map(|l| l.iter().cloned())
+            .collect();
+        v.sort_by_key(|s| s.entry.id);
+        Arc::new(v)
+    }
+
+    fn add_segments(&mut self, handles: impl IntoIterator<Item = Arc<SegmentHandle>>) {
+        for h in handles {
+            let list = self.by_tenant.entry(h.entry.tenant.clone()).or_default();
+            let l = Arc::make_mut(list);
+            l.push(h);
+            if l.len() > 1 && l[l.len() - 2].entry.id > l[l.len() - 1].entry.id {
+                l.sort_by_key(|s| s.entry.id);
+            }
+        }
+    }
+
+    /// The immutable view snapshots are built from.
+    fn read_view(&self) -> ReadView {
+        ReadView {
+            active: Arc::clone(&self.active),
+            frozen: self.frozen.iter().cloned().collect(),
+            by_tenant: self.by_tenant.clone(),
+        }
+    }
+}
+
+/// What snapshots are built from (spec STRATA-SYS-17-001): segments per
+/// tenant and the memtables, as one immutable object published by an atomic
+/// pointer swap after every change to segments or memtables (under the state
+/// lock, so publishes are ordered). A snapshot loads it once and never takes
+/// the state lock. Segments and memtables come from the same view, so no row
+/// is in both.
+#[derive(Debug)]
+struct ReadView {
+    active: Arc<Memtable>,
+    frozen: Vec<Arc<FrozenMemtable>>,
+    by_tenant: HashMap<TenantId, Arc<Vec<Arc<SegmentHandle>>>>,
+}
+
+/// Shards of the snapshot registry (a registration locks one shard).
+const PIN_SHARDS: usize = 16;
+
+/// The registry of live snapshots (`system.snapshots`, STRATA-SYS-17-005):
+/// weak references, removed when the snapshot (all its clones) drops.
+#[derive(Debug, Default)]
+struct Pins {
+    shards: [Mutex<Vec<Weak<Pin>>>; PIN_SHARDS],
+    next: AtomicU64,
+}
+
+/// One live snapshot.
+#[derive(Debug)]
+struct Pin {
+    id: u64,
+    tenant: TenantId,
+    created: Instant,
+    created_unix_ms: i64,
+    holder: OnceLock<String>,
+    segments: Arc<Vec<Arc<SegmentHandle>>>,
+    pins: Arc<Pins>,
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        let shard = &self.pins.shards[(self.id as usize) % PIN_SHARDS];
+        // This pin's own weak reference is dead now; drop every dead one.
+        shard.lock().retain(|w| w.strong_count() > 0);
+    }
+}
+
+impl Pins {
+    fn register(
+        self: &Arc<Self>,
+        tenant: &TenantId,
+        segments: Arc<Vec<Arc<SegmentHandle>>>,
+    ) -> Arc<Pin> {
+        let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        let pin = Arc::new(Pin {
+            id,
+            tenant: tenant.clone(),
+            created: Instant::now(),
+            created_unix_ms: time::now_unix_millis(),
+            holder: OnceLock::new(),
+            segments,
+            pins: Arc::clone(self),
+        });
+        self.shards[(id as usize) % PIN_SHARDS]
+            .lock()
+            .push(Arc::downgrade(&pin));
+        pin
+    }
+
+    fn live(&self) -> Vec<Arc<Pin>> {
+        self.shards
+            .iter()
+            .flat_map(|s| {
+                s.lock()
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+}
+
+/// One open snapshot in [`Engine::snapshots`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SnapshotInfo {
+    pub id: u64,
+    pub tenant: String,
+    pub created_unix_ms: i64,
+    pub age_ms: u64,
+    /// What holds it (a query id), when the holder said.
+    pub holder: Option<String>,
+    pub segments: usize,
+    /// Obsolete segments only this snapshot (or others like it) keeps alive.
+    pub obsolete_segments_pinned: usize,
+    pub obsolete_bytes_pinned: u64,
+}
+
+/// [`Engine::snapshots`] (spec STRATA-SYS-17-005).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SnapshotReport {
+    pub open: Vec<SnapshotInfo>,
+    /// Segments removed from the visible set whose files still exist
+    /// (pinned by a snapshot or within `old_segments_lifetime`).
+    pub obsolete_segments: usize,
+    pub obsolete_bytes: u64,
+    pub disk_total_bytes: u64,
+    /// `obsolete_bytes / disk_total_bytes`.
+    pub obsolete_ratio: f64,
+    /// True above 10% of the disk (the server logs a warning).
+    pub warn: bool,
+}
+
+/// Retained obsolete bytes above this share of the disk are warned about.
+pub const RETAINED_WARN_RATIO: f64 = 0.10;
 
 #[derive(Debug, Default)]
 struct Counters {
@@ -494,6 +734,12 @@ struct Shared {
     wal: Wal,
     write_gate: RwLock<()>,
     state: Mutex<State>,
+    /// Published read view (lock-free snapshots).
+    view: arc_swap::ArcSwap<ReadView>,
+    /// Decoded column cache (`None` when `column_cache_bytes` is 0).
+    column_cache: Option<Arc<crate::colcache::ColumnCache>>,
+    /// Live snapshots.
+    pins: Arc<Pins>,
     /// Current durable manifest; its mutex also serializes flushes.
     manifest: Mutex<Manifest>,
     failed: Mutex<Option<String>>,
@@ -650,6 +896,7 @@ fn open_segment(
         bloom: std::sync::OnceLock::new(),
         ngram: std::sync::OnceLock::new(),
         cache: None,
+        column_cache: None,
     })
 }
 
@@ -658,9 +905,15 @@ impl SegmentHandle {
     pub(crate) fn tracked(
         mut self,
         cache: Option<&Arc<stratadb_common::memory::MemoryTracker>>,
+        column_cache: Option<&Arc<crate::colcache::ColumnCache>>,
     ) -> Self {
         self.cache = cache.cloned();
+        self.column_cache = column_cache.cloned();
         self
+    }
+
+    pub(crate) fn column_cache(&self) -> Option<&crate::colcache::ColumnCache> {
+        self.column_cache.as_deref()
     }
 }
 
@@ -795,6 +1048,13 @@ impl Engine {
                 fsutil::fsync_dir(&tdir)?;
             }
         }
+        // Decoded column cache (opt-in), charged to the cache region.
+        let column_cache = (opts.column_cache_bytes > 0).then(|| {
+            Arc::new(crate::colcache::ColumnCache::new(
+                opts.column_cache_bytes,
+                opts.cache_memory.clone(),
+            ))
+        });
         let mut handles = Vec::with_capacity(manifest.segments.len());
         for entry in &manifest.segments {
             handles.push(Arc::new(
@@ -805,7 +1065,7 @@ impl Engine {
                     k,
                     &opts.io_engine(),
                 )?
-                .tracked(opts.cache_memory.as_ref()),
+                .tracked(opts.cache_memory.as_ref(), column_cache.as_ref()),
             ));
         }
         report.segments = handles.len();
@@ -889,16 +1149,15 @@ impl Engine {
             "storage engine opened"
         );
 
+        let initial = State::new(active, handles);
         let shared = Arc::new(Shared {
             dir: dir.clone(),
             wal,
             write_gate: RwLock::new(()),
-            state: Mutex::new(State {
-                active,
-                frozen: VecDeque::new(),
-                segments: Arc::new(handles),
-                obsolete: Vec::new(),
-            }),
+            view: arc_swap::ArcSwap::from_pointee(initial.read_view()),
+            column_cache: column_cache.clone(),
+            state: Mutex::new(initial),
+            pins: Arc::new(Pins::default()),
             manifest: Mutex::new(manifest),
             failed: Mutex::new(None),
             stall_cv: Condvar::new(),
@@ -1035,7 +1294,7 @@ impl Engine {
     pub fn tenant_usage(&self, tenant: &TenantId) -> TenantUsage {
         let st = self.shared.state.lock();
         let mut u = TenantUsage::default();
-        for s in st.segments.iter().filter(|s| &s.entry.tenant == tenant) {
+        for s in st.by_tenant.get(tenant).into_iter().flat_map(|l| l.iter()) {
             u.segment_bytes += s.entry.file_bytes;
             u.segment_rows += s.entry.row_count;
             u.segments += 1;
@@ -1053,6 +1312,12 @@ impl Engine {
         self.shared.snapshot(tenant)
     }
 
+    /// Open snapshots with their holders, and the obsolete segment bytes
+    /// retained on disk (spec STRATA-SYS-17-005, `system.snapshots`).
+    pub fn snapshots(&self) -> SnapshotReport {
+        self.shared.snapshots()
+    }
+
     pub fn stats(&self) -> EngineStats {
         self.shared.stats()
     }
@@ -1067,9 +1332,22 @@ impl Engine {
         self.shared.failed.lock().clone()
     }
 
+    /// True while free disk space is below the configured reserve, i.e. new
+    /// writes are refused until space is freed (spec IX.22.6 `READ_ONLY`).
+    /// Does not count as a rejection.
+    pub fn disk_below_reserve(&self) -> bool {
+        let sh = &self.shared;
+        let (free, total) = sh.disk_space();
+        let reserve = sh
+            .opts
+            .disk_reserve_bytes
+            .max((total as f64 * sh.opts.disk_reserve_ratio) as u64);
+        free < reserve
+    }
+
     /// Verify every committed segment fully (all checksums and statistics).
     pub fn verify(&self) -> Result<usize> {
-        let segs = Arc::clone(&self.shared.state.lock().segments);
+        let segs = self.shared.state.lock().all_segments();
         for s in segs.iter() {
             s.reader.verify()?;
         }
@@ -1238,11 +1516,14 @@ impl Shared {
     /// Reserve `bytes` of ingest memory. When the region is full, ask for a
     /// flush (which releases memtable memory) and wait up to the stall
     /// timeout. Returns the bytes reserved (0 without a tracker).
-    fn reserve_ingest(&self, bytes: u64) -> Result<u64> {
+    /// Reserve ingest memory; the flag is true when the write had to wait.
+    fn reserve_ingest(&self, bytes: u64) -> Result<(u64, bool)> {
         let Some(t) = &self.ingest.tracker else {
-            return Ok(0);
+            return Ok((0, false));
         };
+        let mut waited = false;
         if t.try_reserve(bytes).is_err() {
+            waited = true;
             self.counters.stalls.fetch_add(1, Ordering::Relaxed);
             self.request_flush();
             if let Err(e) = t.reserve_wait(bytes, self.opts.write_stall_timeout) {
@@ -1254,7 +1535,7 @@ impl Shared {
             }
         }
         self.ingest.add(bytes);
-        Ok(bytes)
+        Ok((bytes, waited))
     }
 
     fn active_over_threshold(&self, active: &Memtable) -> bool {
@@ -1286,10 +1567,12 @@ impl Shared {
 
         // Backpressure (spec §7.4): bounded frozen backlog.
         let admitted = Instant::now();
+        let mut stalled = false;
         {
             let mut st = self.state.lock();
             if st.frozen.len() >= self.opts.max_frozen_memtables {
                 self.counters.stalls.fetch_add(1, Ordering::Relaxed);
+                stalled = true;
                 drop(st);
                 self.request_flush();
                 st = self.state.lock();
@@ -1307,7 +1590,10 @@ impl Shared {
             }
         }
 
-        self.stage_admission.observe_duration(admitted.elapsed());
+        // Time throttled (spec IX.22.2 `THROTTLED`): only real waits count.
+        let admission = admitted.elapsed();
+        self.stage_admission.observe_duration(admission);
+        let mut throttled = if stalled { admission } else { Duration::ZERO };
         let n = events.len();
         let level = match self.opts.wal.durability {
             Durability::Async => CommitLevel::WalWritten,
@@ -1322,6 +1608,10 @@ impl Shared {
                     accepted: m.accepted as usize,
                     level,
                     duplicate: true,
+                    timings: WriteTimings {
+                        throttled,
+                        ..WriteTimings::default()
+                    },
                 });
             }
         }
@@ -1354,11 +1644,19 @@ impl Shared {
             (None, true) => (RecordType::ColumnarEventBatch, batch),
             (None, false) => (RecordType::EventBatch, batch),
         };
-        self.stage_encode.observe_duration(encoding.elapsed());
+        let encode = encoding.elapsed();
+        self.stage_encode.observe_duration(encode);
         // Ingest memory (spec VIII.5.2): reserved before the WAL append, so a
         // write is refused before it is durable, never after.
+        let reserving = Instant::now();
         let reserved = match self.reserve_ingest(crate::memtable::batch_bytes(&events) as u64) {
-            Ok(b) => b,
+            Ok((b, waited)) => {
+                // A wait for ingest memory is throttling too.
+                if waited {
+                    throttled += reserving.elapsed();
+                }
+                b
+            }
             Err(e) => {
                 if let Some(k) = &key {
                     self.dedup.lock().abort(tenant, k);
@@ -1370,7 +1668,7 @@ impl Shared {
         if committed.is_err() {
             self.ingest.release(reserved);
         }
-        let (seq, active, meta) = match committed {
+        let (appended, active, meta, publish) = match committed {
             Ok(v) => v,
             Err(e) => {
                 if let Some(k) = &key {
@@ -1388,10 +1686,17 @@ impl Shared {
             self.request_flush();
         }
         Ok(WriteReceipt {
-            commit_seq: seq,
+            commit_seq: appended.seq,
             accepted: n,
             level,
             duplicate: false,
+            timings: WriteTimings {
+                throttled,
+                encode,
+                wal_write: appended.write,
+                durable_wait: appended.durable_wait,
+                publish,
+            },
         })
     }
 
@@ -1404,12 +1709,18 @@ impl Shared {
         n: usize,
         key: Option<&IdempotencyKey>,
         now_ms: i64,
-    ) -> Result<(u64, Arc<Memtable>, Option<BatchMeta>)> {
+    ) -> Result<(
+        stratadb_wal::Appended,
+        Arc<Memtable>,
+        Option<BatchMeta>,
+        Duration,
+    )> {
         let _gate = self.write_gate.read();
-        let seq = self
+        let appended = self
             .wal
-            .append(rtype, payload)
+            .append_timed(rtype, payload)
             .inspect_err(|e| self.fail(e))?;
+        let seq = appended.seq;
         if let Err(e) = failpoint::hit("engine::after_wal_commit") {
             let e = Error::indeterminate(e.to_string());
             self.fail(&e);
@@ -1432,8 +1743,9 @@ impl Shared {
             self.fail(&e);
             return Err(e);
         }
-        self.stage_memtable.observe_duration(inserting.elapsed());
-        Ok((seq, active, meta))
+        let publish = inserting.elapsed();
+        self.stage_memtable.observe_duration(publish);
+        Ok((appended, active, meta, publish))
     }
 
     /// Freeze the active memtable if non-empty.
@@ -1452,6 +1764,7 @@ impl Shared {
         let old = std::mem::replace(&mut st.active, Arc::new(Memtable::new()));
         st.frozen
             .push_back(Arc::new(FrozenMemtable::new(old, through)));
+        self.publish(&st);
         drop(st);
         failpoint::hit("flush::after_freeze")
     }
@@ -1556,7 +1869,7 @@ impl Shared {
                     self.keys.as_deref(),
                     &self.opts.io_engine(),
                 )?
-                .tracked(self.opts.cache_memory.as_ref());
+                .tracked(self.opts.cache_memory.as_ref(), self.column_cache.as_ref());
                 report.bytes_written += ws.file_bytes;
                 handles.push(Arc::new(handle));
             }
@@ -1604,9 +1917,8 @@ impl Shared {
                     ))
                 }
             }
-            let mut segs: Vec<Arc<SegmentHandle>> = st.segments.iter().cloned().collect();
-            segs.extend(handles.iter().cloned());
-            st.segments = Arc::new(segs);
+            st.add_segments(handles.iter().cloned());
+            self.publish(&st);
         }
         self.stall_cv.notify_all();
         report.memtables_flushed += 1;
@@ -1622,25 +1934,81 @@ impl Shared {
         Ok(())
     }
 
+    /// Publish the read view of `st` (called with the state lock held after
+    /// every change to segments or memtables).
+    fn publish(&self, st: &State) {
+        self.view.store(Arc::new(st.read_view()));
+    }
+
     fn snapshot(&self, tenant: &TenantId) -> Snapshot {
-        let st = self.state.lock();
-        let segments = st
-            .segments
-            .iter()
-            .filter(|s| &s.entry.tenant == tenant)
-            .cloned()
-            .collect();
+        // One atomic load; no state lock (spec STRATA-SYS-17-001).
+        let view = self.view.load();
+        let segments = view.by_tenant.get(tenant).cloned().unwrap_or_default();
         // O(chunks): views copy chunk pointers and a published count.
-        let memory = st
+        let memory = view
             .frozen
             .iter()
             .filter_map(|f| f.view(tenant))
-            .chain(st.active.view(tenant))
+            .chain(view.active.view(tenant))
             .collect();
+        drop(view);
+        let pin = self.pins.register(tenant, Arc::clone(&segments));
         Snapshot {
             tenant: tenant.clone(),
             segments,
+            pin,
             memory,
+        }
+    }
+
+    fn snapshots(&self) -> SnapshotReport {
+        let (obsolete_ids, obsolete_bytes, obsolete_segments): (HashMap<u64, u64>, u64, usize) = {
+            let st = self.state.lock();
+            let ids: HashMap<u64, u64> = st
+                .obsolete
+                .iter()
+                .map(|(h, _)| (h.entry.id, h.entry.file_bytes))
+                .collect();
+            let bytes = ids.values().sum();
+            let n = ids.len();
+            (ids, bytes, n)
+        };
+        let mut open: Vec<SnapshotInfo> = self
+            .pins
+            .live()
+            .into_iter()
+            .map(|p| {
+                let pinned: Vec<u64> = p
+                    .segments
+                    .iter()
+                    .filter_map(|s| obsolete_ids.get(&s.entry.id).copied())
+                    .collect();
+                SnapshotInfo {
+                    id: p.id,
+                    tenant: p.tenant.as_str().to_owned(),
+                    created_unix_ms: p.created_unix_ms,
+                    age_ms: u64::try_from(p.created.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    holder: p.holder.get().cloned(),
+                    segments: p.segments.len(),
+                    obsolete_segments_pinned: pinned.len(),
+                    obsolete_bytes_pinned: pinned.iter().sum(),
+                }
+            })
+            .collect();
+        open.sort_by_key(|s| std::cmp::Reverse(s.age_ms));
+        let (_, total) = self.disk_space();
+        let ratio = if total == 0 || total == u64::MAX {
+            0.0
+        } else {
+            obsolete_bytes as f64 / total as f64
+        };
+        SnapshotReport {
+            open,
+            obsolete_segments,
+            obsolete_bytes,
+            disk_total_bytes: total,
+            obsolete_ratio: ratio,
+            warn: ratio > RETAINED_WARN_RATIO,
         }
     }
 
@@ -1652,7 +2020,7 @@ impl Shared {
                 st.active.rows(),
                 st.active.bytes(),
                 st.frozen.len(),
-                Arc::clone(&st.segments),
+                st.all_segments(),
             )
         };
         let (manifest_version, flushed_through_seq) = {
@@ -1702,6 +2070,7 @@ impl Shared {
                 ("group_commit_wait", wal_metrics.commit_wait_seconds),
                 ("memtable_insert", self.stage_memtable.snapshot()),
             ],
+            column_cache: self.column_cache.as_ref().map(|c| c.stats()),
         }
     }
 }

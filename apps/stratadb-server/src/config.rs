@@ -35,10 +35,22 @@
 //! wal_segment_max_bytes = 67108864
 //! disk_reserve_bytes = 536870912
 //! disk_reserve_ratio = 0.02
+//! old_segments_lifetime_s = 480        # keep replaced segments this long after their last reader
 //! default_retention_days = 30          # omit to keep data indefinitely
 //! bloom_attribute_keys = ["request_id", "user_id", "session_id", "correlation_id"]
 //! ngram_index = true                   # trigram filters on body for LIKE/ILIKE
 //! ngram_attribute_keys = []            # string attributes to index the same way
+//!
+//! [workload]                           # query classes and admission (spec VIII.11)
+//! interactive_slots = 16    # default: limits.max_concurrent_queries
+//! normal_slots = 12         # default: 3/4 of it
+//! batch_slots = 4           # default: 1/4 of it (the AIMD controller adapts it)
+//! queue_max = 64            # queries waiting for a slot
+//! queue_timeout_ms = 5000
+//! interactive_ms = 100      # estimated CPU below this: interactive
+//! batch_ms = 10000          # estimated CPU at or above this: batch
+//! latency_target_ms = 250   # interactive p95 target of the controller
+//! tenant_classes = { reports = "batch" }
 //!
 //! [backup]
 //! dir = "/var/backups/stratadb"        # enables POST /api/v1/admin/backup
@@ -86,6 +98,41 @@ pub struct FileConfig {
     pub observability: ObservabilitySection,
     #[serde(default)]
     pub memory: MemorySection,
+    #[serde(default)]
+    pub workload: WorkloadSection,
+}
+
+/// `[workload]` — query classes, slots and admission (spec VIII.11).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadSection {
+    /// Slots per class, each also bounded by `limits.max_concurrent_queries`
+    /// (defaults: all of it, 3/4 of it, 1/4 of it).
+    pub interactive_slots: Option<usize>,
+    pub normal_slots: Option<usize>,
+    pub batch_slots: Option<usize>,
+    /// The AIMD controller never takes batch slots below this (default 1).
+    pub batch_slots_min: Option<usize>,
+    /// Queries waiting for a slot, all classes (default 64).
+    pub queue_max: Option<usize>,
+    /// Longest wait for a slot (default 5000; also bounded by the query
+    /// timeout).
+    pub queue_timeout_ms: Option<u64>,
+    /// Estimated CPU below this is `interactive` (default 100).
+    pub interactive_ms: Option<f64>,
+    /// Estimated CPU at or above this is `batch` (default 10000).
+    pub batch_ms: Option<f64>,
+    /// Interactive p95 target of the batch-slot controller (default 250).
+    pub latency_target_ms: Option<u64>,
+    /// Controller interval (default 1000).
+    pub controller_interval_ms: Option<u64>,
+    /// Fair-queue aging interval (default 500).
+    pub aging_ms: Option<u64>,
+    /// Free query-pool memory needed to admit a query (default 1 MiB).
+    pub memory_floor_bytes: Option<u64>,
+    /// Operator-assigned class per tenant (`interactive`, `normal`, `batch`).
+    #[serde(default)]
+    pub tenant_classes: std::collections::BTreeMap<String, String>,
 }
 
 /// `[memory]` — budget and regions (spec VIII.5.2, `memory.*` settings).
@@ -172,6 +219,9 @@ pub struct LimitsSection {
     pub max_decompressed_bytes: Option<usize>,
     pub max_concurrent_ingest: Option<usize>,
     pub max_concurrent_queries: Option<usize>,
+    /// Plan cache bounds (0 disables; defaults 10000 entries, 64 MiB).
+    pub plan_cache_entries: Option<usize>,
+    pub plan_cache_bytes: Option<usize>,
     pub max_query_timeout_ms: Option<u64>,
     pub max_query_rows: Option<usize>,
     /// Threads of the shared scan worker pool (1..=256; default: logical CPUs).
@@ -190,6 +240,12 @@ pub struct StorageSection {
     pub wal_segment_max_bytes: Option<u64>,
     pub disk_reserve_bytes: Option<u64>,
     pub disk_reserve_ratio: Option<f64>,
+    /// Seconds an obsolete segment is kept after its last reference
+    /// (0..=86400; default 480, spec `old_parts_lifetime`).
+    pub old_segments_lifetime_s: Option<u64>,
+    /// Decoded column cache bytes (default 0 = off; at most the memory
+    /// plan's cache region).
+    pub column_cache_bytes: Option<usize>,
     pub default_retention_days: Option<u64>,
     pub bloom_attribute_keys: Option<Vec<String>>,
     pub ngram_index: Option<bool>,
@@ -381,6 +437,22 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
     if let Some(v) = positive("limits.max_concurrent_queries", l.max_concurrent_queries)? {
         server.max_concurrent_queries = v;
     }
+    if let Some(v) = l.plan_cache_entries {
+        if v > 1_000_000 {
+            return Err(Error::invalid_input(
+                "limits.plan_cache_entries must be at most 1000000",
+            ));
+        }
+        server.plan_cache_entries = v;
+    }
+    if let Some(v) = l.plan_cache_bytes {
+        if v > 4 << 30 {
+            return Err(Error::invalid_input(
+                "limits.plan_cache_bytes must be at most 4 GiB",
+            ));
+        }
+        server.plan_cache_bytes = v;
+    }
     if let Some(v) = positive("limits.max_query_timeout_ms", l.max_query_timeout_ms)? {
         server.max_query_timeout = Duration::from_millis(v);
     }
@@ -441,6 +513,50 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
             },
         );
     }
+
+    let w = &file.workload;
+    let ws = &mut server.workload;
+    ws.interactive_slots = positive("workload.interactive_slots", w.interactive_slots)?;
+    ws.normal_slots = positive("workload.normal_slots", w.normal_slots)?;
+    ws.batch_slots = positive("workload.batch_slots", w.batch_slots)?;
+    if let Some(v) = w.batch_slots_min {
+        ws.batch_slots_min = v;
+    }
+    if let Some(v) = w.queue_max {
+        ws.queue_max = v;
+    }
+    if let Some(v) = w.queue_timeout_ms {
+        ws.queue_timeout = Duration::from_millis(v);
+    }
+    if let Some(v) = w.interactive_ms {
+        ws.classifier.interactive_ms = v;
+    }
+    if let Some(v) = w.batch_ms {
+        ws.classifier.batch_ms = v;
+    }
+    if let Some(v) = w.latency_target_ms {
+        ws.latency_target = Duration::from_millis(v);
+    }
+    if let Some(v) = w.controller_interval_ms {
+        ws.controller_interval = Duration::from_millis(v);
+    }
+    if let Some(v) = w.aging_ms {
+        ws.aging = Duration::from_millis(v);
+    }
+    if let Some(v) = w.memory_floor_bytes {
+        ws.memory_floor_bytes = v;
+    }
+    for (t, c) in &w.tenant_classes {
+        stratadb_common::TenantId::new(t.clone())
+            .map_err(|e| Error::invalid_input(format!("workload.tenant_classes.{t}: {e}")))?;
+        let class = stratadb_common::workload::WorkClass::parse(c).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "workload.tenant_classes.{t}: unknown class {c:?} (interactive, normal, batch)"
+            ))
+        })?;
+        ws.tenant_classes.insert(t.clone(), class);
+    }
+    ws.validate()?;
 
     let s = &file.storage;
     let mut engine = EngineOptions::new(&data_dir);
@@ -513,6 +629,22 @@ pub fn resolve(file: &FileConfig, o: &Overrides) -> Result<Resolved> {
             ));
         }
         engine.disk_reserve_ratio = r;
+    }
+    if let Some(secs) = s.old_segments_lifetime_s {
+        if secs > 86_400 {
+            return Err(Error::invalid_input(
+                "storage.old_segments_lifetime_s must be at most 86400",
+            ));
+        }
+        engine.old_segments_lifetime = Duration::from_secs(secs);
+    }
+    if let Some(b) = s.column_cache_bytes {
+        if b > 1 << 40 {
+            return Err(Error::invalid_input(
+                "storage.column_cache_bytes must be at most 1 TiB",
+            ));
+        }
+        engine.column_cache_bytes = b;
     }
     let days = positive(
         "storage.default_retention_days",
@@ -625,6 +757,8 @@ impl Resolved {
                 "max_decompressed_bytes": self.server.max_decompressed_bytes,
                 "max_concurrent_ingest": self.server.max_concurrent_ingest,
                 "max_concurrent_queries": self.server.max_concurrent_queries,
+                "plan_cache_entries": self.server.plan_cache_entries,
+                "plan_cache_bytes": self.server.plan_cache_bytes,
                 "max_query_timeout_ms": self.server.max_query_timeout.as_millis() as u64,
                 "max_query_rows": self.server.max_query_rows,
                 "scan_threads": self.threads.scan,
@@ -642,6 +776,8 @@ impl Resolved {
                 "wal_segment_max_bytes": self.engine.wal.segment_max_bytes,
                 "disk_reserve_bytes": self.engine.disk_reserve_bytes,
                 "disk_reserve_ratio": self.engine.disk_reserve_ratio,
+                "old_segments_lifetime_s": self.engine.old_segments_lifetime.as_secs(),
+                "column_cache_bytes": self.engine.column_cache_bytes,
                 "default_retention_days": self.engine.default_retention.map(|d| d.as_secs() / 86_400),
                 "bloom_attribute_keys": self.engine.bloom_attribute_keys,
                 "ngram_index": self.engine.ngram_enabled,
@@ -668,6 +804,23 @@ impl Resolved {
             "quotas": {
                 "default": format!("{:?}", self.server.quotas.default),
                 "tenants": self.server.quotas.tenants.iter().map(|(k, v)| (k.clone(), format!("{v:?}"))).collect::<std::collections::BTreeMap<_, _>>(),
+            },
+            "workload": {
+                "slots": {
+                    "interactive": self.server.workload.slots(self.server.max_concurrent_queries)[stratadb_common::workload::WorkClass::Interactive.index()],
+                    "normal": self.server.workload.slots(self.server.max_concurrent_queries)[stratadb_common::workload::WorkClass::Normal.index()],
+                    "batch": self.server.workload.slots(self.server.max_concurrent_queries)[stratadb_common::workload::WorkClass::Batch.index()],
+                },
+                "batch_slots_min": self.server.workload.batch_slots_min,
+                "queue_max": self.server.workload.queue_max,
+                "queue_timeout_ms": self.server.workload.queue_timeout.as_millis() as u64,
+                "interactive_ms": self.server.workload.classifier.interactive_ms,
+                "batch_ms": self.server.workload.classifier.batch_ms,
+                "latency_target_ms": self.server.workload.latency_target.as_millis() as u64,
+                "controller_interval_ms": self.server.workload.controller_interval.as_millis() as u64,
+                "aging_ms": self.server.workload.aging.as_millis() as u64,
+                "memory_floor_bytes": self.server.workload.memory_floor_bytes,
+                "tenant_classes": self.server.workload.tenant_classes.iter().map(|(k, v)| (k.clone(), v.name())).collect::<std::collections::BTreeMap<_, _>>(),
             },
             "restart_required_for_changes": true,
         })

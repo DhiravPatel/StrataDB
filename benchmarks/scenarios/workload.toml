@@ -1,0 +1,137 @@
+# Workload classes (spec VIII.11, STRATA-SYS-11-001): latency of small
+# interactive queries (open loop) alone and next to a batch flood of
+# scan-heavy queries: 8 closed-loop clients (no admission bound, the
+# embedded worst case) and 3 clients (about what batch slots admit: a
+# quarter of max_concurrent_queries = 12). "unclassed" runs both in the
+# same class (one FIFO-per-tenant queue, the behaviour before classes);
+# "classed" runs them as interactive vs batch, so the scan pool's weighted
+# fair queue serves interactive morsels first (weights 8:1) and batch may
+# fill only half of the pool. Pairs alternate to spread drift. Run in the
+# foreground (efficiency-core pitfall).
+name = "workload"
+description = "Interactive queries alone and beside a batch flood, unclassed vs classed (spec VIII.11)"
+
+[dataset]
+profile = "app-logs"
+events = 400000
+tenants = 4
+seed = 1
+batch_size = 1000
+flush_every = 25000
+
+[engine]
+durability = "group_commit"
+
+[run]
+warmup = 2
+repetitions = 10
+
+[[query]]
+id = "q04_service_severity"
+sql = "SELECT count(*) FROM logs WHERE service = 'auth' AND severity = 'WARN'"
+
+[[query]]
+id = "q09_service_time_bucket"
+sql = "SELECT service, time_bucket(INTERVAL '1 minute', event_time) AS b, count(*) FROM logs GROUP BY service, time_bucket(INTERVAL '1 minute', event_time)"
+
+[[query]]
+id = "q06_message_token_search"
+sql = "SELECT count(*) FROM logs WHERE body LIKE '%TIMEOUT%'"
+
+[[load]]
+id = "interactive_alone"
+kind = "query"
+mode = "open"
+rate_per_s = 100
+duration_s = 6
+workers = 8
+query = "q09_service_time_bucket"
+class = "interactive"
+
+[[load]]
+id = "vs_batch_unclassed_1"
+kind = "query"
+mode = "open"
+rate_per_s = 100
+duration_s = 6
+workers = 8
+query = "q09_service_time_bucket"
+class = "normal"
+alongside = { query = "q06_message_token_search", workers = 8, class = "normal" }
+
+[[load]]
+id = "vs_batch_classed_1"
+kind = "query"
+mode = "open"
+rate_per_s = 100
+duration_s = 6
+workers = 8
+query = "q09_service_time_bucket"
+class = "interactive"
+alongside = { query = "q06_message_token_search", workers = 8, class = "batch" }
+
+[[load]]
+id = "vs_batch_classed_2"
+kind = "query"
+mode = "open"
+rate_per_s = 100
+duration_s = 6
+workers = 8
+query = "q09_service_time_bucket"
+class = "interactive"
+alongside = { query = "q06_message_token_search", workers = 8, class = "batch" }
+
+[[load]]
+id = "vs_batch_unclassed_2"
+kind = "query"
+mode = "open"
+rate_per_s = 100
+duration_s = 6
+workers = 8
+query = "q09_service_time_bucket"
+class = "normal"
+alongside = { query = "q06_message_token_search", workers = 8, class = "normal" }
+
+[[load]]
+id = "vs_batch3_unclassed_1"
+kind = "query"
+mode = "open"
+rate_per_s = 100
+duration_s = 6
+workers = 8
+query = "q09_service_time_bucket"
+class = "normal"
+alongside = { query = "q06_message_token_search", workers = 3, class = "normal" }
+
+[[load]]
+id = "vs_batch3_classed_1"
+kind = "query"
+mode = "open"
+rate_per_s = 100
+duration_s = 6
+workers = 8
+query = "q09_service_time_bucket"
+class = "interactive"
+alongside = { query = "q06_message_token_search", workers = 3, class = "batch" }
+
+[[load]]
+id = "vs_batch3_classed_2"
+kind = "query"
+mode = "open"
+rate_per_s = 100
+duration_s = 6
+workers = 8
+query = "q09_service_time_bucket"
+class = "interactive"
+alongside = { query = "q06_message_token_search", workers = 3, class = "batch" }
+
+[[load]]
+id = "vs_batch3_unclassed_2"
+kind = "query"
+mode = "open"
+rate_per_s = 100
+duration_s = 6
+workers = 8
+query = "q09_service_time_bucket"
+class = "normal"
+alongside = { query = "q06_message_token_search", workers = 3, class = "normal" }

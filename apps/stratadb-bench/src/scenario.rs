@@ -105,6 +105,9 @@ pub struct EngineCfg {
     /// payloads; for A/B).
     #[serde(default = "wal_v3")]
     pub wal_format_version: u16,
+    /// Decoded column cache bytes (0 = off, the engine default).
+    #[serde(default)]
+    pub column_cache_bytes: usize,
 }
 
 fn wal_v3() -> u16 {
@@ -187,6 +190,22 @@ pub struct LoadSpec {
     pub batch_size: Option<usize>,
     /// `id` of a `[[query]]` (kind = query).
     pub query: Option<String>,
+    /// Work class of the load's queries (`interactive`, `normal`, `batch`;
+    /// default `normal`), as the scan pool schedules them (spec VIII.11).
+    pub class: Option<String>,
+    /// A closed-loop query load run at the same time as interference (it
+    /// starts 300 ms earlier and ends with this load).
+    pub alongside: Option<AlongsideSpec>,
+}
+
+/// Interference for a load (see [`LoadSpec::alongside`]).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlongsideSpec {
+    /// `id` of a `[[query]]`.
+    pub query: String,
+    pub workers: usize,
+    pub class: Option<String>,
 }
 
 impl Scenario {
@@ -264,6 +283,31 @@ impl Scenario {
             {
                 return bad(format!("load {}: query must name a [[query]] id", l.id));
             }
+            let class_ok = |c: &Option<String>| {
+                c.as_deref().is_none_or(|c| {
+                    stratadb_common::workload::WorkClass::parse(c)
+                        .is_some_and(|c| stratadb_common::workload::WorkClass::QUERY.contains(&c))
+                })
+            };
+            if !class_ok(&l.class) {
+                return bad(format!(
+                    "load {}: class must be interactive, normal or batch",
+                    l.id
+                ));
+            }
+            if let Some(a) = &l.alongside {
+                if l.kind != "query"
+                    || !self.query.iter().any(|x| x.id == a.query)
+                    || a.workers == 0
+                    || a.workers > 256
+                    || !class_ok(&a.class)
+                {
+                    return bad(format!(
+                        "load {}: alongside needs a query load, a [[query]] id, workers in 1..=256 and a query class",
+                        l.id
+                    ));
+                }
+            }
             if l.mode == "open" {
                 let n = l.rate_per_s.unwrap_or(0.0) * l.duration_s;
                 if n > 1_000_000.0 {
@@ -330,6 +374,11 @@ const STAT_KEYS: &[&str] = &[
     "memory_chunks_pruned",
     "early_stop",
     "scan_workers",
+    "sources_from_metadata",
+    "dense_group_batches",
+    "column_cache_hits",
+    "sort_runs_merged",
+    "topk_rows_skipped",
 ];
 
 fn stat(s: &QueryStats, result_rows: usize, key: &str) -> f64 {
@@ -357,6 +406,11 @@ fn stat(s: &QueryStats, result_rows: usize, key: &str) -> f64 {
         "memory_chunks_pruned" => s.memory_chunks_pruned,
         "early_stop" => u64::from(s.early_stop),
         "scan_workers" => s.scan_workers as u64,
+        "sources_from_metadata" => s.sources_from_metadata,
+        "dense_group_batches" => s.dense_group_batches,
+        "column_cache_hits" => s.column_cache_hits,
+        "sort_runs_merged" => s.sort_runs_merged,
+        "topk_rows_skipped" => s.topk_rows_skipped,
         _ => 0,
     }) as f64
 }
@@ -537,6 +591,7 @@ pub fn run(text: &str, out_dir: &Path, hw_profile: &str, data_dir: Option<PathBu
     opts.wal.durability = durability(&sc.engine);
     opts.wal.adaptive_group_delay = sc.engine.adaptive_group_delay;
     opts.wal.format_version = sc.engine.wal_format_version;
+    opts.column_cache_bytes = sc.engine.column_cache_bytes;
     opts.bloom_enabled = sc.engine.bloom;
     opts.ngram_enabled = sc.engine.ngram;
     opts.segment_compression = sc.engine.compression;
@@ -849,17 +904,51 @@ fn run_load(
             })
         }
         _ => {
-            let id = l.query.as_deref().unwrap_or_default();
-            let (tenant, sql) = sqls
-                .get(id)
-                .cloned()
-                .ok_or_else(|| Error::invalid_input(format!("unknown query {id}")))?;
-            let work = |_: usize| execute(&engine.snapshot(&tenant), &sql, qopts).map(|_| ());
-            Ok(if l.mode == "open" {
-                run_open(l.rate_per_s.unwrap_or(1.0), n, l.workers, work)
+            let lookup = |id: &str| {
+                sqls.get(id)
+                    .cloned()
+                    .ok_or_else(|| Error::invalid_input(format!("unknown query {id}")))
+            };
+            let with_class = |c: &Option<String>| {
+                let class = c
+                    .as_deref()
+                    .and_then(stratadb_common::workload::WorkClass::parse)
+                    .unwrap_or(stratadb_common::workload::WorkClass::Normal);
+                QueryOptions {
+                    class: Some(Arc::new(stratadb_common::workload::ClassCell::new(class))),
+                    ..qopts.clone()
+                }
+            };
+            let (tenant, sql) = lookup(l.query.as_deref().unwrap_or_default())?;
+            let opts = with_class(&l.class);
+            let work = |_: usize| execute(&engine.snapshot(&tenant), &sql, &opts).map(|_| ());
+            let main = || {
+                if l.mode == "open" {
+                    run_open(l.rate_per_s.unwrap_or(1.0), n, l.workers, work)
+                } else {
+                    run_closed(duration, l.workers, work)
+                }
+            };
+            let Some(a) = &l.alongside else {
+                return Ok(main());
+            };
+            let (bt, bsql) = lookup(&a.query)?;
+            let bopts = with_class(&a.class);
+            let lead = Duration::from_millis(300);
+            let span = if l.mode == "open" {
+                Duration::from_secs_f64(n as f64 / l.rate_per_s.unwrap_or(1.0))
             } else {
-                run_closed(duration, l.workers, work)
-            })
+                duration
+            };
+            let bwork = |_: usize| execute(&engine.snapshot(&bt), &bsql, &bopts).map(|_| ());
+            let (mut r, b) = std::thread::scope(|s| {
+                let h = s.spawn(|| run_closed(lead + span, a.workers, bwork));
+                std::thread::sleep(lead);
+                let r = main();
+                (r, h.join())
+            });
+            r.alongside = b.ok().map(Box::new);
+            Ok(r)
         }
     }
 }
@@ -902,7 +991,8 @@ id = "count"
 sql = "SELECT count(*) FROM logs WHERE event_time >= {t_start}"
 [query.expect]
 result_rows = "== 1"
-rows_scanned = ">= 1"
+rows_matched = ">= 1"
+sources_from_metadata = ">= 1"
 [[query]]
 id = "trace"
 sql = "SELECT body FROM logs WHERE trace_id = '{trace_id}'"
@@ -935,7 +1025,9 @@ query = "count"
         assert_eq!(q["id"], "count");
         assert_eq!(q["wall_ms"].as_array().unwrap().len(), 5);
         assert!(q["wall"]["median_ci95"].is_array());
-        assert!(q["cpu_ns_per_row_scanned"].as_f64().unwrap() > 0.0);
+        // Answered from metadata: no rows scanned, so no per-row CPU.
+        assert_eq!(q["rows_scanned"], 0);
+        assert!(q["cpu_ns_per_row_scanned"].is_null());
         let stages: Vec<&str> = r["insert_stages"]["stages"]
             .as_array()
             .unwrap()
@@ -991,8 +1083,8 @@ query = "count"
                 "unknown expectation",
             ),
             (
-                "rows_scanned = \">= 1\"",
-                "rows_scanned = \"about 3\"",
+                "rows_matched = \">= 1\"",
+                "rows_matched = \"about 3\"",
                 "expected",
             ),
             ("query = \"count\"", "query = \"nope\"", "must name"),

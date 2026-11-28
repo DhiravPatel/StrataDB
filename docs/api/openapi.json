@@ -128,12 +128,21 @@
           "page_size": {
             "type": "integer",
             "minimum": 1,
-            "description": "Paginate a row query: at most this many rows per page (capped at max_rows). See ADR-0023."
+            "description": "Paginate a row query: at most this many rows per page (capped at max_rows). See ADR-0023. Ignored (\"paginated\": false) for aggregate and EXPLAIN queries."
           },
           "cursor": {
             "type": "string",
             "maxLength": 65536,
             "description": "next_cursor from the previous page; the query text must be identical."
+          },
+          "workload_class": {
+            "type": "string",
+            "enum": [
+              "interactive",
+              "normal",
+              "batch"
+            ],
+            "description": "Lower the query's work class (spec VIII.11.1); a request can never raise the class chosen from its cost estimate or the tenant's configured class."
           }
         }
       }
@@ -625,6 +634,26 @@
             }
           }
         }
+      },
+      "get": {
+        "summary": "Backups under --backup-dir, newest first (at most 200): name, creation time, bytes, rows",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-permission": "backup.create"
       }
     },
     "/api/v1/retention": {
@@ -768,6 +797,138 @@
           }
         ],
         "x-permission": "cluster.read"
+      }
+    },
+    "/api/v1/admin/workload": {
+      "get": {
+        "summary": "Workload classes and admission: per-class slots (batch adapts, AIMD), running and queued queries, arrival rate, mean service time, utilization and queue-wait p99 (spec VIII.11, STRATA-SYS-11-010)",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-permission": "cluster.read"
+      }
+    },
+    "/api/v1/admin/snapshots": {
+      "get": {
+        "summary": "Open engine snapshots with holder query ids, segments, and the obsolete segment bytes each keeps on disk; totals and the share of the disk retained (spec STRATA-SYS-17-005, system.snapshots)",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-permission": "cluster.read"
+      }
+    },
+    "/api/v1/admin/caches": {
+      "get": {
+        "summary": "Plan cache statistics: hits, misses, insertions, evictions, entries, bytes, hit latency, and the 100 most looked-up query fingerprints with their hit ratios (spec STRATA-SYS-16-004)",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-permission": "cluster.read"
+      }
+    },
+    "/api/v1/whoami": {
+      "get": {
+        "summary": "The calling token: tenant, token id, permissions and expiry (never the secret)",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-permission": "any"
+      }
+    },
+    "/api/v1/schema": {
+      "get": {
+        "summary": "Tables, columns, and the attribute/resource keys of the caller's segments with row counts, from metadata (at most 500 keys per scope)",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-permission": "query"
+      }
+    },
+    "/api/v1/queries": {
+      "get": {
+        "summary": "The caller's queued and running queries: id, state, class, queue position, elapsed time, fingerprint",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "x-permission": "query"
       }
     }
   }

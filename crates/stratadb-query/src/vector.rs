@@ -142,7 +142,8 @@ enum Node {
     Leaf(Access, Pred),
     /// Severity predicate precomputed for every stored code.
     SevTable(Box<[Truth; 256]>),
-    And(Box<Node>, Box<Node>),
+    /// `a AND b AND ...` (flattened), evaluated in an adaptive order.
+    And(Conjunction),
     Or(Box<Node>, Box<Node>),
     Not(Box<Node>),
     /// Scalar fallback.
@@ -198,11 +199,118 @@ fn leaf(src: Source, pred: Pred) -> Node {
     }
 }
 
+/// One conjunct of an [`Conjunction`] with what has been observed of it.
+#[derive(Debug, Clone)]
+struct Conj {
+    node: Node,
+    /// Estimated CPU per row evaluated (static until measured, then an
+    /// exponential average of measurements).
+    ns_per_row: f64,
+    evaluated: u64,
+    /// Rows it did not reject (true or unknown).
+    kept: u64,
+}
+
+/// A flattened `AND` (spec STRATA-SYS-08-019): conjuncts run in order of
+/// increasing `cost / (1 - selectivity)` (selectivity = fraction of rows
+/// kept), each on the rows the earlier ones did not reject. The order is
+/// recomputed from observed costs and selectivities every
+/// [`REORDER_EVERY`] evaluations. Three-valued `AND` is commutative, so the
+/// order never changes a result.
+#[derive(Debug, Clone)]
+struct Conjunction {
+    conj: Vec<Conj>,
+    order: Vec<usize>,
+    evals: u32,
+    reorders: u64,
+    /// `false`: keep the written order (tests and measurements only).
+    adaptive: bool,
+}
+
+/// Batches between re-rankings of a conjunction.
+const REORDER_EVERY: u32 = 8;
+
+/// Static cost guess (ns/row) before a conjunct has been measured.
+fn static_cost(n: &Node) -> f64 {
+    match n {
+        Node::SevTable(_) => 0.5,
+        Node::Leaf(Access::Tenant, _) => 0.2,
+        Node::Leaf(Access::Ints(..), _) => 1.0,
+        Node::Leaf(Access::Strs(_), Pred::Like(..)) => 8.0,
+        Node::Leaf(Access::Strs(_), _) => 2.0,
+        Node::Leaf(Access::Attr(..), _) => 6.0,
+        Node::Leaf(Access::Body, Pred::Like(..)) => 30.0,
+        Node::Leaf(Access::Body, _) => 10.0,
+        Node::And(c) => c.conj.iter().map(|x| static_cost(&x.node)).sum(),
+        Node::Or(a, b) => static_cost(a) + static_cost(b),
+        Node::Not(x) => static_cost(x),
+        Node::Row(_) => 60.0,
+    }
+}
+
+impl Conjunction {
+    fn new(nodes: Vec<Node>) -> Self {
+        let conj: Vec<Conj> = nodes
+            .into_iter()
+            .map(|node| Conj {
+                ns_per_row: static_cost(&node),
+                node,
+                evaluated: 0,
+                kept: 0,
+            })
+            .collect();
+        let mut c = Self {
+            order: (0..conj.len()).collect(),
+            conj,
+            evals: 0,
+            reorders: 0,
+            adaptive: true,
+        };
+        c.rank();
+        c
+    }
+
+    /// `cost / (1 - kept fraction)`: cheap conjuncts that reject many rows
+    /// first. Unmeasured conjuncts assume half their rows are kept.
+    fn rank(&mut self) {
+        let key = |c: &Conj| {
+            let kept = if c.evaluated == 0 {
+                0.5
+            } else {
+                c.kept as f64 / c.evaluated as f64
+            };
+            c.ns_per_row / (1.0 - kept).max(1e-3)
+        };
+        let before = self.order.clone();
+        let conj = &self.conj;
+        // Stable: ties keep the written order.
+        self.order
+            .sort_by(|&a, &b| key(&conj[a]).total_cmp(&key(&conj[b])).then(a.cmp(&b)));
+        if self.order != before {
+            self.reorders += 1;
+        }
+    }
+}
+
+fn flatten_and<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+    match e {
+        Expr::And(l, r) => {
+            flatten_and(l, out);
+            flatten_and(r, out);
+        }
+        other => out.push(other),
+    }
+}
+
 /// Compile a filter expression.
 fn compile(e: &Expr) -> Node {
     let fallback = || Node::Row(e.clone());
     match e {
-        Expr::And(l, r) => Node::And(Box::new(compile(l)), Box::new(compile(r))),
+        Expr::And(..) => {
+            let mut parts = Vec::new();
+            flatten_and(e, &mut parts);
+            Node::And(Conjunction::new(parts.into_iter().map(compile).collect()))
+        }
         Expr::Or(l, r) => Node::Or(Box::new(compile(l)), Box::new(compile(r))),
         Expr::Not(x) => Node::Not(Box::new(compile(x))),
         Expr::Cmp(l, op, r) => match (source(l), &**l, source(r), &**r) {
@@ -273,7 +381,7 @@ fn not_loaded(id: ColumnId) -> Error {
 impl Node {
     /// Evaluate for the absolute row indices `rows`, writing `out[row - base]`.
     fn eval(
-        &self,
+        &mut self,
         b: &Batch<'_>,
         rows: &[usize],
         base: usize,
@@ -290,26 +398,57 @@ impl Node {
                     out[i - base] = t[usize::from(v[i])];
                 }
             }
-            Node::And(l, r) | Node::Or(l, r) => {
-                let is_and = matches!(self, Node::And(..));
+            Node::And(c) => {
+                for &i in rows {
+                    out[i - base] = Some(true);
+                }
+                let mut rest: Vec<usize> = rows.to_vec();
+                let mut tmp = vec![None; out.len()];
+                for k in 0..c.order.len() {
+                    if rest.is_empty() {
+                        break;
+                    }
+                    let cj = &mut c.conj[c.order[k]];
+                    let t = std::time::Instant::now();
+                    cj.node.eval(b, &rest, base, &mut tmp, buf)?;
+                    let ns = t.elapsed().as_nanos() as f64 / rest.len() as f64;
+                    cj.ns_per_row = if cj.evaluated == 0 {
+                        ns
+                    } else {
+                        0.75 * cj.ns_per_row + 0.25 * ns
+                    };
+                    cj.evaluated += rest.len() as u64;
+                    // Rows rejected here are decided (false); the rest go on.
+                    let mut kept = 0usize;
+                    for j in 0..rest.len() {
+                        let i = rest[j];
+                        out[i - base] = eval::and(out[i - base], tmp[i - base]);
+                        if out[i - base] != Some(false) {
+                            rest[kept] = i;
+                            kept += 1;
+                        }
+                    }
+                    cj.kept += kept as u64;
+                    rest.truncate(kept);
+                }
+                c.evals += 1;
+                if c.adaptive && c.evals.is_multiple_of(REORDER_EVERY) {
+                    c.rank();
+                }
+            }
+            Node::Or(l, r) => {
                 l.eval(b, rows, base, out, buf)?;
                 // The right side matters only where the left did not decide.
-                let decided = Some(!is_and);
                 let rest: Vec<usize> = rows
                     .iter()
                     .copied()
-                    .filter(|&i| out[i - base] != decided)
+                    .filter(|&i| out[i - base] != Some(true))
                     .collect();
                 if !rest.is_empty() {
                     let mut tmp = vec![None; out.len()];
                     r.eval(b, &rest, base, &mut tmp, buf)?;
                     for i in rest {
-                        let (a, c) = (out[i - base], tmp[i - base]);
-                        out[i - base] = if is_and {
-                            eval::and(a, c)
-                        } else {
-                            eval::or(a, c)
-                        };
+                        out[i - base] = eval::or(out[i - base], tmp[i - base]);
                     }
                 }
             }
@@ -370,6 +509,13 @@ fn leaf_eval(
                         out[i - base] = table[codes[i] as usize];
                     }
                 }
+                // No missing rows (null_count 0, no bitmap): no presence
+                // checks (spec STRATA-SYS-08-011), chosen once per batch.
+                _ if v.null_count() == 0 => {
+                    for &i in rows {
+                        out[i - base] = pred.eval(VRef::Str(v.get_present(i)), buf);
+                    }
+                }
                 _ => {
                     for &i in rows {
                         let r = v.get(i).map_or(VRef::Missing, VRef::Str);
@@ -428,12 +574,36 @@ impl Filter {
         Self { root: compile(e) }
     }
 
+    /// Times a conjunction's order changed (adaptive ordering).
+    pub(crate) fn reorders(&self) -> u64 {
+        fn count(n: &Node) -> u64 {
+            match n {
+                Node::And(c) => c.reorders + c.conj.iter().map(|x| count(&x.node)).sum::<u64>(),
+                Node::Or(l, r) => count(l) + count(r),
+                Node::Not(x) => count(x),
+                _ => 0,
+            }
+        }
+        count(&self.root)
+    }
+
     /// Truth of the filter for rows `start..end` of `b`.
-    pub(crate) fn eval(&self, b: &Batch<'_>, start: usize, end: usize) -> Result<Vec<Truth>> {
+    pub(crate) fn eval(&mut self, b: &Batch<'_>, start: usize, end: usize) -> Result<Vec<Truth>> {
         let rows: Vec<usize> = (start..end).collect();
         let mut out = vec![None; end - start];
         self.root.eval(b, &rows, start, &mut out, &mut Vec::new())?;
         Ok(out)
+    }
+
+    /// The filter with every conjunction pinned to its written order
+    /// (measurements of the adaptive order).
+    #[cfg(test)]
+    fn fixed_order(mut self) -> Self {
+        if let Node::And(c) = &mut self.root {
+            c.adaptive = false;
+            c.order = (0..c.conj.len()).collect();
+        }
+        self
     }
 
     /// Number of scalar-fallback nodes.
@@ -442,7 +612,8 @@ impl Filter {
         fn count(n: &Node) -> usize {
             match n {
                 Node::Row(_) => 1,
-                Node::And(l, r) | Node::Or(l, r) => count(l) + count(r),
+                Node::And(c) => c.conj.iter().map(|x| count(&x.node)).sum(),
+                Node::Or(l, r) => count(l) + count(r),
                 Node::Not(x) => count(x),
                 Node::Leaf(..) | Node::SevTable(_) => 0,
             }
@@ -544,17 +715,20 @@ mod tests {
         let mut cols = HashMap::new();
         cols.insert(
             ColumnId::EventTime,
-            ColumnData::Ints(r.ints.iter().map(|x| x.0).collect()),
+            ColumnData::Ints(std::sync::Arc::new(r.ints.iter().map(|x| x.0).collect())),
         );
         cols.insert(
             ColumnId::IngestTime,
-            ColumnData::Ints(r.ints.iter().map(|x| x.1).collect()),
+            ColumnData::Ints(std::sync::Arc::new(r.ints.iter().map(|x| x.1).collect())),
         );
         cols.insert(
             ColumnId::SchemaVersion,
-            ColumnData::Ints(r.ints.iter().map(|x| x.2).collect()),
+            ColumnData::Ints(std::sync::Arc::new(r.ints.iter().map(|x| x.2).collect())),
         );
-        cols.insert(ColumnId::Severity, ColumnData::U8s(r.sev.clone()));
+        cols.insert(
+            ColumnId::Severity,
+            ColumnData::U8s(std::sync::Arc::new(r.sev.clone())),
+        );
         for (j, id) in [
             ColumnId::Service,
             ColumnId::SeverityText,
@@ -589,11 +763,17 @@ mod tests {
             };
             cols.insert(id, ColumnData::Strs(col));
         }
-        cols.insert(ColumnId::Body, ColumnData::Values(r.body.clone()));
-        cols.insert(ColumnId::Attributes, ColumnData::Maps(r.attrs.clone()));
+        cols.insert(
+            ColumnId::Body,
+            ColumnData::Values(std::sync::Arc::new(r.body.clone())),
+        );
+        cols.insert(
+            ColumnId::Attributes,
+            ColumnData::Maps(std::sync::Arc::new(r.attrs.clone())),
+        );
         cols.insert(
             ColumnId::ResourceAttributes,
-            ColumnData::Maps(r.res.clone()),
+            ColumnData::Maps(std::sync::Arc::new(r.res.clone())),
         );
         let mut shredded = HashMap::new();
         if let Some(s) = &r.shredded {
@@ -730,8 +910,76 @@ mod tests {
         })
     }
 
+    /// Filters with literal-only parts (folded at plan time) mixed in.
+    fn arb_foldable() -> impl Strategy<Value = Expr> {
+        let lit_leaf = prop_oneof![
+            prop_oneof![
+                Just(Value::Bool(true)),
+                Just(Value::Bool(false)),
+                Just(Value::Null),
+                Just(Value::Int(1))
+            ]
+            .prop_map(Expr::Literal),
+            (arb_value(), arb_op(), arb_value()).prop_map(|(a, op, b)| Expr::Cmp(
+                lit(a),
+                op,
+                lit(b)
+            )),
+            (
+                arb_value(),
+                prop::collection::vec(arb_value(), 0..3),
+                any::<bool>()
+            )
+                .prop_map(|(v, list, negated)| Expr::InList {
+                    expr: lit(v),
+                    list,
+                    negated
+                }),
+            (arb_value(), any::<bool>()).prop_map(|(v, negated)| Expr::IsNull {
+                expr: lit(v),
+                negated
+            }),
+            (arb_value(), any::<bool>()).prop_map(|(v, negated)| Expr::IsMissing {
+                expr: lit(v),
+                negated
+            }),
+            ("[ab%_]{0,4}", any::<bool>(), any::<bool>()).prop_map(|(pat, negated, ci)| {
+                Expr::Like {
+                    expr: lit(Value::String("ab".into())),
+                    pattern: pat,
+                    negated,
+                    case_insensitive: ci,
+                }
+            }),
+        ];
+        let leaf = prop_oneof![2 => arb_leaf(), 1 => lit_leaf];
+        leaf.prop_recursive(4, 24, 2, |inner| {
+            prop_oneof![
+                (inner.clone(), inner.clone())
+                    .prop_map(|(a, b)| Expr::And(Box::new(a), Box::new(b))),
+                (inner.clone(), inner.clone())
+                    .prop_map(|(a, b)| Expr::Or(Box::new(a), Box::new(b))),
+                inner.clone().prop_map(|a| Expr::Not(Box::new(a))),
+                inner.prop_map(|a| Expr::And(Box::new(a.clone()), Box::new(a))),
+            ]
+        })
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        /// Constant folding and duplicate elimination never change a row's
+        /// truth (spec STRATA-SYS-08-018).
+        #[test]
+        fn folding_preserves_truth(rows in arb_rows(), e in arb_foldable()) {
+            let t = TenantId::new("ab").unwrap();
+            let b = batch(&rows, &t);
+            let folded = crate::plan::fold(&e);
+            for i in 0..b.len {
+                let want = eval_truth(&e, &b, i).unwrap();
+                prop_assert_eq!(eval_truth(&folded, &b, i).unwrap(), want, "row {} of {:?} -> {:?}", i, e, folded);
+            }
+        }
 
         /// The vectorized evaluator agrees with the scalar one on every row,
         /// for whole batches and for chunks starting mid-batch.
@@ -739,14 +987,203 @@ mod tests {
         fn vectorized_equals_scalar(rows in arb_rows(), e in arb_expr(), start in 0usize..40) {
             let t = TenantId::new("ab").unwrap();
             let b = batch(&rows, &t);
-            let f = Filter::new(&e);
+            let mut f = Filter::new(&e);
             let start = start.min(b.len);
-            let got = f.eval(&b, start, b.len).unwrap();
-            for i in start..b.len {
-                let want = eval_truth(&e, &b, i).unwrap();
-                prop_assert_eq!(got[i - start], want, "row {} of {:?}", i, e);
+            // Repeated evaluation crosses several re-rankings of every
+            // conjunction (adaptive order must never change a result).
+            for round in 0..(3 * REORDER_EVERY) {
+                let from = if round % 2 == 0 { start } else { 0 };
+                let got = f.eval(&b, from, b.len).unwrap();
+                for i in from..b.len {
+                    let want = eval_truth(&e, &b, i).unwrap();
+                    prop_assert_eq!(got[i - from], want, "row {} of {:?} (round {})", i, e, round);
+                }
             }
         }
+    }
+
+    /// Filter cost of an expensive predicate written before a selective
+    /// one, adaptive vs written order. Run with `cargo test --release -p
+    /// stratadb-query vector::tests::conjunction_order_cost -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore = "timing measurement"]
+    fn conjunction_order_cost() {
+        let t = TenantId::new("ab").unwrap();
+        let n = 1024;
+        let mut cols = HashMap::new();
+        let mut sev = vec![Severity::Info.as_u8(); n];
+        for i in (0..n).step_by(100) {
+            sev[i] = Severity::Fatal.as_u8();
+        }
+        cols.insert(
+            ColumnId::Severity,
+            ColumnData::U8s(std::sync::Arc::new(sev)),
+        );
+        let body: Vec<Datum> = (0..n)
+            .map(|i| {
+                Some(Value::String(format!(
+                    "request {i} served by node-{} in {} ms ok",
+                    i % 97,
+                    i % 13
+                )))
+            })
+            .collect();
+        cols.insert(
+            ColumnId::Body,
+            ColumnData::Values(std::sync::Arc::new(body)),
+        );
+        let b = Batch {
+            len: n,
+            tenant: &t,
+            cols,
+            shredded: HashMap::new(),
+            raw: HashMap::new(),
+        };
+        let e = Expr::And(
+            Box::new(Expr::Like {
+                expr: Box::new(Expr::Column(ColumnRef::Body)),
+                pattern: "%TIMEOUT%".into(),
+                negated: true,
+                case_insensitive: true,
+            }),
+            Box::new(Expr::Cmp(
+                Box::new(Expr::Column(ColumnRef::Severity)),
+                CmpOp::Eq,
+                lit(Value::String("FATAL".into())),
+            )),
+        );
+        for (name, mut f) in [
+            ("adaptive", Filter::new(&e)),
+            ("written order", Filter::new(&e).fixed_order()),
+        ] {
+            let reps = 2000;
+            let t0 = std::time::Instant::now();
+            let mut kept = 0;
+            for _ in 0..reps {
+                kept += f
+                    .eval(&b, 0, n)
+                    .unwrap()
+                    .iter()
+                    .filter(|x| **x == Some(true))
+                    .count();
+            }
+            let ns = t0.elapsed().as_nanos() as f64 / (reps * n) as f64;
+            println!("{name:14} {ns:6.2} ns/row ({kept} kept)");
+        }
+    }
+
+    #[test]
+    fn conjunctions_learn_to_run_cheap_selective_predicates_first() {
+        // 1,000 rows: one FATAL row, every body long. Written order puts the
+        // expensive, unselective LIKE first.
+        let t = TenantId::new("ab").unwrap();
+        let n = 1000;
+        let mut cols = HashMap::new();
+        let mut sev = vec![Severity::Info.as_u8(); n];
+        sev[7] = Severity::Fatal.as_u8();
+        cols.insert(
+            ColumnId::Severity,
+            ColumnData::U8s(std::sync::Arc::new(sev)),
+        );
+        let body: Vec<Datum> = (0..n)
+            .map(|i| {
+                Some(Value::String(format!(
+                    "{} request {i} ok",
+                    "padding ".repeat(20)
+                )))
+            })
+            .collect();
+        cols.insert(
+            ColumnId::Body,
+            ColumnData::Values(std::sync::Arc::new(body)),
+        );
+        let b = Batch {
+            len: n,
+            tenant: &t,
+            cols,
+            shredded: HashMap::new(),
+            raw: HashMap::new(),
+        };
+        let e = Expr::And(
+            Box::new(Expr::Like {
+                expr: Box::new(Expr::Column(ColumnRef::Body)),
+                pattern: "%ok%".into(),
+                negated: false,
+                case_insensitive: true,
+            }),
+            Box::new(Expr::Cmp(
+                Box::new(Expr::Column(ColumnRef::Severity)),
+                CmpOp::Eq,
+                lit(Value::String("FATAL".into())),
+            )),
+        );
+        let mut f = Filter::new(&e);
+        // The static estimate already prefers the severity table.
+        let Node::And(c) = &f.root else {
+            panic!("not a conjunction")
+        };
+        assert_eq!(c.order, vec![1, 0]);
+        for _ in 0..(2 * REORDER_EVERY) {
+            let got = f.eval(&b, 0, n).unwrap();
+            assert_eq!(got.iter().filter(|x| **x == Some(true)).count(), 1);
+        }
+        let Node::And(c) = &f.root else {
+            panic!("not a conjunction")
+        };
+        assert_eq!(c.order, vec![1, 0], "measured order keeps severity first");
+        // The LIKE ran only on the one row severity kept, every time.
+        assert_eq!(c.conj[0].evaluated, u64::from(2 * REORDER_EVERY));
+        assert_eq!(c.conj[1].evaluated, u64::from(2 * REORDER_EVERY) * n as u64);
+
+        // A misleading static estimate is corrected by measurement: the
+        // severity table is the cheapest guess, but `severity != 'FATAL'`
+        // rejects nothing here, while `event_time = 7` keeps one row.
+        let mut cols = HashMap::new();
+        cols.insert(
+            ColumnId::Severity,
+            ColumnData::U8s(std::sync::Arc::new(vec![Severity::Info.as_u8(); n])),
+        );
+        let mut times = vec![5i64; n];
+        times[3] = 7;
+        cols.insert(
+            ColumnId::EventTime,
+            ColumnData::Ints(std::sync::Arc::new(times)),
+        );
+        let b = Batch {
+            len: n,
+            tenant: &t,
+            cols,
+            shredded: HashMap::new(),
+            raw: HashMap::new(),
+        };
+        let e = Expr::And(
+            Box::new(Expr::Cmp(
+                Box::new(Expr::Column(ColumnRef::Severity)),
+                CmpOp::Ne,
+                lit(Value::String("FATAL".into())),
+            )),
+            Box::new(Expr::Cmp(
+                Box::new(Expr::Column(ColumnRef::EventTime)),
+                CmpOp::Eq,
+                lit(Value::Timestamp(7)),
+            )),
+        );
+        let mut f = Filter::new(&e);
+        let Node::And(c) = &f.root else {
+            panic!("not a conjunction")
+        };
+        assert_eq!(c.order, vec![0, 1], "static guess: severity first");
+        for _ in 0..(2 * REORDER_EVERY) {
+            let got = f.eval(&b, 0, n).unwrap();
+            assert_eq!(got.iter().filter(|x| **x == Some(true)).count(), 1);
+        }
+        let Node::And(c) = &f.root else {
+            panic!("not a conjunction")
+        };
+        assert!(c.reorders >= 1);
+        assert_eq!(f.reorders(), c.reorders);
+        assert_eq!(c.order[0], 1, "the selective conjunct runs first: {c:?}");
     }
 
     fn arb_group_expr() -> impl Strategy<Value = Expr> {

@@ -20,6 +20,8 @@ fn opts(dir: &Path) -> EngineOptions {
     o.wal.durability = Durability::Async;
     o.flush_on_close = false;
     o.compaction.min_inputs = 2;
+    // Delete obsolete files as soon as nothing references them.
+    o.old_segments_lifetime = std::time::Duration::ZERO;
     o
 }
 

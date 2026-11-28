@@ -17,6 +17,7 @@ thiserror.workspace = true
 crc32c.workspace = true
 serde.workspace = true
 rustix.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

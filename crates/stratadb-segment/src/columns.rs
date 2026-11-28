@@ -306,9 +306,9 @@ pub(crate) fn decode_column(
                 prev = prev.wrapping_add(d.get_ivarint()?);
                 v.push(prev);
             }
-            ColumnData::Ints(v)
+            ColumnData::Ints(std::sync::Arc::new(v))
         }
-        Encoding::RawU8 => ColumnData::U8s(d.get_raw(rows)?.to_vec()),
+        Encoding::RawU8 => ColumnData::U8s(std::sync::Arc::new(d.get_raw(rows)?.to_vec())),
         Encoding::OptStr => {
             // Straight into one byte buffer: no allocation per row.
             let mut v = StrBuilder::with_capacity(rows, bytes.len());
@@ -359,14 +359,14 @@ pub(crate) fn decode_column(
                     }
                 }
             }
-            ColumnData::Values(v)
+            ColumnData::Values(std::sync::Arc::new(v))
         }
         Encoding::Map => {
             let mut v = Vec::with_capacity(rows);
             for _ in 0..rows {
                 v.push(decode_map(&mut d, &lim)?);
             }
-            ColumnData::Maps(v)
+            ColumnData::Maps(std::sync::Arc::new(v))
         }
     };
     d.expect_end()?;

@@ -29,10 +29,20 @@ getrandom = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
+# Socket options (keepalive) for accepted connections; already a tokio dependency.
+socket2 = { version = "0.6", features = ["all"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde", "std"] }
+# Result JSON number formatting (ADR-0044); both already serde_json's own
+# formatters, so no new crates enter the build.
+itoa = "1"
+zmij = "1"
+# Response body of pre-built chunks (ADR-0044); both already axum dependencies.
+http-body = "1"
+bytes = "1"
 
 [dev-dependencies]
 tempfile.workspace = true
+proptest.workspace = true
 tokio = { version = "1", features = ["io-util"] }
 rcgen = "0.14"
 

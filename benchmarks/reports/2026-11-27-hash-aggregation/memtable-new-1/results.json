@@ -1,0 +1,542 @@
+{
+  "cache": "warm",
+  "description": "Log queries over 200k memtable rows (4 tenants) plus one flushed segment per tenant",
+  "durability": "group_commit",
+  "hw_profile": "HW-REF-7",
+  "ingest": {
+    "ack_ms": {
+      "max": 7.442792,
+      "mean": 3.594637219791666,
+      "median": 3.8688124999999998,
+      "median_ci95": [
+        3.8120307374999998,
+        3.9058335
+      ],
+      "min": 2.354791,
+      "n": 960,
+      "p95": 4.298756249999999,
+      "p99": 4.44481319,
+      "p999": 7.230892319000012,
+      "stddev": 0.5659696350238621
+    },
+    "cpu_ns_per_event": 1834.0666666666666,
+    "events": 240000,
+    "events_per_s": 63573.41181117836,
+    "final_flush_ms": 0.0,
+    "label": "closed-loop bulk load (throughput only). Burst, not sustained: it ends before compaction cycles complete, so it is not publishable as sustained ingest (STRATA-SYS-01-004/005).",
+    "process_cpu_s": 0.440176,
+    "segment_bytes": 2495481,
+    "segments": 4,
+    "wal_bytes_appended": 17446620,
+    "wal_bytes_per_event": 72.69425,
+    "wall_s": 3.7751631249999997
+  },
+  "insert_stages": {
+    "batch_size": 1000,
+    "gate_eligible": false,
+    "note": "upper bounds of the histogram bucket holding the quantile; budgets are spec VIII.1.2 targets for HW-REF-1 (1,000-row batches) and gate only on that profile (STRATA-SYS-01-002)",
+    "stages": [
+      {
+        "budget_p50_us": null,
+        "budget_p99_us": null,
+        "count": 960,
+        "mean_us": 0.019320833333333332,
+        "p50_upper_bound_us": 1.0,
+        "p99_upper_bound_us": 1.0,
+        "stage": "admission"
+      },
+      {
+        "budget_p50_us": 20.0,
+        "budget_p99_us": 60.0,
+        "count": 960,
+        "mean_us": 78.34574270833333,
+        "p50_upper_bound_us": 100.0,
+        "p99_upper_bound_us": 250.0,
+        "stage": "wal_encode"
+      },
+      {
+        "budget_p50_us": 3.0,
+        "budget_p99_us": 15.0,
+        "count": 960,
+        "mean_us": 16.024660416666666,
+        "p50_upper_bound_us": 25.0,
+        "p99_upper_bound_us": 50.0,
+        "stage": "wal_append"
+      },
+      {
+        "budget_p50_us": 250.0,
+        "budget_p99_us": 1500.0,
+        "count": 960,
+        "mean_us": 3455.134080208333,
+        "p50_upper_bound_us": 5000.0,
+        "p99_upper_bound_us": 5000.0,
+        "stage": "group_commit_wait"
+      },
+      {
+        "budget_p50_us": 30.0,
+        "budget_p99_us": 100.0,
+        "count": 960,
+        "mean_us": 38.908686458333335,
+        "p50_upper_bound_us": 50.0,
+        "p99_upper_bound_us": 500.0,
+        "stage": "memtable_insert"
+      }
+    ]
+  },
+  "label": "measurement only; not a capacity claim. Compare only runs with the same runner_fingerprint, durability and dataset.",
+  "loads": [],
+  "queries": [
+    {
+      "cpu_ns_per_row_scanned": 87.20833333333333,
+      "est_cpu_ms": 0.3,
+      "expectation_failures": [],
+      "expectations": {},
+      "id": "m01_trace_id_lookup",
+      "indexes_used": [],
+      "memory_chunks_pruned": 0,
+      "memory_rows_scanned": 50000,
+      "plan_us_median": 0.35450000000000004,
+      "process_cpu": {
+        "max": 5.271,
+        "mean": 5.2297,
+        "median": 5.2325,
+        "median_ci95": [
+          5.2169625,
+          5.247
+        ],
+        "min": 5.191000000000001,
+        "n": 10,
+        "p95": 5.2602,
+        "p99": 5.26884,
+        "p999": 5.270784,
+        "stddev": 0.023423871963827118
+      },
+      "process_cpu_ms": [
+        5.247,
+        5.2379999999999995,
+        5.271,
+        5.247,
+        5.191000000000001,
+        5.218,
+        5.228,
+        5.203,
+        5.2170000000000005,
+        5.237
+      ],
+      "repetitions": 10,
+      "result_rows": 1,
+      "rows_scanned": 60000,
+      "scan_workers": 1,
+      "segments_scanned": 1,
+      "segments_total": 1,
+      "sql": "SELECT event_time, body FROM logs WHERE trace_id = 'a407db042e8bca528ea188a707495213'",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 5.315125,
+        "mean": 5.2335959,
+        "median": 5.231896000000001,
+        "median_ci95": [
+          5.2172726,
+          5.245375
+        ],
+        "min": 5.190459,
+        "n": 10,
+        "p95": 5.2846375,
+        "p99": 5.3090275,
+        "p999": 5.31451525,
+        "stddev": 0.03400371347188108
+      },
+      "wall_ms": [
+        5.245375,
+        5.237,
+        5.315125,
+        5.247375,
+        5.190459,
+        5.217333,
+        5.227667,
+        5.202166999999999,
+        5.217333,
+        5.236125
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": 76.00023126734506,
+      "est_cpu_ms": 0.0,
+      "expectation_failures": [],
+      "expectations": {
+        "memory_chunks_pruned": ">= 1"
+      },
+      "id": "m02_recent_errors",
+      "indexes_used": [],
+      "memory_chunks_pruned": 13,
+      "memory_rows_scanned": 17296,
+      "plan_us_median": 0.41600000000000004,
+      "process_cpu": {
+        "max": 1.342,
+        "mean": 1.3178,
+        "median": 1.3145,
+        "median_ci95": [
+          1.31,
+          1.3225
+        ],
+        "min": 1.3079999999999998,
+        "n": 10,
+        "p95": 1.3366,
+        "p99": 1.3409200000000001,
+        "p999": 1.341892,
+        "stddev": 0.01074760955334312
+      },
+      "process_cpu_ms": [
+        1.33,
+        1.342,
+        1.313,
+        1.315,
+        1.322,
+        1.314,
+        1.31,
+        1.309,
+        1.315,
+        1.3079999999999998
+      ],
+      "repetitions": 10,
+      "result_rows": 100,
+      "rows_scanned": 17296,
+      "scan_workers": 0,
+      "segments_scanned": 0,
+      "segments_total": 1,
+      "sql": "SELECT event_time, service, body FROM logs WHERE event_time >= TIMESTAMP '2026-11-20T00:03:48.000000000Z' AND severity = 'ERROR' ORDER BY event_time DESC LIMIT 100",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 1.3409579999999999,
+        "mean": 1.3175293000000001,
+        "median": 1.3138960000000002,
+        "median_ci95": [
+          1.3098750000000001,
+          1.3220835000000002
+        ],
+        "min": 1.3075,
+        "n": 10,
+        "p95": 1.3359333,
+        "p99": 1.3399530599999998,
+        "p999": 1.3408575059999999,
+        "stddev": 0.0104614458959234
+      },
+      "wall_ms": [
+        1.329792,
+        1.3409579999999999,
+        1.313417,
+        1.314375,
+        1.32125,
+        1.313417,
+        1.3098750000000001,
+        1.3095839999999999,
+        1.315125,
+        1.3075
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": 50.96435546875,
+      "est_cpu_ms": 0.0,
+      "expectation_failures": [],
+      "expectations": {
+        "memory_chunks_pruned": ">= 1"
+      },
+      "id": "m03_old_time_range",
+      "indexes_used": [],
+      "memory_chunks_pruned": 14,
+      "memory_rows_scanned": 16384,
+      "plan_us_median": 0.31300000000000006,
+      "process_cpu": {
+        "max": 0.923,
+        "mean": 0.8468,
+        "median": 0.835,
+        "median_ci95": [
+          0.829,
+          0.853
+        ],
+        "min": 0.829,
+        "n": 10,
+        "p95": 0.8968999999999999,
+        "p99": 0.91778,
+        "p999": 0.922478,
+        "stddev": 0.02937421393747321
+      },
+      "process_cpu_ms": [
+        0.8400000000000001,
+        0.83,
+        0.839,
+        0.829,
+        0.853,
+        0.865,
+        0.923,
+        0.829,
+        0.8310000000000001,
+        0.829
+      ],
+      "repetitions": 10,
+      "result_rows": 1,
+      "rows_scanned": 16384,
+      "scan_workers": 0,
+      "segments_scanned": 0,
+      "segments_total": 1,
+      "sql": "SELECT count(*) FROM logs WHERE event_time >= TIMESTAMP '2026-11-20T00:01:48.000000000Z' AND event_time < TIMESTAMP '2026-11-20T00:02:12.000000000Z'",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 1.0128750000000002,
+        "mean": 0.8578917,
+        "median": 0.8351045,
+        "median_ci95": [
+          0.829583,
+          0.861583
+        ],
+        "min": 0.8279169999999999,
+        "n": 10,
+        "p95": 0.95225595,
+        "p99": 1.0007511900000001,
+        "p999": 1.0116626190000002,
+        "stddev": 0.05690390631982625
+      },
+      "wall_ms": [
+        0.838292,
+        0.830875,
+        0.8390420000000001,
+        0.8279169999999999,
+        0.861583,
+        0.878166,
+        1.0128750000000002,
+        0.829583,
+        0.831917,
+        0.828667
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": 25.35,
+      "est_cpu_ms": 0.7,
+      "expectation_failures": [],
+      "expectations": {},
+      "id": "m04_service_count",
+      "indexes_used": [],
+      "memory_chunks_pruned": 0,
+      "memory_rows_scanned": 50000,
+      "plan_us_median": 0.25,
+      "process_cpu": {
+        "max": 1.572,
+        "mean": 1.5290999999999997,
+        "median": 1.521,
+        "median_ci95": [
+          1.516,
+          1.5399999999999998
+        ],
+        "min": 1.5130000000000001,
+        "n": 10,
+        "p95": 1.5603,
+        "p99": 1.56966,
+        "p999": 1.571766,
+        "stddev": 0.01857387651754176
+      },
+      "process_cpu_ms": [
+        1.546,
+        1.521,
+        1.516,
+        1.527,
+        1.5399999999999998,
+        1.521,
+        1.5130000000000001,
+        1.572,
+        1.521,
+        1.514
+      ],
+      "repetitions": 10,
+      "result_rows": 12,
+      "rows_scanned": 60000,
+      "scan_workers": 1,
+      "segments_scanned": 1,
+      "segments_total": 1,
+      "sql": "SELECT service, count(*) AS n FROM logs GROUP BY service ORDER BY n DESC",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 1.571291,
+        "mean": 1.5284916,
+        "median": 1.5214789999999998,
+        "median_ci95": [
+          1.5149169999999998,
+          1.539417
+        ],
+        "min": 1.512958,
+        "n": 10,
+        "p95": 1.5586163,
+        "p99": 1.56875606,
+        "p999": 1.571037506,
+        "stddev": 0.01823179454323319
+      },
+      "wall_ms": [
+        1.543125,
+        1.5211249999999998,
+        1.5149169999999998,
+        1.526458,
+        1.539417,
+        1.521833,
+        1.512958,
+        1.571291,
+        1.520709,
+        1.513083
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": 48.717073562479925,
+      "est_cpu_ms": 0.0,
+      "expectation_failures": [],
+      "expectations": {},
+      "id": "m05_fatal_only",
+      "indexes_used": [],
+      "memory_chunks_pruned": 2,
+      "memory_rows_scanned": 49808,
+      "plan_us_median": 0.25,
+      "process_cpu": {
+        "max": 2.458,
+        "mean": 2.4315000000000007,
+        "median": 2.4265,
+        "median_ci95": [
+          2.4160000000000004,
+          2.4520000000000004
+        ],
+        "min": 2.408,
+        "n": 10,
+        "p95": 2.45575,
+        "p99": 2.4575500000000003,
+        "p999": 2.457955,
+        "stddev": 0.01848873530919124
+      },
+      "process_cpu_ms": [
+        2.4250000000000003,
+        2.4160000000000004,
+        2.428,
+        2.453,
+        2.458,
+        2.4520000000000004,
+        2.443,
+        2.412,
+        2.42,
+        2.408
+      ],
+      "repetitions": 10,
+      "result_rows": 1,
+      "rows_scanned": 49808,
+      "scan_workers": 0,
+      "segments_scanned": 0,
+      "segments_total": 1,
+      "sql": "SELECT count(*) FROM logs WHERE severity = 'FATAL'",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 2.457042,
+        "mean": 2.4311875,
+        "median": 2.426125,
+        "median_ci95": [
+          2.4151670000000003,
+          2.4515409999999997
+        ],
+        "min": 2.4085,
+        "n": 10,
+        "p95": 2.45559795,
+        "p99": 2.45675319,
+        "p999": 2.457013119,
+        "stddev": 0.0185699757090129
+      },
+      "wall_ms": [
+        2.424042,
+        2.4151670000000003,
+        2.4282079999999997,
+        2.453833,
+        2.457042,
+        2.4515409999999997,
+        2.442792,
+        2.4107920000000003,
+        2.419958,
+        2.4085
+      ]
+    },
+    {
+      "cpu_ns_per_row_scanned": 28250.0,
+      "est_cpu_ms": 0.3,
+      "expectation_failures": [],
+      "expectations": {},
+      "id": "m06_limit_scan",
+      "indexes_used": [],
+      "memory_chunks_pruned": 0,
+      "memory_rows_scanned": 0,
+      "plan_us_median": 0.14550000000000002,
+      "process_cpu": {
+        "max": 0.5770000000000001,
+        "mean": 0.5665,
+        "median": 0.565,
+        "median_ci95": [
+          0.5630000000000001,
+          0.569
+        ],
+        "min": 0.5609999999999999,
+        "n": 10,
+        "p95": 0.5747500000000001,
+        "p99": 0.5765500000000001,
+        "p999": 0.5769550000000001,
+        "stddev": 0.0050607421502296725
+      },
+      "process_cpu_ms": [
+        0.5770000000000001,
+        0.5720000000000001,
+        0.569,
+        0.566,
+        0.5640000000000001,
+        0.5630000000000001,
+        0.5609999999999999,
+        0.5630000000000001,
+        0.562,
+        0.5680000000000001
+      ],
+      "repetitions": 10,
+      "result_rows": 20,
+      "rows_scanned": 20,
+      "scan_workers": 1,
+      "segments_scanned": 1,
+      "segments_total": 1,
+      "sql": "SELECT event_time, body FROM logs LIMIT 20",
+      "tenant": "tenant-0",
+      "wall": {
+        "max": 0.577666,
+        "mean": 0.5662665,
+        "median": 0.5646665,
+        "median_ci95": [
+          0.562,
+          0.569166
+        ],
+        "min": 0.5607500000000001,
+        "n": 10,
+        "p95": 0.5752666,
+        "p99": 0.57718612,
+        "p999": 0.577618012,
+        "stddev": 0.005526323396054352
+      },
+      "wall_ms": [
+        0.577666,
+        0.572334,
+        0.569166,
+        0.565458,
+        0.563875,
+        0.562,
+        0.5611659999999999,
+        0.562291,
+        0.5607500000000001,
+        0.567959
+      ]
+    }
+  ],
+  "results_version": 1,
+  "runner_fingerprint": "0b29fce902bcc9de",
+  "scenario": "memtable",
+  "started_at": "2026-11-27T10:29:07.481169000Z",
+  "verdict": {
+    "excluded_client_bound": false,
+    "failures": [],
+    "flags": [],
+    "ok": true
+  }
+}

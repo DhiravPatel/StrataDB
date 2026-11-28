@@ -152,6 +152,32 @@ pub fn format_rfc3339(nanos: i64) -> String {
     )
 }
 
+/// Append [`format_rfc3339`]'s text to `out` without allocating (the result
+/// serializer's hot path, spec STRATA-SYS-06-003).
+pub fn write_rfc3339(nanos: i64, out: &mut Vec<u8>) {
+    let secs = nanos.div_euclid(NANOS_PER_SEC);
+    let frac = nanos.rem_euclid(NANOS_PER_SEC);
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let mut b = *b"0000-00-00T00:00:00.000000000Z";
+    let mut put = |at: usize, width: usize, mut v: i64| {
+        for k in (at..at + width).rev() {
+            b[k] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+    };
+    // Every i64 of nanoseconds falls in years 1677..=2262: four digits.
+    put(0, 4, y);
+    put(5, 2, i64::from(m));
+    put(8, 2, i64::from(d));
+    put(11, 2, sod / 3600);
+    put(14, 2, (sod % 3600) / 60);
+    put(17, 2, sod % 60);
+    put(20, 9, frac);
+    out.extend_from_slice(&b);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +231,13 @@ mod tests {
         #[test]
         fn roundtrip(n in -9_000_000_000_000_000_000i64..9_000_000_000_000_000_000i64) {
             prop_assert_eq!(parse_rfc3339(&format_rfc3339(n)).unwrap(), n);
+        }
+
+        #[test]
+        fn write_equals_format(n in any::<i64>()) {
+            let mut out = Vec::new();
+            write_rfc3339(n, &mut out);
+            prop_assert_eq!(out, format_rfc3339(n).into_bytes());
         }
     }
 }

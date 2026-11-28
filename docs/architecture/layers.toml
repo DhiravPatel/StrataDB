@@ -28,6 +28,7 @@
 "stratadb-query" = { layers = [3, 4] }  # executor (L3) and StrataQL parser/planner (L4)
 "stratadb-server" = { layers = [5, 6] } # admission, quotas, registry (L5); HTTP, TLS, auth (L6)
 "stratadb-client" = { layers = [7] }    # Rust SDK
+"stratadb-studio" = { layers = [7] }    # `strata-studio`: web admin/query tool; HTTP API v1 client only (ADR-0041)
 "stratadb-cli" = { role = "root" }      # `strata`: local admin, offline verify/repair, doctor
 "stratadb-bench" = { role = "root" }    # `strata-bench`
 "stratadb-testkit" = { role = "root" }  # synthetic datasets for benches and tests
@@ -44,3 +45,8 @@ reason = "INSERT data flow (spec IX.1.4): L5 admission hands the batch to the L2
 from = "stratadb-query"
 to = ["stratadb-segment", "stratadb-wal"]
 reason = "STRATA-ARCH-01-003: the execution engine must not know file formats; it reads through stratadb_storage::ScanSource."
+
+[[forbid]]
+from = "stratadb-studio"
+to = ["stratadb-segment", "stratadb-wal"]
+reason = "ADR-0041 (spec IX.1.1, STRATA-ARCH-01-001): the studio is an L7 client of the HTTP API v1; it must not know file formats, not even in tests (stratadb-storage is a dev-dependency only, to start an in-process server)."

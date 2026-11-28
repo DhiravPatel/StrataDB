@@ -48,6 +48,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84a22b5d51209f6de83d37a0b33d320acb8da88823e42a94c075140708f032a5"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "asn1-rs"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1403,6 +1412,7 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -1442,6 +1452,7 @@ version = "0.0.1"
 dependencies = [
  "ahash",
  "hashbrown 0.17.1",
+ "memchr",
  "proptest",
  "stratadb-common",
  "stratadb-schema",
@@ -1476,14 +1487,19 @@ name = "stratadb-server"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "bytes",
  "clap",
  "flate2",
  "getrandom 0.3.4",
+ "http-body",
+ "itoa",
+ "proptest",
  "rcgen",
  "rustls",
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "stratadb-common",
  "stratadb-crypto",
  "stratadb-query",
@@ -1496,12 +1512,14 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zmij",
 ]
 
 [[package]]
 name = "stratadb-storage"
 version = "0.0.1"
 dependencies = [
+ "arc-swap",
  "fs4",
  "parking_lot",
  "proptest",
@@ -1515,6 +1533,30 @@ dependencies = [
  "stratadb-wal",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "stratadb-studio"
+version = "0.0.1"
+dependencies = [
+ "axum",
+ "clap",
+ "getrandom 0.3.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "stratadb-common",
+ "stratadb-server",
+ "stratadb-storage",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]

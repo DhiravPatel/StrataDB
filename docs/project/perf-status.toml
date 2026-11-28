@@ -181,13 +181,13 @@ note = "scan workers (sx-work) still do synchronous reads; there is no IoEngine 
 
 [req."STRATA-SYS-11-007"]
 status = "PARTIAL"
-evidence = "scan tasks claim whole segments (crates/stratadb-query/src/exec.rs ScanShared::work)"
+evidence = "pool tasks run one morsel (segment) per step (crates/stratadb-query/src/exec.rs ScanShared::step, pool.rs Step); the fair queue reschedules at each morsel boundary"
 note = "morsel = segment; segments have no granules yet"
 
 [req."STRATA-SYS-11-008"]
 status = "PARTIAL"
 evidence = "crates/stratadb-query/src/exec.rs scan_dop + scan_parallel (pool free slots cap tasks: active <= 2 x workers); tests pool_tests"
-note = "one class (interactive, 5 ms target); idle workers are used beyond the base formula (deviation with HW-REF-7 evidence, ADR-0006); per-row cost is a fixed calibration, not the VIII.12 cost model"
+note = "target_ms_per_worker 5 ms (interactive/normal) and 50 ms (batch) from the query class (ADR-0036); per-class pool caps (2W/1.5W/W); idle workers are used beyond the base formula (deviation with HW-REF-7 evidence, ADR-0006); per-row cost is a fixed calibration, not the VIII.12 cost model"
 
 [req."STRATA-SYS-04-002"]
 status = "IMPLEMENTED"
@@ -261,12 +261,12 @@ note = "a hard stall with timeout, not a smooth per-insert delay"
 
 [req."STRATA-SYS-14-003"]
 status = "PARTIAL"
-evidence = "crates/stratadb-query/src/exec.rs top_k / sort_keep (+ proptest top_k_equals_stable_sort_then_truncate)"
-note = "bounded selection per partial, no shared k-th threshold across workers"
+evidence = "bounded selection per partial plus a query-wide k-th row bound shared by all scan workers (SharedBudget::offer_bound, versioned, refreshed per morsel): rows sorting after it are skipped before their outputs are built (QueryStats.topk_rows_skipped); tests/sort.rs on/off equivalence + proptest; top-k queries 2.2-2.6x (report 2026-11-28-normalized-sort, ADR-0043)"
+note = "the bound filters rows, not granules: zone maps are compared to it only for event_time (scan_ordered); a selection instead of a heap"
 
 [req."STRATA-SYS-17-004"]
 status = "IMPLEMENTED"
-evidence = "obsolete segments deleted only when no snapshot references them (crates/stratadb-storage/tests/maintenance.rs)"
+evidence = "obsolete segments deleted only when no snapshot references them and old_segments_lifetime (default 8 min, [storage] old_segments_lifetime_s) has passed since they left the visible set (crates/stratadb-storage/tests/maintenance.rs, tests/snapshots.rs obsolete_files_outlive_their_last_reference_by_the_lifetime); ADR-0039"
 
 [req."STRATA-SYS-06-006"]
 status = "PARTIAL"
@@ -569,3 +569,238 @@ note = "numeric/value columns are owned Vecs; no vector pool; no operator slices
 status = "PARTIAL"
 evidence = "exec.rs Ctx::select / Selected: per-chunk selections (dense range or indices) from the vectorized filter and page bound; downstream work visits selected rows only, rows are never compacted; global count(*) adds selection sizes; tests: query equivalence suites, pagination; ledger count 2.01x"
 note = "the selection lives within one operator (no multi-operator pipeline yet, ARCH-03-001); no compaction threshold because nothing compacts"
+
+# ------------------------------------------------------------- A1-3 --
+[req."STRATA-ARCH-22-001"]
+status = "IMPLEMENTED"
+evidence = "stratadb_common::state QueryState (spec table, test state_tables_match_the_spec); server query_inner drives RECEIVED..FINISHED/FAILED/REJECTED/CANCELLED; /metrics strata_state_seconds{machine=\"query_lifecycle\"}; test apps/stratadb-server/tests/lifecycle.rs; ADR-0035; overhead 0.60-0.66 us per query lifecycle (state::tests::transition_cost, release, M4)"
+
+[req."STRATA-ARCH-22-002"]
+status = "PARTIAL"
+evidence = "InsertState driven by JSON and OTLP ingest: RECEIVED, DECODED, VALIDATED/REJECTED, THROTTLED (real waits only), LOGGED, DURABLE, VISIBLE, ACKED from WriteReceipt.timings; test tests/lifecycle.rs; ADR-0035"
+note = "FLUSHED not driven (requests are acked before flush); undecodable bodies and quota/rate rejections are not tracked (no RECEIVED->REJECTED edge in the spec)"
+
+[req."STRATA-ARCH-22-003"]
+status = "PARTIAL"
+evidence = "Wal: PREALLOCATED->ACTIVE on create, SEALED on rotation, CHECKPOINTED->DELETED on reclamation, FAILED when poisoned; segments found at open are SEALED; test crates/stratadb-wal/tests/lifecycle.rs"
+note = "RECYCLED not driven: segments are deleted, not recycled"
+
+[req."STRATA-ARCH-22-004"]
+status = "PARTIAL"
+evidence = "Shared::rewrite (compaction, retention, upgrade, index rebuild): PLANNED->RESERVED->RUNNING->WRITTEN->COMMITTED, SKIPPED on disk/memory, FAILED while running; test crates/stratadb-storage/tests/merge_lifecycle.rs"
+note = "PAUSED/CANCELLED not driven (maintenance cannot pause or cancel)"
+
+[req."STRATA-ARCH-22-005"]
+status = "DEFERRED"
+evidence = "ConnectionState defined, spec-checked and exported (zero series)"
+note = "not driven: the HTTP API authenticates per request; there is no HELLO handshake or connection-level session"
+
+[req."STRATA-ARCH-22-006"]
+status = "PARTIAL"
+evidence = "lifecycle::Lifecycle: table logs CREATING->ACTIVE at engine open, ACTIVE<->READ_ONLY on engine failure or disk below the reserve (Engine::disk_below_reserve), 10 s tick; test tests/lifecycle.rs"
+note = "ALTERING/DETACHED/DROPPING not driven: no DDL"
+
+[req."STRATA-ARCH-22-007"]
+status = "IMPLEMENTED"
+evidence = "strata-server serve: STARTING->RECOVERING->WARMING->READY<->DEGRADED->DRAINING->STOPPED; /api/v1/ready reports the state (503 unless READY/DEGRADED); test tests/lifecycle.rs"
+note = "spec has no DEGRADED->DRAINING edge: a degraded server stops from DEGRADED"
+
+[req."STRATA-ARCH-22-008"]
+status = "IMPLEMENTED"
+evidence = "lifecycle::DeviceMonitor over WAL fsync latency windows: baseline p99 of 64 fsyncs, DEGRADED when window p99 > 4x baseline for 30 s, HEALTHY after 5 min normal, FAILED on engine I/O fail-stop; unit tests device_degrades_after_sustained_slow_windows_and_recovers, unknown_device_needs_a_baseline_and_cannot_fail"
+note = "one device (the data directory); FAILED->UNKNOWN is an operator restart"
+
+# ------------------------------------------------------------- P2-1 --
+[req."STRATA-SYS-11-001"]
+status = "PARTIAL"
+evidence = "stratadb_common::workload::FairQueue (stride per class over measured CPU, then tenant, then FIFO; aging 500 ms; no credit hoarding) used by the scan pool (morsel-step tasks, requeue under the live class) and by admission; lower-class caller threads run higher-class morsels (help_higher) or yield at morsel boundaries; tests workload::tests, pool::tests (8:1 preemption, tenants alternate, demotion), admission::tests; ADR-0036, report 2026-11-27-workload-classes"
+note = "per-class queues are one shared queue (one lock), not one per worker; ingest/background classes are not scheduled (own semaphore / maintenance thread); sequential scans neither yield nor lend; no measurable interactive-latency gain in the embedded mixed benchmark on HW-REF-7"
+
+[req."STRATA-SYS-11-002"]
+status = "MISSING"
+note = "background maintenance runs on its own thread, outside the class scheduler; no min share or parts-driven boost yet"
+
+[req."STRATA-SYS-11-003"]
+status = "IMPLEMENTED"
+evidence = "Prepared::estimate (metadata-only: unpruned segment rows + memtable rows x per-row cost) -> Classifier (interactive < 100 ms, batch >= 10 s); [workload.tenant_classes] operator override; request workload_class may only lower; demotion at 2x class budget moves the slot and the live ClassCell (scan tasks follow at the next morsel); tests admission::tests overdue_queries_are_demoted_and_free_their_slot, classification_respects_tenant_classes_and_never_raises, pool a_demoted_task_runs_its_remaining_steps_in_the_lower_class, tests/workload.rs"
+note = "role overrides are per tenant (tokens carry no role); class budgets equal the classification thresholds"
+
+[req."STRATA-SYS-11-004"]
+status = "IMPLEMENTED"
+evidence = "apps/stratadb-server/src/admission.rs: per-class slots under max_concurrent_queries, query-pool memory headroom, PSI memory pressure (Linux), bounded fair queue with timeout and visible position (GET /api/v1/query/{id}), refusals TOO_MANY_QUERIES (429) / SERVER_OVERLOADED (503) with retry_after_ms + Retry-After; tests admission::tests, tests/workload.rs"
+note = "estimated CPU work is used for classification and the fair-queue charge, not as an admission budget; PSI only on Linux"
+
+[req."STRATA-SYS-11-005"]
+status = "IMPLEMENTED"
+evidence = "Admission::tick (every controller_interval): batch slots -1 when interactive p95 > latency_target and CPU utilization > 90%, +1 back to configured when below target and < 70%; test aimd_moves_batch_slots_between_min_and_configured; strata_workload_slots"
+note = "verified by unit test with synthetic observations, not under real load"
+
+[req."STRATA-SYS-11-010"]
+status = "PARTIAL"
+evidence = "GET /api/v1/admin/workload and strata_workload_*: per class arrival rate, mean service time, utilization (lambda*S/slots), queue-wait p99, outcomes, demotions, CPU; tests/workload.rs"
+note = "an HTTP endpoint and metrics, not a system.workload_stats SQL table"
+
+# ------------------------------------------------------------- P2-2 --
+[req."STRATA-SYS-09-002"]
+status = "PARTIAL"
+evidence = "hashbrown SwissTable (load factor 7/8, growth x2); GroupTable::growth_bytes upper-bounds the next insert's allocation and Ctx::group_index reserves it on the query accountant before inserting; memory charged by capacity; tests groups::tests growth_is_bounded_before_it_happens, tests/aggregation.rs group_growth_is_reserved_against_the_query_memory_limit; ADR-0037"
+note = "rehash is hashbrown's all-at-once, not batched"
+
+[req."STRATA-SYS-09-003"]
+status = "MISSING"
+note = "single-level table; partial tables are merged sequentially in segment order (first-seen group order)"
+
+[req."STRATA-SYS-09-004"]
+status = "MISSING"
+note = "prefetch intrinsics need unsafe (forbidden); batched hashing not implemented without evidence of a gain"
+
+[req."STRATA-SYS-09-006"]
+status = "IMPLEMENTED"
+evidence = "exec::MetaPlan + plan::MetaFilter: global count(*)/count(event_time) answered from segment/window row counts (and exact footer severity counts) when the filter covers the source; tests/metadata_aggregates.rs (128-case on/off property, mutation-checked); q14 3.43 -> 0.003 ms CPU, report 2026-11-27-hash-aggregation"
+note = "also answers covering event_time ranges and canonical severity filters; GROUP BY severity is not answered (first-seen output order)"
+
+[req."STRATA-SYS-09-007"]
+status = "IMPLEMENTED"
+evidence = "min/max(event_time) from the exact source time range when every row of the source matches; tests/metadata_aggregates.rs"
+note = "only event_time has exact per-source min/max statistics"
+
+[req."STRATA-SYS-09-008"]
+status = "IMPLEMENTED"
+evidence = "Ctx::process: dense per-batch code->group array when all keys are dictionary/byte code columns (code space <= 65,536), per-code counting for count(*)-only; keys decoded once at output; tests/aggregation.rs (dense == hashed rows and order, 48 cases, mutation-checked; reference check); ledger group_by_low_cardinality 14.2 -> 2.56 ns/row, q12 3.4-3.8x"
+note = "memtable string columns are plain (not dictionary), so memtable GROUP BY service still hashes"
+
+[req."STRATA-SYS-09-009"]
+status = "MISSING"
+note = "no streaming aggregation on sort-key prefixes"
+
+[req."STRATA-SYS-09-010"]
+status = "MISSING"
+note = "partial pre-aggregation is never abandoned"
+
+[req."STRATA-SYS-09-011"]
+status = "PARTIAL"
+evidence = "EXPLAIN ANALYZE 'Hash table:' line and QueryStats.group_table: variant, groups, capacity, resizes, bytes, dense batches, 0 spilled partitions; tests/aggregation.rs explain_analyze_reports_the_hash_table"
+note = "no probe length or probe-vs-insert time fraction (hashbrown exposes neither); resizes of per-segment partial tables are not counted"
+
+# ------------------------------------------------------------- P2-3 --
+[req."STRATA-SYS-08-011"]
+status = "PARTIAL"
+evidence = "StrColumn: validity bitmap allocated only at the first missing row; null_count(); vector filter picks a no-presence-check loop per batch when null_count == 0; test column::tests::no_missing_rows_means_no_bitmap; ADR-0038"
+note = "string columns only; Values/Ints columns carry no validity bitmaps to begin with"
+
+[req."STRATA-SYS-08-012"]
+status = "IMPLEMENTED"
+evidence = "StrColumn plain representation: one contiguous text buffer + u32 offsets + validity bitmap (ADR-0034); dictionary representation explicit"
+note = "no German-string view layout (MAY)"
+
+[req."STRATA-SYS-08-013"]
+status = "PARTIAL"
+evidence = "LIKE exact/prefix/suffix fast paths compare lengths before bytes (eval::LikePattern); dictionary filters compare once per distinct value"
+note = "general string comparisons (=, <) use str ordering, not an explicit 8-byte prefix compare"
+
+[req."STRATA-SYS-08-014"]
+status = "IMPLEMENTED"
+evidence = "LIKE '%x%' with a prebuilt memchr::memmem::Finder (SIMD); 13-36 GB/s on 1 KiB rows (floor 4 GB/s), 7.7-7.9 ns per 45-byte row; eval::tests::substring_throughput, substring_search_equals_general; report 2026-11-27-string-kernels"
+note = "measured on HW-REF-7 on battery power; HW-REF-1 not available"
+
+[req."STRATA-SYS-08-015"]
+status = "IMPLEMENTED"
+evidence = "ILIKE with an ASCII literal on ASCII text: eq_ignore_ascii_case for exact/prefix/suffix; %x% by in-place first-byte memchr2 scan (<= 256 B) or lowercased copy + memmem; non-ASCII text uses the Unicode-folding general matcher; ~20x on short rows, 4.8-11 GB/s on 1 KiB; property tests mutation-checked"
+note = "the non-ASCII check is per value (str::is_ascii), not per batch"
+
+[req."STRATA-SYS-08-016"]
+status = "PARTIAL"
+evidence = "std::str::from_utf8 measured at 45-46 GB/s (ASCII JSON) and 10.3-10.7 GB/s (~2% multi-byte) on Apple M4; codec::tests::utf8_validation_throughput"
+note = "std's word-at-a-time validator, not a SIMD validator; adopt simdutf8 if HW-REF-1 measures below 10 GB/s"
+
+[req."STRATA-SYS-08-017"]
+status = "MISSING"
+note = "filters compile to a tree of nodes evaluated per batch, not a flat bytecode"
+
+[req."STRATA-SYS-08-018"]
+status = "PARTIAL"
+evidence = "plan::fold: constant folding of comparisons/IN/LIKE/IS NULL/time_bucket over literals, AND/OR absorbing and identity elements, duplicate operands removed; property test folding_preserves_truth (mutation-checked)"
+note = "applies to WHERE; no CSE across SELECT expressions beyond group-key reuse"
+
+[req."STRATA-SYS-08-019"]
+status = "IMPLEMENTED"
+evidence = "vector::Conjunction: flattened AND, order by measured ns/row / (1 - kept fraction), re-ranked every 8 batches; filter cost 3.4-3.8 vs 22 ns/row for an expensive-first filter (vector::tests::conjunction_order_cost); results unchanged (vectorized_equals_scalar re-evaluates across re-rankings); QueryStats.filter_reorders"
+note = "query-level effect not yet measured on AC power"
+
+# ------------------------------------------------------------- P2-4 --
+[req."STRATA-SYS-17-001"]
+status = "IMPLEMENTED"
+evidence = "engine ReadView (segments per tenant + memtables) published with arc_swap::ArcSwap after every change; Engine::snapshot does one atomic load and an Arc clone of the tenant's list, no state lock; tests/snapshots.rs (isolation, concurrent snapshots never double-count or lose rows); ADR-0039"
+note = "snapshot registration takes one shard lock of the snapshot registry (observability), not the catalog lock"
+
+[req."STRATA-SYS-17-002"]
+status = "PARTIAL"
+evidence = "publishes copy-on-write only the changed tenants' segment lists (Arc::make_mut) under the single state lock that serializes them; ADR-0039"
+note = "lists are vectors, not persistent maps: a flush copies its tenant's list (O(tenant segments)) while a snapshot holds it"
+
+[req."STRATA-SYS-17-003"]
+status = "PARTIAL"
+evidence = "snapshot creation 0.2-0.3 us flat at 10/300/1500 segments vs 0.2/1.75/5.8 us before (tests/snapshots.rs snapshot_cost, release, HW-REF-7 on battery)"
+note = "100k parts and the >= 2,000 publishes/s rate were not measured (flush publishes are bounded by segment fsyncs)"
+
+[req."STRATA-SYS-17-005"]
+status = "PARTIAL"
+evidence = "snapshot registry with holder labels (query:<id> from the server); Engine::snapshots: open snapshots, obsolete segments/bytes pinned per snapshot, totals, share of disk; GET /api/v1/admin/snapshots, strata_snapshots_open / strata_snapshot_oldest_age_seconds / strata_obsolete_retained_*; warning above 10% of the disk (rate-limited); tests/snapshots.rs (storage and server)"
+note = "an HTTP endpoint and metrics, not a system.snapshots SQL table"
+
+# ------------------------------------------------------------- P3-1..4 --
+[req."STRATA-SYS-14-004"]
+status = "IMPLEMENTED"
+evidence = "exec::scan_ordered: ORDER BY event_time [ASC|DESC] LIMIT k reads segments and memtable windows best-first by time range in growing parallel waves and stops when the k-th row beats every remaining source; identical rows and tie order (tests/ordered_scan.rs property, mutation-checked); query.rs recent-error example now reads 1 of 3 segments; ADR-0040"
+note = "event_time is the only sort key with per-source ranges; no MergeSortedParts of pre-sorted runs"
+
+[req."STRATA-SYS-16-001"]
+status = "IMPLEMENTED"
+evidence = "stratadb_common::cache::ShardedLru: 64 shards by key hash, a lock and counters per shard, entry and byte bounds; used by the server plan cache; cache::tests (LRU, bounds, concurrency)"
+
+[req."STRATA-SYS-16-004"]
+status = "PARTIAL"
+evidence = "plan cache and decoded column cache export hits, misses, insertions, evictions, entries, bytes and a hit-latency histogram (strata_plan_cache_*, strata_column_cache_*, GET /api/v1/admin/caches), plus hit ratio for the top 100 fingerprints; tests/snapshots.rs, storage tests/column_cache.rs"
+note = "the decoded-filter cache (Bloom/trigram) does not export these yet"
+
+[req."STRATA-SYS-06-009"]
+status = "PARTIAL"
+evidence = "server::net::tune sets TCP_NODELAY on accepted connections (plain and TLS); net::tests"
+note = "responses are written whole by hyper; no application-level frame batching (no native protocol)"
+
+[req."STRATA-SYS-06-012"]
+status = "IMPLEMENTED"
+evidence = "server::net::tune: TCP keepalive idle 60 s, interval 10 s, 6 probes on accepted connections (socket2); net::tests verifies the values on macOS/Linux"
+
+[req."STRATA-SYS-12-004"]
+status = "PARTIAL"
+evidence = "per query: est_rows (metadata estimate of rows to scan) vs rows_scanned, q_error in the response stats and system.query_log attributes (est_rows, est_cpu_ms, q_error); histogram strata_query_estimate_q_error"
+note = "one estimate per query (the scan), not per operator; early stop and metadata answers inflate it by design"
+
+# ------------------------------------------------------------- P3-5 --
+[req."STRATA-SYS-16-002"]
+status = "IMPLEMENTED"
+evidence = "ShardedLru SLRU: every insert probationary, promotion to protected (80%) on a second hit, probationary evicted first; cache::tests a_scan_of_one_time_keys_does_not_evict_the_working_set; used by the decoded column cache (ADR-0042) and the plan cache"
+note = "all first inserts are probationary rather than only batch scans over 20% of the cache (same protection, no query class needed at the storage layer); no TinyLFU admission"
+
+# ------------------------------------------------------------- P3-6 --
+[req."STRATA-SYS-14-001"]
+status = "IMPLEMENTED"
+evidence = "crates/stratadb-query/src/sort.rs: fixed-width memcmp-comparable keys (9 B per column: tag incl. null/missing, big-endian sign-flipped ints, IEEE total-order floats, 7-byte string prefix + length after the column's common prefix, DESC by bitwise NOT) with the full comparator as tie-break; each segment's rows sorted on its scan worker, runs merged by a loser tree (merge_runs, QueryStats.sort_runs_merged); proptests vs a stable comparison sort (prefix agreement, boundary values pairwise, merge), mutation-checked; tests/sort.rs on/off equivalence incl. pagination; ADR-0043"
+note = "result sets are bounded (max_result_rows), so there is no external phase (14-005)"
+
+[req."STRATA-SYS-14-002"]
+status = "IMPLEMENTED"
+evidence = "sort::order: stable LSD radix sort (constant digits skipped) when n >= 4096 and the compared key is <= 16 bytes, pdqsort over the permutation otherwise; full sorts 1.8-9.4x faster than the comparison sort (sort_kernel_ab, report 2026-11-28-normalized-sort)"
+note = "selections keeping under a quarter of the rows stay on comparison selection (encoding every row costs more there, measured)"
+
+[req."STRATA-SYS-14-006"]
+status = "PARTIAL"
+evidence = "the sort orders a permutation of row indices by key, then moves each row once (no payload is carried through the sort)"
+note = "always a permutation; no width-based choice to carry narrow payloads along with the keys"
+
+# ------------------------------------------------------------- P3-7 --
+[req."STRATA-SYS-06-003"]
+status = "IMPLEMENTED"
+evidence = "apps/stratadb-server/src/json_out.rs: rows encoded per column in 1,024-row blocks into scratch buffers, then interleaved with pre-encoded keys; itoa + zmij (shortest round-trip) numbers, non-allocating RFC 3339 timestamps; byte-identical to serde_json (proptests incl. escaping, key order, missing cells, nested values); 587 MB/s per core vs 186 MB/s for the old value tree (3.17x) on events-table rows (json_throughput, report 2026-11-28-json-serializer, ADR-0044)"
+note = "rows are encoded off the async reactor (blocking pool); the response is still built whole, not streamed (06-002)"

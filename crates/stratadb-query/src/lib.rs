@@ -14,12 +14,17 @@ pub mod page;
 pub mod parser;
 pub mod plan;
 pub mod pool;
+mod sort;
 mod vector;
 
 pub use ast::Table;
 pub use eval::Datum;
 pub use exec::{
-    execute, execute_page, Catalog, Page, PageRequest, QueryOptions, QueryOutput, QueryStats,
+    execute, execute_page, execute_page_prepared, execute_prepared, parse, Catalog, Estimate,
+    HashTableStats, Page, PageRequest, Parsed, Prepared, QueryOptions, QueryOutput, QueryStats,
+    TARGET_MS_PER_WORKER,
 };
 pub use fingerprint::{fingerprint, Fingerprint};
-pub use pool::{configure_scan_pool, scan_pool, PoolStats};
+pub use pool::{
+    configure_scan_pool, scan_pool, tenant_key, ClassUsage, PoolStats, Step, Tag, Task,
+};

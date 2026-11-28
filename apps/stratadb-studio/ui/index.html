@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>StrataStudio</title>
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/app.css">
+<script type="module" src="/assets/js/main.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="topbar">
+  <button id="nav-toggle" class="icon-btn" type="button" aria-label="Toggle the object browser" aria-controls="sidebar" aria-expanded="true">
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18" class="stroke"/></svg>
+  </button>
+  <div class="brand"><img src="/assets/favicon.svg" alt="" width="22" height="22"><span>Strata<strong>Studio</strong></span></div>
+  <div class="topbar-spacer"></div>
+  <span id="studio-version" class="muted small"></span>
+  <button id="theme-toggle" class="btn ghost" type="button" aria-label="Switch colour theme">Dark</button>
+  <button id="logout" class="btn ghost" type="button" hidden>Log out</button>
+</header>
+<div class="layout" id="app" hidden>
+  <aside id="sidebar" class="sidebar" aria-label="Object browser">
+    <div class="sidebar-head">
+      <h2>Browser</h2>
+      <button id="add-server" class="btn small" type="button">+ Server</button>
+    </div>
+    <nav id="tree" class="tree" aria-label="Servers"></nav>
+  </aside>
+  <main id="main" class="main" tabindex="-1">
+    <div id="tabs" class="tabs" role="tablist" aria-label="Open panels"></div>
+    <div id="panels" class="panels"></div>
+  </main>
+</div>
+<section id="login" class="login-screen" hidden aria-labelledby="login-title">
+  <form id="login-form" class="login-card" autocomplete="on">
+    <div class="brand big"><img src="/assets/favicon.svg" alt="" width="36" height="36"><span>Strata<strong>Studio</strong></span></div>
+    <h1 id="login-title">Sign in</h1>
+    <p class="muted">This studio requires a password.</p>
+    <label for="login-password">Password</label>
+    <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+    <p id="login-error" class="form-error" role="alert" hidden></p>
+    <button class="btn primary" type="submit">Sign in</button>
+  </form>
+</section>
+<div id="boot" class="boot" role="status">Loading StrataStudio…</div>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+<dialog id="modal" class="modal" aria-modal="true"></dialog>
+<noscript><p class="noscript">StrataStudio needs JavaScript enabled.</p></noscript>
+</body>
+</html>

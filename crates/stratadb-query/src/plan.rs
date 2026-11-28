@@ -215,6 +215,97 @@ fn intersect_sev(p: &mut Pruning, set: BTreeSet<u8>) {
 
 /// Derive pruning predicates. Only top-level conjuncts are used, and only
 /// forms whose truth implies the pruning condition (soundness).
+/// A filter that metadata can evaluate exactly: only `event_time`
+/// comparisons with timestamp literals and `severity = 'NAME'` /
+/// `severity IN (...)` with canonical names, joined by `AND`. A source whose
+/// time range lies inside `[time_lo, time_hi]` then matches exactly the rows
+/// of the listed severities (STRATA-SYS-09-006/007).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetaFilter {
+    /// Inclusive bounds.
+    pub time_lo: Option<i64>,
+    pub time_hi: Option<i64>,
+    /// `None`: every severity.
+    pub severities: Option<BTreeSet<u8>>,
+}
+
+impl MetaFilter {
+    /// `None` when any part of `filter` is not of the supported forms.
+    pub fn of(filter: Option<&Expr>) -> Option<Self> {
+        let mut m = MetaFilter::default();
+        let Some(f) = filter else {
+            return Some(m);
+        };
+        let canonical = |v: &Value| -> Option<u8> {
+            let s = v.as_str()?;
+            let sev = Severity::parse(s)?;
+            (sev.as_str() == s).then(|| sev.as_u8())
+        };
+        let mut cs = Vec::new();
+        conjuncts(f, &mut cs);
+        for c in cs {
+            match c {
+                Expr::Cmp(a, op, b) => {
+                    let (col, op, lit) = match (a.as_ref(), b.as_ref()) {
+                        (Expr::Column(c), Expr::Literal(v)) => (c, *op, v),
+                        (Expr::Literal(v), Expr::Column(c)) => (c, op.flip(), v),
+                        _ => return None,
+                    };
+                    match (col, lit) {
+                        (ColumnRef::EventTime, Value::Timestamp(t)) => {
+                            let t = *t;
+                            let (lo, hi) = match op {
+                                CmpOp::Eq => (Some(t), Some(t)),
+                                CmpOp::Ge => (Some(t), None),
+                                CmpOp::Gt => (Some(t.checked_add(1)?), None),
+                                CmpOp::Le => (None, Some(t)),
+                                CmpOp::Lt => (None, Some(t.checked_sub(1)?)),
+                                CmpOp::Ne => return None,
+                            };
+                            if let Some(lo) = lo {
+                                m.time_lo = Some(m.time_lo.map_or(lo, |x| x.max(lo)));
+                            }
+                            if let Some(hi) = hi {
+                                m.time_hi = Some(m.time_hi.map_or(hi, |x| x.min(hi)));
+                            }
+                        }
+                        (ColumnRef::Severity, v) if op == CmpOp::Eq => {
+                            m.restrict(BTreeSet::from([canonical(v)?]));
+                        }
+                        _ => return None,
+                    }
+                }
+                Expr::InList {
+                    expr,
+                    list,
+                    negated: false,
+                } if matches!(expr.as_ref(), Expr::Column(ColumnRef::Severity)) => {
+                    let set = list
+                        .iter()
+                        .map(canonical)
+                        .collect::<Option<BTreeSet<u8>>>()?;
+                    m.restrict(set);
+                }
+                _ => return None,
+            }
+        }
+        Some(m)
+    }
+
+    fn restrict(&mut self, set: BTreeSet<u8>) {
+        self.severities = Some(match self.severities.take() {
+            Some(prev) => prev.intersection(&set).copied().collect(),
+            None => set,
+        });
+    }
+
+    /// Whether every row of a source with this inclusive time range passes
+    /// the time bounds.
+    pub fn covers_time(&self, (min, max): (i64, i64)) -> bool {
+        self.time_lo.is_none_or(|lo| min >= lo) && self.time_hi.is_none_or(|hi| max <= hi)
+    }
+}
+
 pub fn extract_pruning(filter: &Expr) -> Pruning {
     let mut p = Pruning::default();
     let mut cs = Vec::new();
@@ -311,9 +402,194 @@ pub fn extract_pruning(filter: &Expr) -> Pruning {
     p
 }
 
+/// A literal's truth value in a filter (`truth_of`): `None` when `e` is not
+/// a literal.
+fn literal_truth(e: &Expr) -> Option<crate::eval::Truth> {
+    match e {
+        Expr::Literal(v) => Some(crate::eval::truth_of(&Some(v.clone()))),
+        _ => None,
+    }
+}
+
+fn truth_literal(t: crate::eval::Truth) -> Expr {
+    Expr::Literal(t.map_or(Value::Null, Value::Bool))
+}
+
+fn flatten<'e>(e: &'e Expr, and: bool, out: &mut Vec<&'e Expr>) {
+    match e {
+        Expr::And(l, r) if and => {
+            flatten(l, and, out);
+            flatten(r, and, out);
+        }
+        Expr::Or(l, r) if !and => {
+            flatten(l, and, out);
+            flatten(r, and, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Constant folding and duplicate elimination for a filter (spec
+/// STRATA-SYS-08-018), exact under three-valued logic:
+/// - comparisons, `IN`, `LIKE`, `IS [NOT] NULL` and `time_bucket` over
+///   literals are evaluated once;
+/// - `false AND x` = `false`, `true AND x` = `x`, `true OR x` = `true`,
+///   `false OR x` = `x`, `NOT literal` folds;
+/// - repeated operands of an `AND` (or `OR`) chain are kept once.
+pub fn fold(e: &Expr) -> Expr {
+    match e {
+        Expr::And(..) | Expr::Or(..) => {
+            let and = matches!(e, Expr::And(..));
+            let mut parts = Vec::new();
+            flatten(e, and, &mut parts);
+            let mut kept: Vec<Expr> = Vec::new();
+            for p in parts {
+                let f = fold(p);
+                match literal_truth(&f) {
+                    // Absorbing element: the whole chain is decided.
+                    Some(Some(b)) if b != and => return truth_literal(Some(b)),
+                    // Identity element: drop it.
+                    Some(Some(_)) => continue,
+                    _ => {}
+                }
+                if !kept.contains(&f) {
+                    kept.push(f);
+                }
+            }
+            let mut it = kept.into_iter();
+            match it.next() {
+                // Every operand was the identity.
+                None => truth_literal(Some(and)),
+                Some(first) => it.fold(first, |acc, x| {
+                    if and {
+                        Expr::And(Box::new(acc), Box::new(x))
+                    } else {
+                        Expr::Or(Box::new(acc), Box::new(x))
+                    }
+                }),
+            }
+        }
+        Expr::Not(x) => {
+            let f = fold(x);
+            match literal_truth(&f) {
+                Some(t) => truth_literal(crate::eval::not(t)),
+                None => Expr::Not(Box::new(f)),
+            }
+        }
+        Expr::Cmp(l, op, r) => {
+            let (l, r) = (fold(l), fold(r));
+            if let (Expr::Literal(a), Expr::Literal(b)) = (&l, &r) {
+                let o = crate::eval::compare(&Some(a.clone()), &Some(b.clone()));
+                return truth_literal(o.map(|o| match op {
+                    CmpOp::Eq => o.is_eq(),
+                    CmpOp::Ne => o.is_ne(),
+                    CmpOp::Lt => o.is_lt(),
+                    CmpOp::Le => o.is_le(),
+                    CmpOp::Gt => o.is_gt(),
+                    CmpOp::Ge => o.is_ge(),
+                }));
+            }
+            Expr::Cmp(Box::new(l), *op, Box::new(r))
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let x = fold(expr);
+            if let Expr::Literal(v) = &x {
+                let d = Some(v.clone());
+                let mut unknown = false;
+                let mut found = false;
+                for item in list {
+                    match crate::eval::compare(&d, &Some(item.clone())) {
+                        Some(o) if o.is_eq() => {
+                            found = true;
+                            break;
+                        }
+                        Some(_) => {}
+                        None => unknown = true,
+                    }
+                }
+                let t = if found {
+                    Some(true)
+                } else if unknown {
+                    None
+                } else {
+                    Some(false)
+                };
+                return truth_literal(if *negated { crate::eval::not(t) } else { t });
+            }
+            Expr::InList {
+                expr: Box::new(x),
+                list: list.clone(),
+                negated: *negated,
+            }
+        }
+        Expr::IsNull { expr, negated } => {
+            let x = fold(expr);
+            if let Expr::Literal(v) = &x {
+                return truth_literal(Some(matches!(v, Value::Null) != *negated));
+            }
+            Expr::IsNull {
+                expr: Box::new(x),
+                negated: *negated,
+            }
+        }
+        Expr::IsMissing { expr, negated } => {
+            let x = fold(expr);
+            if matches!(x, Expr::Literal(_)) {
+                // A literal is never missing.
+                return truth_literal(Some(*negated));
+            }
+            Expr::IsMissing {
+                expr: Box::new(x),
+                negated: *negated,
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+        } => {
+            let x = fold(expr);
+            if let Expr::Literal(v) = &x {
+                let t = match v {
+                    Value::String(s) => {
+                        Some(crate::eval::like(s, pattern, *case_insensitive) != *negated)
+                    }
+                    _ => None,
+                };
+                return truth_literal(t);
+            }
+            Expr::Like {
+                expr: Box::new(x),
+                pattern: pattern.clone(),
+                negated: *negated,
+                case_insensitive: *case_insensitive,
+            }
+        }
+        Expr::TimeBucket { width_ns, expr } => {
+            let x = fold(expr);
+            if let Expr::Literal(v) = &x {
+                return Expr::Literal(match v {
+                    Value::Timestamp(t) => Value::Timestamp(t.div_euclid(*width_ns) * width_ns),
+                    _ => Value::Null,
+                });
+            }
+            Expr::TimeBucket {
+                width_ns: *width_ns,
+                expr: Box::new(x),
+            }
+        }
+        other => other.clone(),
+    }
+}
+
 impl Plan {
     pub fn new(stmt: Statement) -> Result<Self> {
-        let q = stmt.query;
+        let mut q = stmt.query;
         if let Some(f) = &q.filter {
             if f.contains_agg() {
                 return Err(Error::invalid_input(
@@ -322,6 +598,12 @@ impl Plan {
             }
             type_check(f)?;
         }
+        // Fold constants (a filter that folds to true keeps every row).
+        q.filter = q
+            .filter
+            .as_ref()
+            .map(fold)
+            .filter(|f| literal_truth(f) != Some(Some(true)));
         for g in &q.group_by {
             if g.contains_agg() {
                 return Err(Error::invalid_input(
@@ -529,6 +811,38 @@ mod tests {
 
     fn plan(s: &str) -> Result<Plan> {
         Plan::new(parse(s, &ParseLimits::default())?)
+    }
+
+    #[test]
+    fn filters_are_folded_and_deduplicated() {
+        let p =
+            plan("SELECT body FROM logs WHERE 1 = 1 AND severity = 'ERROR' AND severity = 'ERROR'")
+                .unwrap();
+        assert_eq!(
+            p.filter.as_ref().unwrap().to_string(),
+            plan("SELECT body FROM logs WHERE severity = 'ERROR'")
+                .unwrap()
+                .filter
+                .unwrap()
+                .to_string()
+        );
+        // A filter that folds to true keeps every row: no filter at all.
+        assert!(plan("SELECT body FROM logs WHERE 2 > 1 OR service = 'x'")
+            .unwrap()
+            .filter
+            .is_none());
+        // ... and one that folds to false stays as a constant.
+        let p = plan("SELECT body FROM logs WHERE 1 = 2 AND service = 'x'").unwrap();
+        assert_eq!(p.filter, Some(Expr::Literal(Value::Bool(false))));
+        // Unknown (NULL) is not an identity element of AND.
+        let p = plan("SELECT body FROM logs WHERE NULL = 1 AND service = 'x'").unwrap();
+        assert!(matches!(p.filter, Some(Expr::And(..))), "{:?}", p.filter);
+        // Folding feeds pruning: the time bound survives the constant.
+        let p = plan(
+            "SELECT body FROM logs WHERE TRUE AND event_time >= TIMESTAMP '2026-01-01T00:00:00Z'",
+        )
+        .unwrap();
+        assert!(p.pruning.time_lo.is_some());
     }
 
     #[test]

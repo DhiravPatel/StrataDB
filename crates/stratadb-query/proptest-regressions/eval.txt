@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 2a2b85e7527d7dff4a799a1b56edf3017ff9d84379539b97eaa6872be0e7b8c1 # shrinks to text = "\\%", pattern = "%\\", ci = false
+cc acc16a3d6523391f819088abb729a7e04185e3e8f7aebab7cc54a6a7a9dbf2b6 # shrinks to text = "AaaCA", lit = "aCA", lead = true, trail = true, ci = true

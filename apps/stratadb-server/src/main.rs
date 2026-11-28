@@ -175,6 +175,8 @@ fn init_logging() {
 }
 
 fn serve(r: Resolved) -> Result<()> {
+    // Server lifecycle (spec IX.22.7): STARTING until the config is applied.
+    let life = Arc::new(stratadb_server::lifecycle::Lifecycle::default());
     let tls = match &r.tls {
         Some(t) => Some(stratadb_server::tls::load_server_config(&t.cert, &t.key)?),
         None => None,
@@ -258,6 +260,16 @@ fn serve(r: Resolved) -> Result<()> {
     eopts.memory = Some(Arc::clone(&mem.ingest));
     eopts.cache_memory = Some(Arc::clone(&mem.cache));
     eopts.background_memory = Some(Arc::clone(&mem.background));
+    // The decoded column cache lives in the cache region.
+    if eopts.column_cache_bytes as u64 > mplan.cache {
+        tracing::warn!(
+            component = "memory",
+            configured = eopts.column_cache_bytes,
+            capped = mplan.cache,
+            "column_cache_bytes capped to the cache memory region"
+        );
+        eopts.column_cache_bytes = usize::try_from(mplan.cache).unwrap_or(usize::MAX);
+    }
     // Flush well before the ingest region fills (active + frozen memtables).
     let cap = usize::try_from(mplan.ingest / 4)
         .unwrap_or(usize::MAX)
@@ -283,7 +295,9 @@ fn serve(r: Resolved) -> Result<()> {
         per_query = mplan.per_query,
         "memory budget"
     );
+    life.recovering();
     let engine = Arc::new(Engine::open(eopts.clone())?);
+    life.warming();
     let query_log = if r.query_log.enabled {
         let q = stratadb_server::query_log::QueryLog::open(&r.data_dir, &eopts, &r.query_log)?;
         tracing::info!(
@@ -305,10 +319,12 @@ fn serve(r: Resolved) -> Result<()> {
     )?;
     let mut state = AppState::new(Arc::clone(&engine), tokens, r.server.clone())
         .with_audit(AuditLog::open(&r.data_dir)?)
-        .with_memory(Arc::clone(&mem));
+        .with_memory(Arc::clone(&mem))
+        .with_lifecycle(Arc::clone(&life));
     if let Some(q) = &query_log {
         state = state.with_query_log(Arc::clone(q));
     }
+    let admission = state.admission();
     let app = router(state);
     let net_id = std::sync::atomic::AtomicUsize::new(0);
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -328,35 +344,75 @@ fn serve(r: Resolved) -> Result<()> {
         .build()
         .map_err(|e| Error::io("starting runtime", e))?;
     let listen = r.listen;
+    let (life_rt, health_engine) = (Arc::clone(&life), Arc::downgrade(&engine));
     rt.block_on(async move {
+        let life = life_rt;
         // RSS vs tracked memory every 10 s (STRATA-SYS-05-009), off the
         // async workers since reading RSS may spawn `ps` outside Linux.
+        // The same tick re-evaluates device/table/server health (it reads
+        // disk space).
         let sampler = Arc::clone(&mem);
+        // A weak reference, so shutdown can still take sole ownership of the
+        // engine to close it.
+        let health_life = Arc::clone(&life);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(10));
             loop {
                 tick.tick().await;
                 let m = Arc::clone(&sampler);
-                let _ = tokio::task::spawn_blocking(move || m.sample()).await;
+                let (l, e) = (Arc::clone(&health_life), health_engine.clone());
+                let _ = tokio::task::spawn_blocking(move || {
+                    m.sample();
+                    if let Some(e) = e.upgrade() {
+                        l.tick(&e, std::time::Instant::now());
+                    }
+                })
+                .await;
+            }
+        });
+        // Admission controller (spec STRATA-SYS-11-005): AIMD on batch
+        // slots, pressure readings, demotions. Reads /proc, so it runs off
+        // the async workers.
+        let interval = admission.settings().controller_interval;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            loop {
+                tick.tick().await;
+                let a = Arc::clone(&admission);
+                let _ = tokio::task::spawn_blocking(move || a.tick()).await;
             }
         });
         let listener = tokio::net::TcpListener::bind(listen)
             .await
             .map_err(|e| Error::io(format!("binding {listen}"), e))?;
         tracing::info!(component = "server", addr = %listen, tls = tls.is_some(), "listening");
+        life.ready();
+        let signal_life = Arc::clone(&life);
+        let on_signal = move || {
+            let l = Arc::clone(&signal_life);
+            async move {
+                shutdown_signal().await;
+                l.draining();
+            }
+        };
         match tls {
             Some(cfg) => {
                 let l = stratadb_server::tls::TlsListener::new(listener, cfg)
                     .map_err(|e| Error::io("starting TLS listener", e))?;
                 axum::serve(l, app)
-                    .with_graceful_shutdown(shutdown_signal())
+                    .with_graceful_shutdown(on_signal())
                     .await
                     .map_err(|e| Error::io("serving", e))
             }
-            None => axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await
-                .map_err(|e| Error::io("serving", e)),
+            None => axum::serve(
+                axum::serve::ListenerExt::tap_io(listener, |s: &mut tokio::net::TcpStream| {
+                    stratadb_server::net::tune(s)
+                }),
+                app,
+            )
+            .with_graceful_shutdown(on_signal())
+            .await
+            .map_err(|e| Error::io("serving", e)),
         }
     })?;
     tracing::info!(component = "server", "shutting down; flushing");
@@ -372,10 +428,12 @@ fn serve(r: Resolved) -> Result<()> {
             }
         }
     }
-    match Arc::try_unwrap(engine) {
+    let closed = match Arc::try_unwrap(engine) {
         Ok(e) => e.close(),
         Err(_) => Ok(()), // remaining references drop → WAL synced in Drop; recovery covers the rest
-    }
+    };
+    life.stopped();
+    closed
 }
 
 fn healthcheck(addr: SocketAddr, tcp_only: bool) -> Result<()> {

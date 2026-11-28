@@ -28,7 +28,7 @@ stages are not lost.
 | Series | Stages |
 |--------|--------|
 | `strata_insert_stage_seconds{stage}` | in pipeline order: `auth`, `decode` (body decompress, UTF-8, JSON framing), `validate` (event mapping and limits), `admission` (flush-backlog backpressure wait), `wal_encode` (batch encoding), `wal_append` (frame + CRC + write, including WAL lock wait), `group_commit_wait` (written → durable; sync modes), `memtable_insert`, `ack` (response construction). Server stages cover `/api/v1/ingest`; engine stages cover every write path |
-| `strata_query_stage_seconds{stage}` | `queue` (waiting for an execution thread), `parse`, `plan`, `exec`, `serialize`; successful queries only |
+| `strata_query_stage_seconds{stage}` | `queue` (waiting for an execution thread), `parse`, `plan`, `exec`, `serialize` (row encoding on the blocking pool plus the envelope); successful queries only |
 
 ## Group commit
 `strata_wal_group_delay_seconds` (µs buckets) is the time the WAL sync leader
@@ -144,8 +144,63 @@ number of concurrent writers (ADR-0032).
 `memtable_bytes`, `segment_bytes`, `wal_durable_seq`, `engine_failed` — see the
 `# HELP` text of each series.
 
+## Plan cache and estimates (ADR-0040)
+| Series | Meaning |
+|--------|---------|
+| `strata_plan_cache_{hits,misses,insertions,evictions}_total` | plan cache lookups and changes |
+| `strata_plan_cache_entries`, `strata_plan_cache_bytes` | cached plans and their approximate size |
+| `strata_plan_cache_hit_seconds` | histogram of hit lookup latency |
+| `strata_plan_cache_fingerprint_hit_ratio{fingerprint}` | hit ratio of the 100 most looked-up query shapes |
+| `strata_column_cache_{hits,misses,insertions,evictions}_total`, `strata_column_cache_bytes`, `strata_column_cache_protected_entries`, `strata_column_cache_hit_seconds` | decoded column cache (only when `[storage] column_cache_bytes` > 0): bytes are charged to the cache memory region; protected = used at least twice (SLRU) |
+| `strata_query_estimate_q_error` | histogram of max(estimated/actual, actual/estimated) rows per query; high values also come from early stops and metadata answers (work avoided) |
+
+## Snapshots and retained segments (spec VIII.17, ADR-0039)
+| Series | Meaning |
+|--------|---------|
+| `strata_snapshots_open` | engine snapshots currently held (each query holds one while it runs) |
+| `strata_snapshot_oldest_age_seconds` | age of the oldest open snapshot: a long-running query keeps its segments alive |
+| `strata_obsolete_segments`, `strata_obsolete_retained_bytes` | replaced segments (compaction, retention, upgrade) whose files still exist: pinned by a snapshot or within `old_segments_lifetime` |
+| `strata_obsolete_retained_ratio` | retained bytes / disk size; the server warns above 0.10 and `GET /api/v1/admin/snapshots` names the holders |
+
+## Workload classes and admission (spec VIII.11, ADR-0036)
+| Series | Meaning |
+|--------|---------|
+| `strata_workload_slots{class}` | concurrent query slots of the class (batch is adapted by the AIMD controller) |
+| `strata_workload_running{class}`, `strata_workload_queued{class}` | queries running / waiting for a slot |
+| `strata_workload_queries_total{class,outcome}` | `admitted`, `queue_full`, `overloaded`, `queue_timeout`, `cancelled_queued` |
+| `strata_workload_queue_wait_seconds{class}` | histogram of time spent waiting for a slot |
+| `strata_workload_demotions_total{class}` | running queries demoted out of the class (ran past 2x its time budget) |
+| `strata_workload_cpu_seconds_total{class}` | CPU time of finished queries, by the class they ended in |
+| `strata_scan_pool_class_cpu_seconds_total{class}` | scan-pool worker CPU by class (the fair queue's view) |
+
+Per-class arrival rate, mean service time, utilization and queue-wait p99 are
+in `GET /api/v1/admin/workload`.
+
+## State machines (spec IX.22, ADR-0035)
+| Series | Meaning |
+|--------|---------|
+| `strata_state_seconds{machine,state}` | histogram of time spent in a state, recorded when the state is left (terminal states are never left) |
+| `strata_state_entities{machine,state}` | entities in each state now (queries running, WAL segments sealed, ...) |
+| `strata_state_illegal_transitions_total{machine}` | transitions refused because the spec does not allow them; anything non-zero is a bug |
+
+Machines are `query_lifecycle`, `insert_lifecycle`, `wal_segment`,
+`merge_task`, `connection` (exported but not yet driven), `table`, `server`
+and `device`. The current server state is also in `GET /api/v1/ready`
+(`"state"`), which returns 503 while the server is starting or draining.
+
+Examples:
+* stuck queries: `strata_state_entities{machine="query_lifecycle",state="RUNNING"}`
+  keeps rising, or the p99 of `strata_state_seconds{machine="query_lifecycle",state="QUEUED"}` grows (admission);
+* WAL not reclaimed: `strata_state_entities{machine="wal_segment",state="SEALED"}` grows (flushes are behind);
+* device: `strata_state_entities{machine="device",state="DEGRADED"} == 1` means
+  the fsync p99 has been above 4× its baseline for 30 s.
+
 ## Suggested alerts
 * `engine_failed == 1` — engine in fail-stop state (restart; see runbooks/recovery.md).
 * `rate(write_rejections_total[5m]) > 0` or `disk_write_rejections_total` increasing — backpressure / disk reserve.
 * p99 of `wal_sync_seconds` rising — storage latency problem (affects every acknowledgement in `sync`/`group_commit`).
 * `rate(queries_total{outcome=~"timeout|rejected"}[5m])` — query budgets too tight or overload.
+* `strata_state_entities{machine="server",state="DEGRADED"} == 1` — device degraded or table read-only (disk reserve, engine failure).
+* `strata_state_illegal_transitions_total > 0` — a lifecycle bug; report it.
+* `rate(strata_workload_queries_total{outcome=~"queue_full|queue_timeout"}[5m]) > 0` — queries refused for lack of slots: raise `[workload]` slots or `max_concurrent_queries`, or find the expensive queries.
+* `strata_workload_slots{class="batch"}` below its configured value for a long time — interactive latency is over target under CPU saturation (the controller is shedding batch work).

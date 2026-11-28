@@ -115,7 +115,137 @@ Evidence for changes like this one comes from the ledger (`strata-bench
 ledger --path X --write`, interleaved base and new runs); it is far steadier
 than the scenarios.
 
-**Next is A1-3**: state-machine metrics `strata_state_seconds` (ARCH-22-*).
+A1-3 is **done** (ADR-0035): the spec IX.22 state machines.
+- `stratadb_common::state` holds the tables (a test checks them against the
+  spec text) and `Tracker`. An illegal edge is counted and logged, and
+  `debug_assert`s, so tests catch it.
+- **Drivers:** query and insert in `apps/stratadb-server/src/lib.rs`; WAL
+  segment in `stratadb-wal`; merge task in `engine/maintenance.rs`
+  (`rewrite`); server, table and device in
+  `apps/stratadb-server/src/lifecycle.rs`, ticked every 10 s from the RSS
+  sampler task.
+- **Tests:** `apps/stratadb-server/tests/lifecycle.rs`,
+  `crates/stratadb-wal/tests/lifecycle.rs` and
+  `crates/stratadb-storage/tests/merge_lifecycle.rs`. Each is one test per
+  binary, because the counters are process-wide.
+- `WriteTimings.throttled` is now zero unless the write really waited.
+
+P2-1 is **done** (ADR-0036): workload classes, fair scheduling and
+admission.
+- `stratadb_common::workload` has `WorkClass`, `Classifier`, `ClassCell`
+  and `FairQueue`.
+- **Scan pool:** stepped tasks (`Step`, `Tag`), per-class caps,
+  `help_higher` and `higher_busy`, and `enter` guards.
+- **Server:** `apps/stratadb-server/src/admission.rs` (admission, AIMD,
+  stats), the `[workload]` config, `/api/v1/admin/workload`, and the
+  `workload_class` request field.
+- **Evidence:** report 2026-11-27-workload-classes. There is no overhead.
+  The embedded mixed benchmark shows no latency gain, because caller
+  threads outnumber cores; the guarantees are covered by tests.
+- **Scenario:** `benchmarks/scenarios/workload.toml`. Loads now take
+  `class` and `alongside`.
+
+P2-2 is **done** (ADR-0037).
+- **Metadata answers:** `exec::MetaPlan` / `plan::MetaFilter` answer global
+  `count`/`min`/`max(event_time)` from segment and window metadata.
+  `ScanSource::severity_counts` is new.
+- **Code aggregation:** a dense per-batch array maps dictionary/byte codes
+  to groups (`KeySrc::domain`/`code`).
+- **Group table:** `GroupTable` has `growth_bytes`, `heap_bytes` and
+  `stats`, and EXPLAIN ANALYZE prints a "Hash table" line.
+- **Switches:** `enable_metadata_aggregates` and `enable_dense_groups`.
+  Tests that exercise scans now turn metadata answers off, because a plain
+  `count(*)` reads no rows.
+- **Bench:** the ledger's kernel operators run with metadata off;
+  `count_from_metadata` is new. Plan assertions gain
+  `sources_from_metadata` and `dense_group_batches`, and the standard
+  scenario has q14.
+- **Possible cost:** high-cardinality GROUP BY may be 2–3% slower (ledger
+  0.97×; near the noise band).
+
+P2-3 is **done** (ADR-0038).
+- **Kernels:** `eval::LikePattern` has `memmem`/ASCII-folding fast paths;
+  `vector::Conjunction` is the adaptive `AND`.
+- **Planner:** `plan::fold` folds constants.
+- **Columns:** `StrColumn::null_count`/`get_present` back the lazy bitmap.
+- **Dependency:** `memchr` is now direct; it was already in the lock file.
+- **Evidence:** in-process kernel microbenchmarks (report
+  2026-11-27-string-kernels).
+
+**FIRST, on AC power:** run the P2-3 end-to-end A/B. The session ran on
+battery, which made scenario and ledger numbers unusable (crc32c 64 vs 33
+ns/KiB).
+- **Baseline:** rebuild it from this tree with the four P2-3 hot-path
+  changes reverted, as described in the report.
+- **Run:** standard (with q15/q16) and memtable, 3 alternating rounds,
+  plus the ledger (including `ilike_substring_count`).
+- **Then:** update the report and perf-status.
+
+Before benchmarking, check `pmset -g batt` (AC power) as well as `uptime`.
+
+P2-4 is **done** (ADR-0039).
+- **Read view:** `Shared::view` (an `ArcSwap<ReadView>`) is republished by
+  `Shared::publish` under the state lock after freeze, flush and rewrite.
+- **Segment lists:** `State.by_tenant` is the source of truth;
+  `all_segments()` serves admin paths.
+- **Registry:** a `Pins` registry backs `Engine::snapshots()`, and
+  `Snapshot::set_holder` labels a snapshot.
+- **Lifetime:** `EngineOptions::old_segments_lifetime` defaults to 8 min.
+  Tests that check reclamation set 0.
+- **Server:** `GET /api/v1/admin/snapshots`, `strata_snapshot*` /
+  `strata_obsolete_*` metrics, and a retained-bytes warning in
+  `lifecycle::tick`.
+
+P3-1..4 are **done** (ADR-0040).
+- **Ordered scans:** `exec::scan_ordered`, with `enable_ordered_scan` and
+  `sources_skipped_by_order`.
+- **Plan cache:** `stratadb_common::cache::ShardedLru` and the server's
+  `plan_cache` (`/api/v1/admin/caches`, `[limits] plan_cache_*`).
+  `Prepared` now holds `Arc<Plan>` and has `Prepared::cached`.
+- **Sockets:** `server::net::tune` sets nodelay and keepalive.
+- **Q-error:** `est_rows`/`q_error` in stats and the query log, and
+  `strata_query_estimate_q_error`.
+
+**StrataStudio** is built (`apps/stratadb-studio`, ADR-0041; run it with
+`strata-studio serve`, see `docs/studio/README.md`). Its server requests are
+done (ADR-0042).
+
+P3-7 has started: the columnar JSON serializer is **done** (ADR-0044).
+- **Serializer:** `apps/stratadb-server/src/json_out.rs` provides
+  `write_rows`, `envelope_parts` and `ChunkedBody`.
+- **Query handler:** it encodes rows inside the blocking closure
+  (`EncodedRows`) and sends prefix + rows + suffix with an exact length.
+- **Timestamps:** `stratadb_common::time::write_rfc3339`.
+- **Dependencies:** itoa, zmij, http-body and bytes, all of them already
+  in the build.
+- **Next in P3-7:** streamed results (06-002), then the native protocol
+  and the cost model.
+
+P3-6 is **done** (ADR-0043).
+- **Sort module:** `stratadb_query::sort` has the normalized keys, radix
+  and pdqsort over a permutation, and the loser-tree `merge_runs`.
+- **Where sorting runs:** scan tasks sort their segment's rows, and the
+  query thread merges the runs. `Ctx::sorted_rows` marks the merged prefix.
+- **Top-k bound:** `SharedBudget::offer_bound` plus `Ctx::refresh_bound`
+  form the top-k bound (rows strictly after it are skipped). Workers
+  compact from 2k, at least 64 rows, when a bound exists.
+- **Switches:** `enable_normalized_sort` and `enable_topk_bound`.
+- **Stats:** `sort_runs_merged` and `topk_rows_skipped`.
+- **Behaviour change:** `eval::sort_cmp` compares numbers exactly.
+- **Evidence:** report 2026-11-28-normalized-sort, measured on battery.
+  Rerun it on AC power with the rest of the pending A/B.
+
+P3-5 is **done** (ADR-0042).
+- **Columns:** `ColumnData` buffers are `Arc`-shared.
+- **Cache:** `ShardedLru` is SLRU. `stratadb_storage::colcache` is the
+  opt-in decoded column cache (`column_cache_bytes`), with
+  `column_cache_hits` in query stats.
+
+**Next:**
+- **The pending A/B**, on AC power and an otherwise idle machine. Baseline:
+  this tree with P2-3, P2-4 and P3 reverted (see report
+  2026-11-27-string-kernels), or the committed tree once the owner commits.
+- **Then P3-5.**
 
 Before benchmarking, check `uptime`: this session saw external load as high
 as 88 and a machine sleep. Disk is tight: `target/debug/incremental` grew to

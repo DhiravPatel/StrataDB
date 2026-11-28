@@ -83,14 +83,16 @@ impl ColumnId {
 
 /// Decoded column values, one entry per row.
 #[derive(Debug, Clone, PartialEq)]
+/// Buffers are shared (`Arc`) and immutable once built: cloning a column is
+/// O(1), so decoded columns can be cached and handed to several queries.
 pub enum ColumnData {
-    Ints(Vec<i64>),
-    U8s(Vec<u8>),
+    Ints(std::sync::Arc<Vec<i64>>),
+    U8s(std::sync::Arc<Vec<u8>>),
     /// Typed string column (no allocation per row; dictionary-encoded when
     /// the source was).
     Strs(StrColumn),
-    Values(Vec<Option<Value>>),
-    Maps(Vec<BTreeMap<String, Value>>),
+    Values(std::sync::Arc<Vec<Option<Value>>>),
+    Maps(std::sync::Arc<Vec<BTreeMap<String, Value>>>),
 }
 
 fn wrong(expected: &str) -> Error {
@@ -112,15 +114,43 @@ impl ColumnData {
         self.len() == 0
     }
 
+    /// Approximate heap bytes held (cache budgets and memory accounting).
+    pub fn approx_bytes(&self) -> usize {
+        match self {
+            ColumnData::Ints(v) => v.len() * 8,
+            ColumnData::U8s(v) => v.len(),
+            ColumnData::Strs(c) => c.approx_bytes(),
+            ColumnData::Values(v) => v
+                .iter()
+                .map(|x| {
+                    std::mem::size_of::<Option<Value>>() + x.as_ref().map_or(0, Value::approx_size)
+                })
+                .sum(),
+            ColumnData::Maps(v) => v
+                .iter()
+                .map(|m| {
+                    48 + m
+                        .iter()
+                        .map(|(k, x)| 32 + k.len() + x.approx_size())
+                        .sum::<usize>()
+                })
+                .sum(),
+        }
+    }
+
     pub fn into_ints(self) -> Result<Vec<i64>> {
         match self {
-            ColumnData::Ints(v) => Ok(v),
+            ColumnData::Ints(v) => {
+                Ok(std::sync::Arc::try_unwrap(v).unwrap_or_else(|a| (*a).clone()))
+            }
             _ => Err(wrong("ints")),
         }
     }
     pub fn into_u8s(self) -> Result<Vec<u8>> {
         match self {
-            ColumnData::U8s(v) => Ok(v),
+            ColumnData::U8s(v) => {
+                Ok(std::sync::Arc::try_unwrap(v).unwrap_or_else(|a| (*a).clone()))
+            }
             _ => Err(wrong("u8s")),
         }
     }
@@ -132,13 +162,17 @@ impl ColumnData {
     }
     pub fn into_values(self) -> Result<Vec<Option<Value>>> {
         match self {
-            ColumnData::Values(v) => Ok(v),
+            ColumnData::Values(v) => {
+                Ok(std::sync::Arc::try_unwrap(v).unwrap_or_else(|a| (*a).clone()))
+            }
             _ => Err(wrong("values")),
         }
     }
     pub fn into_maps(self) -> Result<Vec<BTreeMap<String, Value>>> {
         match self {
-            ColumnData::Maps(v) => Ok(v),
+            ColumnData::Maps(v) => {
+                Ok(std::sync::Arc::try_unwrap(v).unwrap_or_else(|a| (*a).clone()))
+            }
             _ => Err(wrong("maps")),
         }
     }
@@ -176,12 +210,16 @@ enum StrRepr {
         offsets: std::sync::Arc<Vec<u32>>,
         /// All values back to back; offsets fall on char boundaries.
         text: std::sync::Arc<String>,
-        valid: std::sync::Arc<Bitmap>,
+        /// `None`: no row is missing, and no bitmap was allocated (spec
+        /// STRATA-SYS-08-011).
+        valid: Option<std::sync::Arc<Bitmap>>,
+        missing: usize,
     },
     /// Row `i` is `dict[codes[i] - 1]`, missing when `codes[i] == 0`.
     Dict {
         dict: std::sync::Arc<Vec<String>>,
         codes: std::sync::Arc<Vec<u32>>,
+        missing: usize,
     },
 }
 
@@ -204,7 +242,9 @@ pub struct StrColumn {
 pub struct StrBuilder {
     offsets: Vec<u32>,
     text: String,
-    valid: Bitmap,
+    /// Created at the first missing row (earlier rows back-filled present).
+    valid: Option<Bitmap>,
+    missing: usize,
 }
 
 impl StrBuilder {
@@ -214,10 +254,8 @@ impl StrBuilder {
         Self {
             offsets,
             text: String::with_capacity(bytes),
-            valid: Bitmap {
-                words: Vec::with_capacity(rows.div_ceil(64)),
-                len: 0,
-            },
+            valid: None,
+            missing: 0,
         }
     }
 
@@ -232,7 +270,26 @@ impl StrBuilder {
         let end = u32::try_from(self.text.len())
             .map_err(|_| Error::invalid_input("string column larger than 4 GiB"))?;
         self.offsets.push(end);
-        self.valid.push(v.is_some());
+        match (&mut self.valid, v.is_some()) {
+            (Some(bm), present) => bm.push(present),
+            (None, true) => {}
+            (None, false) => {
+                // First missing row: the rows before it were all present.
+                let rows = self.offsets.len() - 2;
+                let mut bm = Bitmap {
+                    words: Vec::with_capacity((rows + 1).div_ceil(64)),
+                    len: 0,
+                };
+                for _ in 0..rows {
+                    bm.push(true);
+                }
+                bm.push(false);
+                self.valid = Some(bm);
+            }
+        }
+        if v.is_none() {
+            self.missing += 1;
+        }
         Ok(())
     }
 
@@ -244,7 +301,8 @@ impl StrBuilder {
             repr: StrRepr::Plain {
                 offsets: std::sync::Arc::new(self.offsets),
                 text: std::sync::Arc::new(self.text),
-                valid: std::sync::Arc::new(self.valid),
+                valid: self.valid.map(std::sync::Arc::new),
+                missing: self.missing,
             },
         }
     }
@@ -270,10 +328,12 @@ impl StrColumn {
         if codes.iter().any(|c| *c as usize > dict.len()) {
             return Err(Error::corruption("column", "dictionary code out of range"));
         }
+        let missing = codes.iter().filter(|c| **c == 0).count();
         Ok(Self {
             repr: StrRepr::Dict {
                 dict: std::sync::Arc::new(dict),
                 codes: std::sync::Arc::new(codes),
+                missing,
             },
         })
     }
@@ -289,6 +349,43 @@ impl StrColumn {
         self.len() == 0
     }
 
+    /// Approximate heap bytes held.
+    pub fn approx_bytes(&self) -> usize {
+        match &self.repr {
+            StrRepr::Plain {
+                offsets,
+                text,
+                valid,
+                ..
+            } => text.len() + offsets.len() * 4 + valid.as_ref().map_or(0, |b| b.words.len() * 8),
+            StrRepr::Dict { dict, codes, .. } => {
+                dict.iter().map(|d| d.len() + 24).sum::<usize>() + codes.len() * 4
+            }
+        }
+    }
+
+    /// Rows that are missing. Zero means no validity bitmap is held and
+    /// [`StrColumn::get_present`] may be used for every row.
+    pub fn null_count(&self) -> usize {
+        match &self.repr {
+            StrRepr::Plain { missing, .. } | StrRepr::Dict { missing, .. } => *missing,
+        }
+    }
+
+    /// Row `i` of a column with `null_count() == 0` (no presence check;
+    /// a missing row would read as ""). Panics if `i >= len`.
+    pub fn get_present(&self, i: usize) -> &str {
+        match &self.repr {
+            StrRepr::Plain { offsets, text, .. } => text
+                .get(offsets[i] as usize..offsets[i + 1] as usize)
+                .unwrap_or(""),
+            StrRepr::Dict { dict, codes, .. } => codes[i]
+                .checked_sub(1)
+                .and_then(|c| dict.get(c as usize))
+                .map_or("", String::as_str),
+        }
+    }
+
     /// Row `i` (`None` = missing). Panics if `i >= len`.
     pub fn get(&self, i: usize) -> Option<&str> {
         match &self.repr {
@@ -296,15 +393,16 @@ impl StrColumn {
                 offsets,
                 text,
                 valid,
+                ..
             } => {
-                if !valid.get(i) {
+                if valid.as_ref().is_some_and(|v| !v.get(i)) {
                     return None;
                 }
                 // Offsets are recorded after whole `&str` pushes, so they
                 // are char boundaries: `get` only checks the two ends.
                 text.get(offsets[i] as usize..offsets[i + 1] as usize)
             }
-            StrRepr::Dict { dict, codes } => match codes[i] {
+            StrRepr::Dict { dict, codes, .. } => match codes[i] {
                 0 => None,
                 c => dict.get(c as usize - 1).map(String::as_str),
             },
@@ -324,7 +422,7 @@ impl StrColumn {
     /// `k` = `dictionary[k - 1]`.
     pub fn dict(&self) -> Option<(&[String], &[u32])> {
         match &self.repr {
-            StrRepr::Dict { dict, codes } => Some((dict, codes)),
+            StrRepr::Dict { dict, codes, .. } => Some((dict, codes)),
             StrRepr::Plain { .. } => None,
         }
     }
@@ -606,6 +704,36 @@ mod tests {
                 prop_assert_eq!(plain.get(i), v.as_deref());
             }
         }
+    }
+
+    #[test]
+    fn no_missing_rows_means_no_bitmap() {
+        let c = StrColumn::from_options(["a", "", "bc"].map(Some)).unwrap();
+        assert_eq!(c.null_count(), 0);
+        let StrRepr::Plain { valid, .. } = &c.repr else {
+            panic!("plain")
+        };
+        assert!(valid.is_none(), "no bitmap allocated");
+        assert_eq!(
+            (c.get_present(0), c.get_present(1), c.get_present(2)),
+            ("a", "", "bc")
+        );
+        // The first missing row (after 70 present ones, across a word)
+        // creates the bitmap and back-fills the earlier rows as present.
+        let mut vals: Vec<Option<String>> = (0..70).map(|i| Some(i.to_string())).collect();
+        vals.push(None);
+        vals.push(Some("x".into()));
+        let c = StrColumn::from_options(vals.clone()).unwrap();
+        assert_eq!(c.null_count(), 1);
+        assert_eq!(c.to_options(), vals);
+        let d = StrColumn::from_dict(vec!["p".into()], vec![1, 0, 1]).unwrap();
+        assert_eq!(d.null_count(), 1);
+        assert_eq!(
+            StrColumn::from_dict(vec!["p".into()], vec![1, 1])
+                .unwrap()
+                .get_present(1),
+            "p"
+        );
     }
 
     #[test]

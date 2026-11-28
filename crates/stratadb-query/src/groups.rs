@@ -30,7 +30,23 @@ pub(crate) struct GroupTable<S> {
     hashes: Vec<u64>,
     states: Vec<S>,
     n_aggs: usize,
+    /// Times the hash table's capacity grew.
+    resizes: u64,
 }
+
+/// Statistics of one table (EXPLAIN ANALYZE, STRATA-SYS-09-011).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TableStats {
+    pub groups: usize,
+    /// Groups the hash table holds before it grows (load factor 7/8).
+    pub capacity: usize,
+    pub resizes: u64,
+    /// Heap bytes held (capacity, not length).
+    pub bytes: usize,
+}
+
+/// Bytes per hash-table bucket: a `u32` group index plus one control byte.
+const BUCKET_BYTES: usize = std::mem::size_of::<u32>() + 1;
 
 impl<S> GroupTable<S> {
     pub(crate) fn new(n_aggs: usize) -> Self {
@@ -47,6 +63,65 @@ impl<S> GroupTable<S> {
             hashes: Vec::new(),
             states: Vec::new(),
             n_aggs,
+            resizes: 0,
+        }
+    }
+
+    /// Heap bytes held by the table and its arrays (by capacity).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        // hashbrown keeps capacity at 7/8 of the buckets.
+        let buckets = self.table.capacity() * 8 / 7 + 1;
+        buckets * BUCKET_BYTES
+            + self.arena.capacity()
+            + self.spans.capacity() * std::mem::size_of::<(usize, usize)>()
+            + self.hashes.capacity() * std::mem::size_of::<u64>()
+            + self.states.capacity() * std::mem::size_of::<S>()
+    }
+
+    /// Upper bound of the bytes the next insert of a `key_len`-byte key
+    /// allocates: every array at capacity doubles (STRATA-SYS-09-002 asks
+    /// for this to be reserved before the allocation).
+    pub(crate) fn growth_bytes(&self, key_len: usize) -> usize {
+        let doubled = |cap: usize, len: usize, add: usize, elem: usize| {
+            if len + add > cap {
+                (cap.max(4) + add) * elem
+            } else {
+                0
+            }
+        };
+        let table = if self.table.len() >= self.table.capacity() {
+            (self.table.capacity().max(3) * 2 * 8 / 7 + 1) * BUCKET_BYTES
+        } else {
+            0
+        };
+        table
+            + doubled(self.arena.capacity(), self.arena.len(), key_len, 1)
+            + doubled(
+                self.spans.capacity(),
+                self.spans.len(),
+                1,
+                std::mem::size_of::<(usize, usize)>(),
+            )
+            + doubled(
+                self.hashes.capacity(),
+                self.hashes.len(),
+                1,
+                std::mem::size_of::<u64>(),
+            )
+            + doubled(
+                self.states.capacity(),
+                self.states.len(),
+                self.n_aggs,
+                std::mem::size_of::<S>(),
+            )
+    }
+
+    pub(crate) fn stats(&self) -> TableStats {
+        TableStats {
+            groups: self.len(),
+            capacity: self.table.capacity(),
+            resizes: self.resizes,
+            bytes: self.heap_bytes(),
         }
     }
 
@@ -92,8 +167,12 @@ impl<S> GroupTable<S> {
         self.states.extend(states);
         debug_assert_eq!(self.states.len(), (g + 1) * self.n_aggs);
         let hashes = &self.hashes;
+        let cap = self.table.capacity();
         self.table
             .insert_unique(hash, g as u32, |&x| hashes[x as usize]);
+        if self.table.capacity() > cap {
+            self.resizes += 1;
+        }
         g
     }
 
@@ -217,6 +296,30 @@ mod tests {
         assert_eq!(e.find(h, &[]), Some(g));
         assert_eq!(e.group(g).1, &[1, 2]);
         assert_eq!(decode_keys(&[], 0).unwrap(), Vec::<Datum>::new());
+    }
+
+    #[test]
+    fn growth_is_bounded_before_it_happens() {
+        let mut t: GroupTable<u64> = GroupTable::new(1);
+        let mut last = t.heap_bytes();
+        for i in 0..50_000u64 {
+            let kb = key_bytes(&[Some(Value::UInt(i))]);
+            let bound = t.growth_bytes(kb.len());
+            let h = t.hash(&kb);
+            t.insert(h, &kb, [i]);
+            let now = t.heap_bytes();
+            // What the insert allocated never exceeds the reserved bound.
+            assert!(
+                now.saturating_sub(last) <= bound,
+                "{i}: grew {} > bound {bound}",
+                now - last
+            );
+            last = now;
+        }
+        let s = t.stats();
+        assert_eq!(s.groups, 50_000);
+        assert!(s.capacity >= 50_000 && s.resizes >= 10, "{s:?}");
+        assert_eq!(s.bytes, t.heap_bytes());
     }
 
     #[test]

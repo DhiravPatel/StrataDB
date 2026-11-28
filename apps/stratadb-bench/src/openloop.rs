@@ -64,6 +64,9 @@ pub struct LoadReport {
     pub client_cpu_fraction: Option<f64>,
     pub flags: Vec<&'static str>,
     pub first_error: Option<String>,
+    /// The interference load run at the same time, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alongside: Option<Box<LoadReport>>,
 }
 
 /// Bound on raw latency samples kept per load report.
@@ -285,6 +288,7 @@ fn finish(
         client_cpu_fraction: client_cpu,
         flags,
         first_error,
+        alongside: None,
     }
 }
 

@@ -1336,10 +1336,7 @@ async fn query_pagination_over_http() {
     .await;
     assert_eq!(st, 400);
     // Aggregates cannot be paginated; page_size 0 is invalid.
-    for body in [
-        json!({"query": "SELECT count(*) FROM logs", "page_size": 5}),
-        json!({"query": sql, "page_size": 0}),
-    ] {
+    for body in [json!({"query": sql, "page_size": 0})] {
         let (st, _) = req(
             &s,
             "POST",
@@ -1351,6 +1348,18 @@ async fn query_pagination_over_http() {
         .await;
         assert_eq!(st, 400, "{body}");
     }
+    // An aggregate's result is bounded: page_size is ignored, not an error.
+    let (st, b) = req(
+        &s,
+        "POST",
+        "/api/v1/query",
+        Some(&s.a_rw),
+        "application/json",
+        &json!({"query": "SELECT count(*) FROM logs", "page_size": 5}).to_string(),
+    )
+    .await;
+    assert_eq!(st, 200, "{b}");
+    assert_eq!(j(&b)["paginated"], false);
 }
 
 /// `/metrics` exposes latency histograms and query outcomes in valid
@@ -1372,7 +1381,8 @@ async fn metrics_histograms_and_query_outcomes() {
         assert_eq!(st, 200);
     }
     for _ in 0..3 {
-        let (st, body) = query(&s, &s.a_rw, "SELECT count(*) FROM logs").await;
+        // count(body) reads rows (a plain count(*) is answered from metadata).
+        let (st, body) = query(&s, &s.a_rw, "SELECT count(body) FROM logs").await;
         assert_eq!(st, 200);
         // Phase decomposition is reported per query (STRATA-SYS-01-007).
         let stats = &body["stats"];
@@ -1628,4 +1638,62 @@ async fn thread_inventory_lists_named_engine_threads() {
     } else {
         assert!(v["os_threads"].is_null());
     }
+}
+
+/// Query results are encoded by the columnar serializer (ADR-0044): the
+/// response has an exact `Content-Length` (not chunked), and values with
+/// escapes, missing cells and nested maps arrive intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_responses_have_an_exact_length_and_escaped_values() {
+    let s = start(ServerConfig::default()).await;
+    let lines: Vec<String> = (0..2500)
+        .map(|i| {
+            json!({
+                "body": format!("line {i} \"quoted\"\ttab \u{1} é"),
+                "service": if i % 3 == 0 { json!(null) } else { json!(format!("svc-{}", i % 7)) },
+                "attributes": {"n": i, "f": i as f64 / 4.0, "nested": {"k": [1, 2]}},
+            })
+            .to_string()
+        })
+        .collect();
+    let (st, _) = req(
+        &s,
+        "POST",
+        "/api/v1/ingest",
+        Some(&s.a_rw),
+        "application/x-ndjson",
+        &lines.join("\n"),
+    )
+    .await;
+    assert_eq!(st, 200);
+    let mut c = tokio::net::TcpStream::connect(s.addr).await.unwrap();
+    let body = json!({"query": "SELECT body, service, attributes['f'] AS f, attributes['nested'] AS nested FROM logs ORDER BY attributes['n'] LIMIT 3000"}).to_string();
+    let msg = format!(
+        "POST /api/v1/query HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        s.a_rw,
+        body.len()
+    );
+    c.write_all(msg.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    c.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8(buf).unwrap();
+    let (head, payload) = text.split_once("\r\n\r\n").unwrap();
+    let head = head.to_ascii_lowercase();
+    assert!(!head.contains("transfer-encoding: chunked"), "{head}");
+    let len: usize = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length: "))
+        .expect("content-length header")
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(len, payload.len());
+    let v = j(payload);
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2500);
+    assert_eq!(rows[1]["body"], "line 1 \"quoted\"\ttab \u{1} é");
+    assert_eq!(rows[1]["f"], 0.25);
+    assert_eq!(rows[1]["service"], "svc-1");
+    assert!(rows[0].get("service").is_none() || rows[0]["service"].is_null());
+    assert_eq!(rows[2]["nested"], json!({"k": [1, 2]}));
 }

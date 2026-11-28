@@ -1,7 +1,129 @@
 # Changelog
 
 ## Unreleased (0.0.1)
+### Added
+- **StrataStudio (ADR-0041).** A pgAdmin-style web UI, `strata-studio
+  serve`. It provides:
+  - a connection registry with masked tokens;
+  - a query tool with paging, cancel, EXPLAIN and export;
+  - a live dashboard;
+  - a query log browser;
+  - admin actions with confirmations.
+
+  It proxies to StrataDB servers, so tokens never reach the browser. See
+  `docs/studio/README.md`.
+- **New server endpoints for clients and StrataStudio (ADR-0042):**
+  `GET /api/v1/whoami`, `GET /api/v1/schema` (attribute keys from
+  metadata), `GET /api/v1/queries` (the caller's queued and running
+  queries) and `GET /api/v1/admin/backup` (backup list). A `page_size` on
+  aggregate or EXPLAIN queries is now ignored (`"paginated": false`)
+  instead of rejected.
+- **Faster query responses (ADR-0044).**
+  - **Encoding:** result rows are encoded to JSON column by column (587
+    MB/s per core, 3.2× the previous path) with byte-identical output.
+  - **Off the async threads:** encoding now happens on the blocking pool,
+    not on the async threads.
+  - **No extra copy:** the encoded rows are not copied again into the
+    response body.
+- **Faster ORDER BY (ADR-0043).**
+  - **`LIMIT` queries:** `ORDER BY ... LIMIT k` skips rows that cannot
+    reach the top k before building them, with one bound shared by all
+    scan workers. Measured 2.2–2.6× faster.
+  - **Full sorts:** they use normalized keys with radix sort (kernel
+    1.8–9×), each segment's rows are sorted in parallel, and the runs are
+    merged by a loser tree.
+  - **New stats:** `sort_runs_merged` and `topk_rows_skipped`.
+- **Changed: exact numeric ordering.** ORDER BY now compares integers and
+  floats exactly, so the order is total even beyond 2^53, where it was
+  ill-defined before.
+- **Decoded column cache (ADR-0042).** An opt-in
+  `[storage] column_cache_bytes` caches decoded segment columns,
+  scan-resistant (SLRU) and charged to the cache memory region. Metrics:
+  `strata_column_cache_*`, and `column_cache_hits` in query stats.
+- **Faster latest-rows queries, plan cache, connection options (ADR-0040).**
+  - **Latest rows:** `ORDER BY event_time [DESC] LIMIT k` reads the newest
+    (or oldest) segments first and stops as soon as the k-th row beats
+    every remaining segment, with the same results.
+  - **Plan cache:** repeated queries skip parsing and planning. It is
+    bounded and sharded, with stats at `/api/v1/admin/caches` and
+    `strata_plan_cache_*`.
+  - **Connections:** client connections use `TCP_NODELAY` and TCP
+    keepalive.
+  - **Estimates:** query stats and `system.query_log` record estimated vs
+    actual rows (`est_rows`, `q_error`), with the histogram
+    `strata_query_estimate_q_error`.
+- **Snapshot catalog (ADR-0039).**
+  - **Cost:** queries take their snapshot from a lock-free published view,
+    in constant time whatever the number of segments (about 0.25 µs,
+    against 5.8 µs at 1,500 segments).
+  - **Visibility:** `GET /api/v1/admin/snapshots` lists open snapshots
+    with the query holding each and the replaced-segment bytes it keeps on
+    disk. New metrics: `strata_snapshots_open`,
+    `strata_snapshot_oldest_age_seconds` and `strata_obsolete_retained_*`.
+    A warning is logged above 10% of the disk.
+  - **Deletion delay:** replaced segments are deleted only after
+    `[storage] old_segments_lifetime_s` (default 480 s) without readers.
+- **Faster string filters (ADR-0038).**
+  - **ILIKE:** literal patterns on ASCII text use ASCII case folding,
+    about 20× faster per row, with Unicode folding unchanged for other
+    text.
+  - **LIKE:** `'%x%'` uses a prebuilt SIMD finder.
+  - **AND:** conditions are evaluated in an adaptive order, cheapest and
+    most selective first.
+  - **Planner:** constant comparisons and duplicate conditions in `WHERE`
+    are folded at plan time.
+  - **Columns:** string columns without missing values hold no validity
+    bitmap.
+  - **EXPLAIN ANALYZE:** it reports conjunction reorders.
+- **Aggregates from metadata and on dictionary codes (ADR-0037).**
+  - **Metadata answers:** `SELECT count(*), min(event_time),
+    max(event_time)` skips reading any segment or memtable window that the
+    filter fully covers. That includes unfiltered queries, time ranges
+    containing the whole segment, and severity filters, using each
+    segment's exact severity counts. A total count fell from 3.4 ms of CPU
+    to 0.003 ms.
+  - **Code aggregation:** `GROUP BY` on dictionary or severity columns
+    aggregates on codes (3.4–3.8× faster for `GROUP BY severity`).
+  - **Memory:** aggregation reserves hash-table growth against the query
+    memory limit before allocating.
+  - **EXPLAIN ANALYZE:** it shows the hash table (variant, groups,
+    capacity, resizes, bytes).
+  - **API:** responses report `stats.sources_from_metadata`.
+- **Workload classes and admission (ADR-0036, spec VIII.11).**
+  - **Classes:** queries are `interactive`, `normal` or `batch`, chosen
+    from a plan-time cost estimate. Operators can set a class per tenant,
+    and a request's `workload_class` can only lower it.
+  - **Queueing:** a query without a free slot waits in a bounded fair
+    queue by class, then tenant, then arrival. Its position is visible
+    through `GET /api/v1/query/{id}`, and it can be cancelled while it
+    waits.
+  - **Refusals:** a full queue or a timed-out wait gets 429
+    `TOO_MANY_QUERIES`; memory pressure gets 503 `SERVER_OVERLOADED`. Both
+    carry `retry_after_ms`.
+  - **Long queries:** a query running past twice its class budget is
+    demoted one class.
+  - **Batch slots:** an AIMD controller shrinks them when interactive p95
+    is over target under CPU saturation.
+  - **Scan pool:** it schedules morsels by class weight (8:4:1) and tenant,
+    and lower-class queries lend their thread to, or yield to,
+    higher-class work.
+  - **Observability:** new `[workload]` config section,
+    `/api/v1/admin/workload`, `strata_workload_*` and
+    `strata_scan_pool_class_cpu_seconds_total`.
+- **System state machines (ADR-0035, spec IX.22).**
+  - **Machines:** query, insert, WAL segment, merge task, table, server and
+    device lifecycles are tracked against the spec's transition tables.
+  - **Metrics:** `strata_state_seconds{machine,state}`,
+    `strata_state_entities` and `strata_state_illegal_transitions_total`
+    in `/metrics`.
+  - **Readiness:** `/api/v1/ready` reports the server state and returns 503
+    while starting or draining.
+  - **Device health:** a device health monitor marks the server `DEGRADED`
+    when WAL fsync p99 stays above 4× its baseline for 30 s. Disk below the
+    reserve makes the table `READ_ONLY`.
+
 ### Changed
+- `stats.elapsed_ms` of query responses is measured from the request's arrival, so `queue_us + parse_us + plan_us + exec_us <= elapsed_ms` holds again (parse, plan and admission run before the worker; the old start point excluded them).
 - **Typed string columns and selection vectors (ADR-0034).**
   - **String columns:** they are now `StrColumn`, either plain (one text
     buffer) or dictionary-encoded as decoded from segments. There is no
